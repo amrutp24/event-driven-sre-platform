@@ -8,34 +8,33 @@ This repo is a production-minded scaffold for building an event-driven SRE loop 
 ### Mermaid
 ```mermaid
 flowchart TD
-  U[Users/Clients] --> R53[Route53 DNS + TLS]
-  R53 --> WAF[CloudFront optional + AWS WAF]
-  WAF --> ALB[ALB (AWS Load Balancer Controller)]
-  ALB --> ING[Ingress -> K8s Service]
-  ING --> APP[Checkout Service Pods\\n/checkout /metrics /healthz]
+  U[Users] --> R53[Route53 DNS and TLS]
+  R53 --> EDGE[CloudFront optional and WAF]
+  EDGE --> ALB[ALB via AWS Load Balancer Controller]
+  ALB --> ING[Ingress to Service]
+  ING --> APP[Checkout pods]
 
-  subgraph OBS[Observability Plane]
-    PROM[Prometheus Operator\nScrape + TSDB] --> AM[Alertmanager]
-    GRAF[Grafana\nDashboards] --> PROM
-    DDAG[Datadog Agent\nLogs + Metrics + APM] --> DDUX[Datadog UI\nSLOs + Dashboards]
+  subgraph OBS[Observability]
+    PROM[Prometheus] --> AM[Alertmanager]
+    GRAF[Grafana] --> PROM
+    DDAG[Datadog Agent] --> DDUX[Datadog]
   end
 
   APP --> PROM
   APP --> DDAG
 
-  AM --> WEBHOOK[Webhook Receiver\n(API Gateway or ALB)]
-  DDUX --> DDALERTS[Datadog Alerts] --> WEBHOOK
+  AM --> WEBHOOK[Webhook endpoint]
+  DDUX --> DDALERTS[Datadog alerts] --> WEBHOOK
 
-  WEBHOOK --> L1[Lambda\nValidate + Enrich + Normalize]
+  WEBHOOK --> L1[Lambda alert ingest]
   L1 --> EB[EventBridge]
 
-  EB --> SNS[SNS\nNotify]
-  EB --> DDB[DynamoDB\nIncident Record]
-  EB --> SF[Step Functions\nRunbook Automation]
-  EB --> SQS[SQS\nWork Buffer]
+  EB --> SNS[SNS notify]
+  EB --> DDB[DynamoDB incidents]
+  EB --> SF[Step Functions runbook]
 
-  SF --> REM[Remediation Actions\nScale/Restart/Feature Flag/Node ops]
-  REM --> EKS[EKS API\n(IRSA + RBAC)]
+  SF --> RBL[Lambda runbook action]
+  RBL --> EKS[EKS API]
   EKS --> APP
 ```
 
