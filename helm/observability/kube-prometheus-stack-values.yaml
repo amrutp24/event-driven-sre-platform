@@ -1,0 +1,11 @@
+# Minimal production-minded overrides; expand as needed.
+grafana:
+  enabled: true
+
+prometheus:
+  prometheusSpec:
+    retention: 7d
+    scrapeInterval: 15s
+
+alertmanager:
+  enabled: true

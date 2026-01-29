@@ -1,0 +1,43 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: checkout-alerts
+  labels:
+    release: mon
+spec:
+  groups:
+  - name: checkout.rules
+    rules:
+    - alert: CheckoutHighErrorRate
+      expr: |
+        sum(rate(http_requests_total{route="/checkout",code=~"5.."}[5m]))
+        /
+        sum(rate(http_requests_total{route="/checkout"}[5m])) > 0.02
+      for: 5m
+      labels:
+        severity: page
+        service: checkout
+      annotations:
+        summary: "Checkout 5xx rate > 2% (5m)"
+        runbook: "stepfunctions:RunbookCheckoutDegradeOrRollback"
+
+    - alert: CheckoutHighLatencyP95
+      expr: |
+        histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{route="/checkout"}[5m])) by (le)) > 1
+      for: 5m
+      labels:
+        severity: page
+        service: checkout
+      annotations:
+        summary: "Checkout p95 latency > 1s (5m)"
+        runbook: "stepfunctions:RunbookCheckoutDegradeOrScale"
+
+    - alert: CheckoutDown
+      expr: up == 0
+      for: 2m
+      labels:
+        severity: page
+        service: checkout
+      annotations:
+        summary: "Prometheus target down"
+        runbook: "stepfunctions:RunbookCheckoutRestart"
