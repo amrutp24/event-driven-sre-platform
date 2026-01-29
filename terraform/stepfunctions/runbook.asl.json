@@ -1,0 +1,29 @@
+{
+  "Comment": "SRE Runbook Automation (event-driven) - invokes runbook action Lambda",
+  "StartAt": "InvokeRunbookAction",
+  "States": {
+    "InvokeRunbookAction": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName.$": "$.runbook_action_arn",
+        "Payload.$": "$"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "ResultPath": "$.runbook_result",
+      "Next": "Done"
+    },
+    "Done": {
+      "Type": "Succeed"
+    }
+  }
+}

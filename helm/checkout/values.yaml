@@ -1,0 +1,25 @@
+image:
+  repository: "<YOUR_ECR_REPO>/checkout"
+  tag: "latest"
+
+replicaCount: 2
+
+env:
+  DEGRADED_MODE: "false"
+  ERROR_RATE: "0.00"
+  LATENCY_MS: "0"
+  CHAOS: "false"
+
+ingress:
+  enabled: true
+  host: "checkout.example.com"
+  albGroup: "public"
+  certificateArn: "<ACM_CERT_ARN>"
+
+resources:
+  requests:
+    cpu: "200m"
+    memory: "256Mi"
+  limits:
+    cpu: "500m"
+    memory: "512Mi"

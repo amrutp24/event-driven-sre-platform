@@ -1,0 +1,41 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: checkout-slo-burnrate
+  labels:
+    release: mon
+spec:
+  groups:
+  - name: checkout.slo
+    rules:
+    # Define an SLI: error ratio for checkout (5xx / all)
+    - record: checkout:error_ratio:5m
+      expr: |
+        sum(rate(http_requests_total{route="/checkout",code=~"5.."}[5m]))
+        /
+        clamp_min(sum(rate(http_requests_total{route="/checkout"}[5m])), 1)
+
+    # Fast burn (page): ~14.4x for 5m is a common pattern for 99.9% SLOs; tune as needed.
+    - alert: CheckoutSLOBurnFast
+      expr: checkout:error_ratio:5m > 0.00144
+      for: 5m
+      labels:
+        severity: page
+        service: checkout
+      annotations:
+        summary: "FAST burn: checkout error budget burning quickly (5m)"
+        runbook: "runbook_action:degrade_or_scale"
+
+    # Slow burn (ticket): sustained smaller burn.
+    - alert: CheckoutSLOBurnSlow
+      expr: |
+        sum(rate(http_requests_total{route="/checkout",code=~"5.."}[1h]))
+        /
+        clamp_min(sum(rate(http_requests_total{route="/checkout"}[1h])), 1) > 0.00036
+      for: 1h
+      labels:
+        severity: ticket
+        service: checkout
+      annotations:
+        summary: "SLOW burn: checkout error budget burning (1h)"
+        runbook: "runbook_action:notify_only"
