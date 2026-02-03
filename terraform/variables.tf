@@ -41,7 +41,7 @@ variable "node_instance_type_apps" {
 variable "tags" {
   type = map(string)
   default = {
-    "env" = "prod"
+    "env"   = "prod"
     "owner" = "you"
   }
 }

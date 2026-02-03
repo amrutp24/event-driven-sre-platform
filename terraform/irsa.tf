@@ -22,8 +22,8 @@ module "external_dns_irsa" {
   version = "~> 5.0"
 
   role_name                     = "${var.name}-external-dns"
-  attach_external_dns_policy     = true
-  external_dns_hosted_zone_arns  = var.route53_zone_arns
+  attach_external_dns_policy    = true
+  external_dns_hosted_zone_arns = var.route53_zone_arns
 
   oidc_providers = {
     main = {
@@ -43,8 +43,8 @@ module "cert_manager_irsa" {
   role_name = "${var.name}-cert-manager"
 
   # Minimal Route53 permissions for DNS01 challenges (optional; enable if you use Route53 solver)
-  create_role = var.cert_manager_route53_enabled
-  role_policy_arns = var.cert_manager_route53_enabled ? [] : []
+  create_role      = var.cert_manager_route53_enabled
+  role_policy_arns = var.cert_manager_route53_enabled ? {} : {}
 
   oidc_providers = var.cert_manager_route53_enabled ? {
     main = {
@@ -60,7 +60,7 @@ resource "aws_iam_policy" "cert_manager_route53" {
   count       = var.cert_manager_route53_enabled ? 1 : 0
   name        = "${var.name}-cert-manager-route53"
   description = "Route53 permissions for cert-manager DNS01"
-  policy      = jsonencode({
+  policy = jsonencode({
     Version = "2012-10-17",
     Statement = [
       {
