@@ -2,7 +2,10 @@ resource "aws_dynamodb_table" "incidents" {
   name         = "${var.name}-incidents"
   billing_mode = "PAY_PER_REQUEST"
   hash_key     = "incident_id"
-  attribute { name = "incident_id" type = "S" }
+  attribute {
+    name = "incident_id"
+    type = "S"
+  }
 }
 
 resource "aws_sns_topic" "alerts" {
@@ -14,13 +17,13 @@ resource "aws_cloudwatch_event_bus" "sre" {
 }
 
 resource "aws_iam_role" "lambda_role" {
-  name               = "${var.name}-alert-ingest-role"
+  name = "${var.name}-alert-ingest-role"
   assume_role_policy = jsonencode({
     Version = "2012-10-17",
     Statement = [{
-      Effect = "Allow",
+      Effect    = "Allow",
       Principal = { Service = "lambda.amazonaws.com" },
-      Action = "sts:AssumeRole"
+      Action    = "sts:AssumeRole"
     }]
   })
 }
@@ -33,28 +36,28 @@ resource "aws_iam_role_policy" "lambda_policy" {
       {
         Effect = "Allow",
         Action = [
-          "logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"
+          "logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"
         ],
-        Resource = "*"
+        Resource = "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/${var.name}-alert-ingest:*"
       },
       {
-        Effect = "Allow",
-        Action = ["events:PutEvents"],
-        Resource = "*"
+        Effect   = "Allow",
+        Action   = ["events:PutEvents"],
+        Resource = aws_cloudwatch_event_bus.sre.arn
       },
       {
-        Effect = "Allow",
-        Action = ["dynamodb:PutItem"],
+        Effect   = "Allow",
+        Action   = ["dynamodb:PutItem"],
         Resource = aws_dynamodb_table.incidents.arn
       },
       {
-        Effect = "Allow",
-        Action = ["sns:Publish"],
+        Effect   = "Allow",
+        Action   = ["sns:Publish"],
         Resource = aws_sns_topic.alerts.arn
       },
       {
-        Effect = "Allow",
-        Action = ["states:StartExecution"],
+        Effect   = "Allow",
+        Action   = ["states:StartExecution"],
         Resource = aws_sfn_state_machine.runbook.arn
       }
     ]
@@ -62,13 +65,13 @@ resource "aws_iam_role_policy" "lambda_policy" {
 }
 
 resource "aws_iam_role" "sfn_role" {
-  name               = "${var.name}-sfn-role"
+  name = "${var.name}-sfn-role"
   assume_role_policy = jsonencode({
     Version = "2012-10-17",
     Statement = [{
-      Effect = "Allow",
+      Effect    = "Allow",
       Principal = { Service = "states.amazonaws.com" },
-      Action = "sts:AssumeRole"
+      Action    = "sts:AssumeRole"
     }]
   })
 }
@@ -80,8 +83,11 @@ resource "aws_iam_role_policy" "sfn_policy" {
     Statement = [
       {
         Effect = "Allow",
-        Action = ["logs:CreateLogDelivery","logs:GetLogDelivery","logs:UpdateLogDelivery","logs:DeleteLogDelivery","logs:ListLogDeliveries",
-                  "logs:PutResourcePolicy","logs:DescribeResourcePolicies","logs:DescribeLogGroups"],
+        # Step Functions log delivery requires broad permissions to manage CloudWatch Logs
+        # These actions don't support resource-level permissions per AWS documentation
+        Action = ["logs:CreateLogDelivery", "logs:GetLogDelivery", "logs:UpdateLogDelivery",
+          "logs:DeleteLogDelivery", "logs:ListLogDeliveries", "logs:PutResourcePolicy",
+        "logs:DescribeResourcePolicies", "logs:DescribeLogGroups"],
         Resource = "*"
       }
     ]
@@ -104,13 +110,13 @@ resource "aws_lambda_function" "alert_ingest" {
 
   environment {
     variables = {
-      EVENT_BUS_NAME = aws_cloudwatch_event_bus.sre.name
-      INCIDENT_TABLE = aws_dynamodb_table.incidents.name
-      RUNBOOK_ARN    = aws_sfn_state_machine.runbook.arn
-      SNS_TOPIC_ARN  = aws_sns_topic.alerts.arn
-      CLUSTER_NAME   = var.eks_cluster_name
-      REGION         = var.aws_region
-      DEGRADED_PARAM = "/checkout/degraded_mode"
+      EVENT_BUS_NAME     = aws_cloudwatch_event_bus.sre.name
+      INCIDENT_TABLE     = aws_dynamodb_table.incidents.name
+      RUNBOOK_ARN        = aws_sfn_state_machine.runbook.arn
+      SNS_TOPIC_ARN      = aws_sns_topic.alerts.arn
+      CLUSTER_NAME       = var.eks_cluster_name
+      REGION             = var.aws_region
+      DEGRADED_PARAM     = "/checkout/degraded_mode"
       RUNBOOK_ACTION_ARN = aws_lambda_function.runbook_action.arn
     }
   }
@@ -155,13 +161,13 @@ resource "aws_ssm_parameter" "checkout_degraded_mode" {
 
 # Runbook action Lambda: performs remediation against EKS and/or SSM
 resource "aws_iam_role" "runbook_lambda_role" {
-  name               = "${var.name}-runbook-action-role"
+  name = "${var.name}-runbook-action-role"
   assume_role_policy = jsonencode({
     Version = "2012-10-17",
     Statement = [{
-      Effect = "Allow",
+      Effect    = "Allow",
       Principal = { Service = "lambda.amazonaws.com" },
-      Action = "sts:AssumeRole"
+      Action    = "sts:AssumeRole"
     }]
   })
 }
@@ -172,23 +178,25 @@ resource "aws_iam_role_policy" "runbook_lambda_policy" {
     Version = "2012-10-17",
     Statement = [
       {
-        Effect = "Allow",
-        Action = ["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],
-        Resource = "*"
+        Effect   = "Allow",
+        Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+        Resource = "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/${var.name}-runbook-action:*"
+      },
+      {
+        Effect   = "Allow",
+        Action   = ["eks:DescribeCluster"],
+        Resource = "arn:aws:eks:${var.aws_region}:${data.aws_caller_identity.current.account_id}:cluster/${var.eks_cluster_name}"
+      },
+      {
+        Effect   = "Allow",
+        Action   = ["ssm:PutParameter", "ssm:GetParameter"],
+        Resource = "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/checkout/*"
       },
       {
         Effect = "Allow",
-        Action = ["eks:DescribeCluster"],
-        Resource = "*"
-      },
-      {
-        Effect = "Allow",
-        Action = ["ssm:PutParameter","ssm:GetParameter"],
-        Resource = "*"
-      },
-      {
-        Effect = "Allow",
-        Action = ["sts:GetCallerIdentity"],
+        # sts:GetCallerIdentity doesn't support resource-level permissions
+        # This is required for the Lambda to authenticate with EKS
+        Action   = ["sts:GetCallerIdentity"],
         Resource = "*"
       }
     ]
@@ -221,8 +229,8 @@ resource "aws_iam_role_policy" "sfn_invoke_lambda" {
     Version = "2012-10-17",
     Statement = [
       {
-        Effect = "Allow",
-        Action = ["lambda:InvokeFunction"],
+        Effect   = "Allow",
+        Action   = ["lambda:InvokeFunction"],
         Resource = [aws_lambda_function.runbook_action.arn]
       }
     ]
