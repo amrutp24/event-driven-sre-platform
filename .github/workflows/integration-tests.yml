@@ -45,10 +45,4 @@ jobs:
             terraform/lambda/${{ matrix.lambda }}/test-results.xml
           retention-days: 30
 
-      - name: Publish test results
-        uses: dorny/test-reporter@v1
-        if: always()
-        with:
-          name: ${{ matrix.lambda }} Tests
-          path: terraform/lambda/${{ matrix.lambda }}/test-results.xml
-          reporter: java-junit
+      
