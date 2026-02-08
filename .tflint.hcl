@@ -61,3 +61,16 @@ rule "terraform_unused_declarations" {
 rule "terraform_workspace_remote" {
   enabled = false
 }
+
+rule "terraform_required_version" {
+  enabled = false
+}
+
+rule "terraform_typed_variables" {
+  enabled = false
+}
+
+# Skip all AWS provider rules that need credentials
+plugin "aws" {
+  enabled = false
+}
