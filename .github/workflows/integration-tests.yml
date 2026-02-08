@@ -17,19 +17,21 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Run Checkov (no backend, no AWS calls)
-        id: checkov
-        uses: bridgecrewio/checkov-action@v3
+      - name: Install Checkov locally
+        run: |
+          pip install checkov
+
+      - name: Run Checkov locally
+        run: |
+          checkov -d terraform/ --var-file ${{ env.TF_VAR_FILE }} --skip-download --external-checks-git --skip-check CKV_AWS_1,CKV_AWS_2,CKV_AWS_3,CKV_AWS_20,CKV_AWS_21,CKV_AWS_41,CKV_AWS_57,CKV_AWS_58,CKV_AWS_61,CKV_AWS_84,CKV_AWS_88,CKV_AWS_93,CKV_AWS_94,CKV_AWS_95,CKV_AWS_98,CKV_AWS_99 | tee reports/checkov-results.txt
+
+      - name: Upload Checkov results
+        uses: actions/upload-artifact@v4
+        if: always()
         with:
-          framework: terraform
-          directory: terraform/
-          output_format: cli
-          output_file_path: reports/checkov-results.txt
-          soft_fail: true
-          var_file: ${{ env.TF_VAR_FILE }}
-          args: --skip-download --external-checks-git --skip-check CKV_AWS_1,CKV_AWS_2,CKV_AWS_3,CKV_AWS_20,CKV_AWS_21,CKV_AWS_41,CKV_AWS_57,CKV_AWS_58,CKV_AWS_61,CKV_AWS_84,CKV_AWS_88,CKV_AWS_93,CKV_AWS_94,CKV_AWS_95,CKV_AWS_98,CKV_AWS_99
-        env:
-          CHECKOV_SKIP_CHECKS: "CKV_AWS_1,CKV_AWS_2,CKV_AWS_3,CKV_AWS_20,CKV_AWS_21,CKV_AWS_41,CKV_AWS_57,CKV_AWS_58,CKV_AWS_61,CKV_AWS_84,CKV_AWS_88,CKV_AWS_93,CKV_AWS_94,CKV_AWS_95,CKV_AWS_98,CKV_AWS_99"
+          name: checkov-results
+          path: reports/
+          retention-days: 30
 
       - name: Upload Checkov results
         uses: actions/upload-artifact@v4
@@ -133,7 +135,9 @@ jobs:
           terraform init -input=false -backend=false
 
       - name: Terraform fmt check
-        run: terraform fmt -check -diff -var-file=${{ env.TF_VAR_FILE }} terraform/
+        run: |
+          cd terraform
+          terraform fmt -check -diff
 
       - name: Terraform validate (local backend)
         run: |
