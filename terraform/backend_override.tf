@@ -3,9 +3,15 @@
 terraform {
   required_providers {
     aws = {
-      source  = "hashicorp/aws"
-      version = "~> 4.0"
+      source = "hashicorp/aws"
+      version = ">= 4.0"
     }
+  }
+  
+  backend "local" {
+    path = "./terraform.tfstate"
+  }
+}
   }
 
   backend "local" {
