@@ -1,9 +1,10 @@
 # CI Local Backend Configuration
-# This overrides the S3 backend for CI/CD testing
+# This overrides S3 backend for CI/CD testing
 terraform {
   backend "local" {
     path = "./terraform.tfstate"
   }
+}
 }
 
 # Also disable production backend configuration
