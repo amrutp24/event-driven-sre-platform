@@ -10,8 +10,6 @@ on:
 jobs:
   integration-tests:
     runs-on: ubuntu-latest
-    container:
-      image: python:3.11-slim
     
     services:
       localstack:
@@ -22,42 +20,39 @@ jobs:
         env:
           SERVICES: lambda,events,stepfunctions,dynamodb,sns,apigateway,iam,ssm,eks
           DEBUG: 1
-          DATA_DIR: /tmp/localstack/data
+          PERSISTENCE: 1
+          DOCKER_HOST: unix:///var/run/docker.sock
         options: >-
           --health-cmd "curl -f http://localhost:4566/health"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+        volumes:
+          - /var/run/docker.sock:/var/run/docker.sock
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Install system dependencies
-      run: |
-        apt-get update && apt-get install -y \
-          curl \
-          unzip \
-          zip \
-          docker.io \
-          jq
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
 
-    - name: Start Docker daemon
+    - name: Install git and other tools
       run: |
-        dockerd &
+        sudo apt-get update && sudo apt-get install -y git curl unzip zip jq
 
     - name: Set up kubectl
-      run: |
-        curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
-        chmod +x kubectl
-        mv kubectl /usr/local/bin/
+      uses: azure/setup-kubectl@v4
+      with:
+        version: 'v1.28.0'
 
     - name: Set up kind
-      run: |
-        curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
-        chmod +x ./kind
-        mv ./kind /usr/local/bin/
-        kind create cluster --name sre-integration --wait 300s
+      uses: container-tools/kind-action@v2
+      with:
+        cluster_name: sre-integration
+        wait: 300s
 
     - name: Install LocalStack CLI
       run: |
@@ -118,6 +113,17 @@ jobs:
           type: ClusterIP
         EOF
 
+    - name: Wait for LocalStack
+      run: |
+        for i in {1..30}; do
+          if curl -f http://localhost:4566/health; then
+            echo "LocalStack is ready"
+            break
+          fi
+          echo "Attempt $i: LocalStack not ready, waiting..."
+          sleep 2
+        done
+
     - name: Create AWS test resources
       env:
         AWS_DEFAULT_REGION: us-east-1
@@ -125,8 +131,6 @@ jobs:
         AWS_SECRET_ACCESS_KEY: test
         AWS_ENDPOINT_URL: http://localhost:4566
       run: |
-        # Wait for LocalStack to be ready
-        timeout 60 bash -c 'until curl -f http://localhost:4566/health; do sleep 2; done'
         
         # Create test resources
         awslocal events create-event-bus --name test-sre-events
