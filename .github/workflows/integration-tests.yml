@@ -1,4 +1,4 @@
-name: Lambda Unit Tests
+name: CI/CD Pipeline
 
 on:
   push:
@@ -8,6 +8,50 @@ on:
   workflow_dispatch:
 
 jobs:
+  terraform-security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Checkov
+        id: checkov
+        uses: bridgecrewio/checkov-action@v3
+        with:
+          framework: terraform
+          directory: terraform/
+          output_format: cli
+          output_file_path: reports/checkov-results.txt
+          soft_fail: true
+
+      - name: Upload Checkov results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: checkov-results
+          path: reports/
+          retention-days: 30
+
+  container-security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
   lambda-tests:
     runs-on: ubuntu-latest
     
@@ -43,6 +87,66 @@ jobs:
             terraform/lambda/${{ matrix.lambda }}/coverage.xml
             terraform/lambda/${{ matrix.lambda }}/htmlcov/
             terraform/lambda/${{ matrix.lambda }}/test-results.xml
+          retention-days: 30
+
+  infrastructure-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.5.7"
+
+      - name: Terraform fmt check
+        run: terraform fmt -check -diff terraform/
+
+      - name: Terraform validate
+        run: |
+          cd terraform
+          terraform validate
+
+      - name: Install tflint
+        run: |
+          curl -L https://github.com/terraform-linters/tflint/releases/latest/download/tflint_linux_amd64.zip -o tflint.zip
+          unzip tflint.zip
+          sudo mv tflint /usr/local/bin/
+
+      - name: Run tflint
+        run: tflint terraform/
+
+  application-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          cd apps/checkout
+          pip install -r requirements-dev.txt
+
+      - name: Run application tests
+        run: |
+          cd apps/checkout
+          pytest tests/ -v --cov --cov-report=xml --junitxml=test-results.xml
+
+      - name: Upload app coverage reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: app-coverage
+          path: |
+            apps/checkout/coverage.xml
+            apps/checkout/htmlcov/
+            apps/checkout/test-results.xml
           retention-days: 30
 
       
