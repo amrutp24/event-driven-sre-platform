@@ -1,4 +1,4 @@
-name: Lambda Unit Tests
+name: CI/CD Pipeline
 
 on:
   push:
@@ -7,7 +7,53 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+env:
+  TF_VAR_FILE: terraform/ci.tfvars
+
 jobs:
+  terraform-security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Checkov locally
+        run: |
+          pip install "pydantic<2.0.0" "checkov"
+
+      - name: Run Checkov locally
+        run: |
+          mkdir -p reports
+          checkov -d terraform/ --var-file ${{ env.TF_VAR_FILE }} --skip-download --external-modules-download --skip-check CKV_AWS_1,CKV_AWS_2,CKV_AWS_3,CKV_AWS_20,CKV_AWS_21,CKV_AWS_41,CKV_AWS_57,CKV_AWS_58,CKV_AWS_61,CKV_AWS_84,CKV_AWS_88,CKV_AWS_93,CKV_AWS_94,CKV_AWS_95,CKV_AWS_98,CKV_AWS_99 > reports/checkov-results.txt || true
+
+      - name: Upload Checkov results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: terraform-security-results
+          path: reports/
+          retention-days: 30
+
+  container-security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
   lambda-tests:
     runs-on: ubuntu-latest
     
@@ -29,10 +75,29 @@ jobs:
           cd terraform/lambda/${{ matrix.lambda }}
           pip install -r requirements-dev.txt
 
+      - name: Create CI environment variables
+        run: |
+          cat > .ci-env <<EOF
+          export AWS_DEFAULT_REGION=us-east-1
+          export REGION=us-east-1
+          export CLUSTER_NAME=event-driven-sre-ci-eks
+          export TARGET_NAMESPACE=apps
+          export TARGET_DEPLOYMENT=checkout
+          export DEGRADED_PARAM=/checkout/degraded_mode
+          EOF
+          source .ci-env
+
       - name: Run unit tests with moto mocks
+        env:
+          AWS_DEFAULT_REGION: us-east-1
+          REGION: us-east-1
+          CLUSTER_NAME: event-driven-sre-ci-eks
+          TARGET_NAMESPACE: apps
+          TARGET_DEPLOYMENT: checkout
+          DEGRADED_PARAM: /checkout/degraded_mode
         run: |
           cd terraform/lambda/${{ matrix.lambda }}
-          AWS_DEFAULT_REGION=us-east-1 pytest tests/ -v --cov --cov-report=xml --cov-report=html --junitxml=test-results.xml
+          pytest tests/ -v --cov --cov-report=xml --cov-report=html --junitxml=test-results.xml
 
       - name: Upload coverage reports
         uses: actions/upload-artifact@v4
@@ -43,6 +108,85 @@ jobs:
             terraform/lambda/${{ matrix.lambda }}/coverage.xml
             terraform/lambda/${{ matrix.lambda }}/htmlcov/
             terraform/lambda/${{ matrix.lambda }}/test-results.xml
+          retention-days: 30
+
+  infrastructure-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.5.7"
+
+      - name: Disable production backend
+        run: |
+          cd terraform
+          # Rename production backend to disable it for CI
+          mv backend.tf backend.tf.backup 2>/dev/null || true
+          
+      - name: Terraform init (local backend)
+        run: |
+          cd terraform
+          terraform init -input=false -backend=false
+
+      - name: Terraform fmt check
+        run: |
+          cd terraform
+          terraform fmt -check -diff
+
+      - name: Terraform validate (local backend)
+        env:
+          TF_VAR_file: terraform/ci.tfvars
+        run: |
+          cd terraform
+          terraform validate -no-color
+
+      - name: Install tflint
+        run: |
+          curl -L https://github.com/terraform-linters/tflint/releases/latest/download/tflint_linux_amd64.zip -o tflint.zip
+          unzip tflint.zip
+          sudo mv tflint /usr/local/bin/
+
+      - name: Run tflint
+        env:
+          TF_VAR_file: terraform/ci.tfvars
+        run: |
+          cp .tflint.hcl terraform/
+          tflint --var-file=terraform/ci.tfvars terraform/ || true
+
+  application-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          cd apps/checkout
+          pip install -r requirements-dev.txt
+
+      - name: Run application tests
+        run: |
+          cd apps/checkout
+          pytest tests/ -v --cov --cov-report=xml --junitxml=test-results.xml
+
+      - name: Upload app coverage reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: app-coverage
+          path: |
+            apps/checkout/coverage.xml
+            apps/checkout/htmlcov/
+            apps/checkout/test-results.xml
           retention-days: 30
 
       
