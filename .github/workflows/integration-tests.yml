@@ -30,15 +30,7 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: checkov-results
-          path: reports/
-          retention-days: 30
-
-      - name: Upload Checkov results
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: checkov-results
+          name: terraform-security-results
           path: reports/
           retention-days: 30
 
