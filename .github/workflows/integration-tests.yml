@@ -1,0 +1,48 @@
+name: Lambda Unit Tests
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  lambda-tests:
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        lambda: [alert_ingest, runbook_action]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install test dependencies
+        run: |
+          cd terraform/lambda/${{ matrix.lambda }}
+          pip install -r requirements-dev.txt
+
+      - name: Run unit tests with moto mocks
+        run: |
+          cd terraform/lambda/${{ matrix.lambda }}
+          AWS_DEFAULT_REGION=us-east-1 pytest tests/ -v --cov --cov-report=xml --cov-report=html --junitxml=test-results.xml
+
+      - name: Upload coverage reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ matrix.lambda }}-coverage
+          path: |
+            terraform/lambda/${{ matrix.lambda }}/coverage.xml
+            terraform/lambda/${{ matrix.lambda }}/htmlcov/
+            terraform/lambda/${{ matrix.lambda }}/test-results.xml
+          retention-days: 30
+
+      
