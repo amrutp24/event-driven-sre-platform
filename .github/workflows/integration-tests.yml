@@ -23,7 +23,7 @@ jobs:
 
       - name: Run Checkov locally
         run: |
-          checkov -d terraform/ --var-file ${{ env.TF_VAR_FILE }} --skip-download --external-checks-git --skip-check CKV_AWS_1,CKV_AWS_2,CKV_AWS_3,CKV_AWS_20,CKV_AWS_21,CKV_AWS_41,CKV_AWS_57,CKV_AWS_58,CKV_AWS_61,CKV_AWS_84,CKV_AWS_88,CKV_AWS_93,CKV_AWS_94,CKV_AWS_95,CKV_AWS_98,CKV_AWS_99 | tee reports/checkov-results.txt
+          checkov -d terraform/ --var-file ${{ env.TF_VAR_FILE }} --skip-download --external-modules-download --skip-check CKV_AWS_1,CKV_AWS_2,CKV_AWS_3,CKV_AWS_20,CKV_AWS_21,CKV_AWS_41,CKV_AWS_57,CKV_AWS_58,CKV_AWS_61,CKV_AWS_84,CKV_AWS_88,CKV_AWS_93,CKV_AWS_94,CKV_AWS_95,CKV_AWS_98,CKV_AWS_99 | tee reports/checkov-results.txt
 
       - name: Upload Checkov results
         uses: actions/upload-artifact@v4
