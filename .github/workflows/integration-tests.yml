@@ -138,9 +138,11 @@ jobs:
           terraform fmt -check -diff
 
       - name: Terraform validate (local backend)
+        env:
+          TF_VAR_file: terraform/ci.tfvars
         run: |
           cd terraform
-          terraform validate -var-file=${{ env.TF_VAR_FILE }} -no-color
+          terraform validate -no-color
 
       - name: Install tflint
         run: |
