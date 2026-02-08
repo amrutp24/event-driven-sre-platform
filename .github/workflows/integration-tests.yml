@@ -7,12 +7,19 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+env:
+  TF_VAR_FILE: terraform/ci.tfvars
+
 jobs:
   terraform-security-scan:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Use CI variables file
+        run: |
+          cp terraform/ci.tfvars ${{ env.TF_VAR_FILE }}
 
       - name: Run Checkov
         id: checkov
@@ -23,6 +30,7 @@ jobs:
           output_format: cli
           output_file_path: reports/checkov-results.txt
           soft_fail: true
+          var_file: ${{ env.TF_VAR_FILE }}
 
       - name: Upload Checkov results
         uses: actions/upload-artifact@v4
@@ -73,10 +81,29 @@ jobs:
           cd terraform/lambda/${{ matrix.lambda }}
           pip install -r requirements-dev.txt
 
+      - name: Create CI environment variables
+        run: |
+          cat > .ci-env <<EOF
+          export AWS_DEFAULT_REGION=us-east-1
+          export REGION=us-east-1
+          export CLUSTER_NAME=event-driven-sre-ci-eks
+          export TARGET_NAMESPACE=apps
+          export TARGET_DEPLOYMENT=checkout
+          export DEGRADED_PARAM=/checkout/degraded_mode
+          EOF
+          source .ci-env
+
       - name: Run unit tests with moto mocks
+        env:
+          AWS_DEFAULT_REGION: us-east-1
+          REGION: us-east-1
+          CLUSTER_NAME: event-driven-sre-ci-eks
+          TARGET_NAMESPACE: apps
+          TARGET_DEPLOYMENT: checkout
+          DEGRADED_PARAM: /checkout/degraded_mode
         run: |
           cd terraform/lambda/${{ matrix.lambda }}
-          AWS_DEFAULT_REGION=us-east-1 pytest tests/ -v --cov --cov-report=xml --cov-report=html --junitxml=test-results.xml
+          pytest tests/ -v --cov --cov-report=xml --cov-report=html --junitxml=test-results.xml
 
       - name: Upload coverage reports
         uses: actions/upload-artifact@v4
@@ -95,18 +122,27 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Use CI variables file
+        run: |
+          cp terraform/ci.tfvars ${{ env.TF_VAR_FILE }}
+
       - name: Set up Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.5.7"
 
+      - name: Terraform init
+        run: |
+          cd terraform
+          terraform init -input=false
+
       - name: Terraform fmt check
-        run: terraform fmt -check -diff terraform/
+        run: terraform fmt -check -diff -var-file=${{ env.TF_VAR_FILE }} terraform/
 
       - name: Terraform validate
         run: |
           cd terraform
-          terraform validate
+          terraform validate -var-file=${{ env.TF_VAR_FILE }}
 
       - name: Install tflint
         run: |
@@ -115,7 +151,7 @@ jobs:
           sudo mv tflint /usr/local/bin/
 
       - name: Run tflint
-        run: tflint terraform/
+        run: tflint --var-file=${{ env.TF_VAR_FILE }} terraform/
 
   application-tests:
     runs-on: ubuntu-latest
