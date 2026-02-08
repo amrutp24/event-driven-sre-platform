@@ -209,6 +209,13 @@ class TestDeploymentActions:
 class TestActionRouting:
     """Test alert action routing logic"""
 
+    @patch.dict(os.environ, {
+        'REGION': 'us-east-1',
+        'CLUSTER_NAME': 'test-cluster',
+        'TARGET_NAMESPACE': 'test-namespace',
+        'TARGET_DEPLOYMENT': 'test-deployment',
+        'DEGRADED_PARAM': '/test/degraded_mode'
+    })
     @patch('handler.SSM')
     @patch('handler._cluster_conn')
     @patch('handler._eks_bearer_token')
@@ -355,6 +362,7 @@ class TestErrorHandling:
     @patch.dict(os.environ, {}, clear=True)
     def test_missing_cluster_name(self, sample_normalized_alert):
         """Test error when CLUSTER_NAME is not set"""
+        # No need for boto3 mock since we check env vars first
         with pytest.raises(RuntimeError, match="CLUSTER_NAME env var is required"):
             handler.lambda_handler(sample_normalized_alert, {})
 
@@ -451,13 +459,17 @@ class TestEnvironmentVariables:
     @patch.dict(os.environ, {
         'CLUSTER_NAME': 'test-cluster'
     }, clear=True)  # No REGION set
-    def test_region_fallback_to_aws_region(self, sample_normalized_alert):
+    @patch('handler._k8s_request')
+    @patch('boto3.client')
+    def test_region_fallback_to_aws_region(self, mock_boto3, mock_k8s_request, sample_normalized_alert):
         """Test fallback to AWS_REGION when REGION is not set"""
         with patch.dict(os.environ, {'AWS_REGION': 'us-gov-west-1'}, clear=False):
             with patch('handler._cluster_conn') as mock_cluster:
                 mock_cluster.return_value = ('https://test-cluster.us-gov-west-1.amazonaws.com', b'test-ca')
                 with patch('handler._eks_bearer_token') as mock_token:
                     mock_token.return_value = 'test-token'
+                    # Mock k8s request to prevent real network calls
+                    mock_k8s_request.return_value = {"status": "ok"}
                     
                     result = handler.lambda_handler(sample_normalized_alert, {})
                     

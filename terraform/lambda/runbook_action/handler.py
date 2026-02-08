@@ -11,12 +11,9 @@ import requests
 EKS = boto3.client("eks")
 SSM = boto3.client("ssm")
 
-# Env
-REGION = os.environ.get("REGION")
-CLUSTER_NAME = os.environ.get("CLUSTER_NAME")
-TARGET_NAMESPACE = os.environ.get("TARGET_NAMESPACE", "apps")
-TARGET_DEPLOYMENT = os.environ.get("TARGET_DEPLOYMENT", "checkout")
-DEGRADED_PARAM = os.environ.get("DEGRADED_PARAM", "/checkout/degraded_mode")
+# Env defaults
+def get_env(name, default=None):
+    return os.environ.get(name, default)
 
 def _eks_bearer_token(cluster_name: str, region: str) -> str:
     """Generate an EKS authentication token (k8s-aws-v1) using a presigned STS GetCallerIdentity URL."""
@@ -113,16 +110,17 @@ def _scale_deployment(endpoint, token, ca, namespace, deployment, replicas):
 
 def lambda_handler(event, context):
     """
-    Input is the normalized alert from alert_ingest (incident_id, alertname, severity, annotations, labels).
+    Input is normalized alert from alert_ingest (incident_id, alertname, severity, annotations, labels).
     Actions are derived from alertname + severity by default; can be overridden with annotations.runbook_action.
     """
-    region = REGION or os.environ.get("AWS_REGION") or "us-east-1"
-    cluster = CLUSTER_NAME
+    # Read environment variables
+    region = get_env("REGION") or get_env("AWS_REGION") or "us-east-1"
+    cluster = get_env("CLUSTER_NAME")
     if not cluster:
         raise RuntimeError("CLUSTER_NAME env var is required")
-
-    endpoint, ca = _cluster_conn(cluster)
-    token = _eks_bearer_token(cluster, region)
+    target_namespace = get_env("TARGET_NAMESPACE", "apps")
+    target_deployment = get_env("TARGET_DEPLOYMENT", "checkout")
+    degraded_param = get_env("DEGRADED_PARAM", "/checkout/degraded_mode")
 
     alertname = event.get("alertname", "UnknownAlert")
     severity = event.get("severity", "ticket")
@@ -141,30 +139,34 @@ def lambda_handler(event, context):
     if action == "notify_only":
         return result
 
+    # Only connect to cluster if we need to perform actions
+    endpoint, ca = _cluster_conn(cluster)
+    token = _eks_bearer_token(cluster, region)
+
     if action == "degrade":
         # also store state in SSM for audit/visibility
-        SSM.put_parameter(Name=DEGRADED_PARAM, Value="true", Type="String", Overwrite=True)
-        _patch_deployment_env(endpoint, token, ca, TARGET_NAMESPACE, TARGET_DEPLOYMENT, "DEGRADED_MODE", "true")
-        _restart_deployment(endpoint, token, ca, TARGET_NAMESPACE, TARGET_DEPLOYMENT)
+        SSM.put_parameter(Name=degraded_param, Value="true", Type="String", Overwrite=True)
+        _patch_deployment_env(endpoint, token, ca, target_namespace, target_deployment, "DEGRADED_MODE", "true")
+        _restart_deployment(endpoint, token, ca, target_namespace, target_deployment)
         result["degraded"] = True
         return result
 
     if action == "restart":
-        _restart_deployment(endpoint, token, ca, TARGET_NAMESPACE, TARGET_DEPLOYMENT)
+        _restart_deployment(endpoint, token, ca, target_namespace, target_deployment)
         return result
 
     if action == "scale":
         # scale to 4 by default, or derive from labels/annotations
         replicas = int(annotations.get("desired_replicas", "4"))
-        _scale_deployment(endpoint, token, ca, TARGET_NAMESPACE, TARGET_DEPLOYMENT, replicas)
+        _scale_deployment(endpoint, token, ca, target_namespace, target_deployment, replicas)
         return result
 
     if action == "degrade_or_scale":
         # degrade first for customer relief, then scale up
-        SSM.put_parameter(Name=DEGRADED_PARAM, Value="true", Type="String", Overwrite=True)
-        _patch_deployment_env(endpoint, token, ca, TARGET_NAMESPACE, TARGET_DEPLOYMENT, "DEGRADED_MODE", "true")
-        _restart_deployment(endpoint, token, ca, TARGET_NAMESPACE, TARGET_DEPLOYMENT)
-        _scale_deployment(endpoint, token, ca, TARGET_NAMESPACE, TARGET_DEPLOYMENT, int(annotations.get("desired_replicas", "4")))
+        SSM.put_parameter(Name=degraded_param, Value="true", Type="String", Overwrite=True)
+        _patch_deployment_env(endpoint, token, ca, target_namespace, target_deployment, "DEGRADED_MODE", "true")
+        _restart_deployment(endpoint, token, ca, target_namespace, target_deployment)
+        _scale_deployment(endpoint, token, ca, target_namespace, target_deployment, int(annotations.get("desired_replicas", "4")))
         result["degraded"] = True
         result["scaled_to"] = int(annotations.get("desired_replicas", "4"))
         return result
