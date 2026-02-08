@@ -17,10 +17,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Use CI variables file
-        run: |
-          cp terraform/ci.tfvars ${{ env.TF_VAR_FILE }}
-
       - name: Run Checkov
         id: checkov
         uses: bridgecrewio/checkov-action@v3
@@ -121,10 +117,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Use CI variables file
-        run: |
-          cp terraform/ci.tfvars ${{ env.TF_VAR_FILE }}
 
       - name: Set up Terraform
         uses: hashicorp/setup-terraform@v3
