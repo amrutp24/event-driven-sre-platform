@@ -121,10 +121,15 @@ jobs:
         with:
           terraform_version: "1.5.7"
 
+      - name: Disable production backend
+        run: |
+          cd terraform
+          # Rename production backend to disable it for CI
+          mv backend.tf backend.tf.backup 2>/dev/null || true
+          
       - name: Terraform init (local backend)
         run: |
           cd terraform
-          cp backend_override.tf backend_override.tf.backup 2>/dev/null || true
           terraform init -input=false -backend=false
 
       - name: Terraform fmt check

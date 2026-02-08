@@ -5,3 +5,10 @@ terraform {
     path = "./terraform.tfstate"
   }
 }
+
+# Also disable production backend configuration
+terraform {
+  backend "local" {
+    path = "/dev/null"
+  }
+}
