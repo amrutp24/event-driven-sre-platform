@@ -12,6 +12,12 @@ terraform {
     path = "./terraform.tfstate"
   }
 }
+  }
+  
+  backend "local" {
+    path = "./terraform.tfstate"
+  }
+}
 }
 
 # Also disable production backend configuration
