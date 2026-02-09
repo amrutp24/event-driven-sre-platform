@@ -16,6 +16,10 @@ ERROR_RATE = float(os.getenv("ERROR_RATE", "0.00"))
 LATENCY_MS = int(os.getenv("LATENCY_MS", "0"))
 CHAOS = os.getenv("CHAOS", "false").lower() == "true"
 
+@app.route("/")
+def home():
+    return "OK -- Flask is running"
+
 @app.get("/metrics")
 def metrics():
     return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)
@@ -58,4 +62,4 @@ def checkout():
         INFLIGHT.dec()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+    app.run(host="127.0.0.1", port=8080)
