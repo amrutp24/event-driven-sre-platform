@@ -8,3 +8,6 @@
 .DS_Store
 
 **/vendor/
+
+# test coverage data
+.coverage

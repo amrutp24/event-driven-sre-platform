@@ -207,9 +207,9 @@ sequenceDiagram
     Note over APIGW,EB: Ingestion Phase
     APIGW->>L1: Invoke with event payload
     L1->>L1: Validate JSON schema<br/>Enrich: account_id, region, timestamp
-    L1->>EB: PutEvents: source=sre.alertmanager<br/>detail-type=AlertFired
+    L1->>EB: PutEvents: source=sre.alertmanager<br/>detail-type=incident.created
     L1-->>APIGW: Return 202 Accepted
-    APIGW-->>AM: Return 200 OK
+    APIGW-->>AM: Return 202 Accepted
 
     Note over EB,SNS: Fan-out Phase
     par Parallel Targets
@@ -241,7 +241,7 @@ sequenceDiagram
     Prom->>AM: Resolve alert: CheckoutHighErrorRate
     AM->>APIGW: POST /webhook<br/>status=resolved
     APIGW->>L1: Process resolved event
-    L1->>EB: PutEvents: AlertResolved
+    L1->>EB: PutEvents: incident.resolved
     EB->>DDB: UpdateItem: status=resolved<br/>resolved_at=timestamp
 
     Note over SNS,DDB: Completion
@@ -341,7 +341,7 @@ graph TB
 - Integration: Lambda proxy integration
 
 **alert_ingest Lambda**
-- Runtime: Python 3.11
+- Runtime: Python 3.13
 - Memory: 256 MB
 - Timeout: 30 seconds
 - Concurrency: 100 reserved concurrent executions
@@ -380,7 +380,7 @@ graph TB
 - Execution history: 90 days
 
 **runbook_action Lambda**
-- Runtime: Python 3.11
+- Runtime: Python 3.13
 - Memory: 512 MB
 - Timeout: 120 seconds
 - VPC: Attached to private subnets (access to EKS API)

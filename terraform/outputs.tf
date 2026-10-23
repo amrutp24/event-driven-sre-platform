@@ -35,7 +35,20 @@ output "external_dns_role_arn" {
 }
 
 output "alert_webhook_url" {
-  value = try("${aws_apigatewayv2_api.alerts_api.api_endpoint}/${aws_apigatewayv2_stage.prod.name}/alert", null)
+  description = "POST alerts here"
+  value       = "${aws_api_gateway_stage.prod.invoke_url}/webhook"
+}
+
+output "alertmanager_api_key" {
+  description = "X-API-Key for Alertmanager; empty when webhook_require_api_key is false"
+  value       = try(aws_api_gateway_api_key.webhook["alertmanager"].value, "")
+  sensitive   = true
+}
+
+output "datadog_api_key" {
+  description = "X-API-Key for the Datadog webhook; empty when webhook_require_api_key is false"
+  value       = try(aws_api_gateway_api_key.webhook["datadog"].value, "")
+  sensitive   = true
 }
 
 output "runbook_action_lambda_arn" {

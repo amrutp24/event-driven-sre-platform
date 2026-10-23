@@ -1,4 +1,11 @@
+# Sends alerts to POST /webhook. scripts/deploy.sh replaces <WEBHOOK_URL> with
+# `terraform output alert_webhook_url` and creates the alertmanager-webhook-key
+# secret from `terraform output alertmanager_api_key`.
 alertmanager:
+  alertmanagerSpec:
+    # Mounted at /etc/alertmanager/secrets/alertmanager-webhook-key/
+    secrets:
+      - alertmanager-webhook-key
   config:
     route:
       receiver: "aws-webhook"
@@ -9,5 +16,10 @@ alertmanager:
     receivers:
     - name: "aws-webhook"
       webhook_configs:
-      - url: "https://<API_GATEWAY_ID>.execute-api.<REGION>.amazonaws.com/prod/alert"
+      - url: "<WEBHOOK_URL>"
         send_resolved: true
+        http_config:
+          http_headers:
+            X-API-Key:
+              files:
+                - /etc/alertmanager/secrets/alertmanager-webhook-key/api-key
