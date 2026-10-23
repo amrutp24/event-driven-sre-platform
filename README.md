@@ -126,6 +126,13 @@ cd terraform/lambda/runbook_action && pip install -r requirements-dev.txt && AWS
 
 CI (`.github/workflows/integration-tests.yml`) runs Checkov on the Terraform, Trivy on the container image, the app and Lambda unit tests, and `terraform fmt`, `validate` and `tflint`.
 
+## Docs
+
+- [Architecture](docs/architecture/README.md): components, the alert and remediation path, and why it's built this way
+- [Alert webhook](docs/API.md): request and response format, and how to check a request went through
+- [Security](docs/SECURITY.md): IAM, network and encryption setup, and how to report a vulnerability
+- [Demo](docs/DEMO.md): break the service on purpose and follow the alert through
+
 ## Known gaps
 
 - **The runbook Lambda can't reach the cluster yet.** Its IAM role, `event-driven-sre-runbook-action-role`, isn't granted anything inside EKS: there's no access entry and no RBAC binding. Its Kubernetes API calls are rejected until it gets an EKS access entry with permission to patch deployments in the `apps` namespace.
