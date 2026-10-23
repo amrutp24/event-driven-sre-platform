@@ -170,8 +170,7 @@ A Datadog payload is recognized by its `alert_transition` field, and it's publis
     {
       "incident_id": "1f8a2b52-3c0e-5d6f-9a1b-7c2d3e4f5a6b",
       "alertname": "CheckoutHighErrorRate",
-      "status": "firing",
-      "remediation_started": true
+      "status": "firing"
     }
   ]
 }
@@ -183,7 +182,7 @@ A Datadog payload is recognized by its `alert_transition` field, and it's publis
 | `message` | string | Human-readable confirmation |
 | `alert_count` | integer | Number of alerts processed in this request |
 | `correlation_id` | string (UUID) | Unique identifier for tracking this request through the pipeline |
-| `incidents` | array | One entry per alert. `remediation_started` is false for resolved alerts and for a firing alert whose incident already has a remediation run. |
+| `incidents` | array | One entry per alert, with its incident id. The alerts are on the EventBridge bus by the time this returns; remediation runs asynchronously. |
 
 ### Error Response (400 Bad Request)
 
@@ -339,7 +338,7 @@ curl -X POST "$WEBHOOK_URL" \
   "alert_count": 1,
   "correlation_id": "550e8400-e29b-41d4-a716-446655440000",
   "incidents": [
-    {"incident_id": "6f1c2c1e-5d1a-4f0e-9a43-2b8f6a0c9e71", "alertname": "TestAlert", "status": "firing", "remediation_started": true}
+    {"incident_id": "6f1c2c1e-5d1a-4f0e-9a43-2b8f6a0c9e71", "alertname": "TestAlert", "status": "firing"}
   ]
 }
 ```
@@ -538,15 +537,16 @@ aws logs tail /aws/lambda/PLATFORM_NAME-alert-ingest --follow --format short
 ```
 Accepted 1 alert(s), correlation_id 550e8400-e29b-41d4-a716-446655440000
 Rejected payload (INVALID_SEVERITY): Severity must be one of critical, warning, info {'field': 'alerts[0].labels.severity', ...}
-Runbook already started for incident 1f8a2b52-3c0e-5d6f-9a1b-7c2d3e4f5a6b
 ```
 
 ### Check EventBridge Events
 
-Verify events are being published to EventBridge:
+Every event on the bus is logged, and events EventBridge couldn't deliver end up in the dead-letter queue:
 
 ```bash
-aws events put-events --entries file://test-event.json
+aws logs tail /aws/events/PLATFORM_NAME --follow
+aws sqs get-queue-attributes --attribute-names ApproximateNumberOfMessages \
+  --queue-url "$(terraform -chdir=terraform output -raw events_dlq_url)"
 ```
 
 ### Check DynamoDB Incident Records
@@ -557,7 +557,7 @@ Verify incidents are being stored:
 aws dynamodb scan \
   --table-name PLATFORM_NAME-incidents \
   --max-items 5 \
-  --query 'Items[*].[incident_id.S, alertname.S, status.S, received_at.S]' \
+  --query 'Items[*].[incident_id.S, alertname.S, status.S, first_seen_at.S, last_action.S]' \
   --output table
 ```
 
@@ -649,6 +649,7 @@ aws cloudwatch put-metric-alarm \
 | Version | Date | Changes |
 |---------|------|---------|
 | 1.0 | 2026-02-02 | Initial API documentation |
+| 1.2 | 2026-10-23 | `alert_ingest` publishes to EventBridge only; rules route to DynamoDB, SNS and Step Functions. `remediation_started` removed from the response. |
 | 1.1 | 2026-10-23 | `POST /webhook` on a REST API with schema validation, API keys and throttling; Datadog payloads; `202` and `400` responses as documented |
 
 ---
@@ -662,4 +663,4 @@ For API issues or questions:
 ---
 
 **Last Updated**: 2026-10-23
-**API Version**: 1.1
+**API Version**: 1.2

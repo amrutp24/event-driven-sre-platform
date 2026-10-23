@@ -60,21 +60,6 @@ All IAM roles and policies follow the principle of least privilege—granting on
       "Effect": "Allow",
       "Action": ["events:PutEvents"],
       "Resource": "arn:aws:events:REGION:ACCOUNT_ID:event-bus/PLATFORM_NAME-bus"
-    },
-    {
-      "Effect": "Allow",
-      "Action": ["dynamodb:PutItem"],
-      "Resource": "arn:aws:dynamodb:REGION:ACCOUNT_ID:table/PLATFORM_NAME-incidents"
-    },
-    {
-      "Effect": "Allow",
-      "Action": ["sns:Publish"],
-      "Resource": "arn:aws:sns:REGION:ACCOUNT_ID:PLATFORM_NAME-alerts"
-    },
-    {
-      "Effect": "Allow",
-      "Action": ["states:StartExecution"],
-      "Resource": "arn:aws:states:REGION:ACCOUNT_ID:stateMachine:PLATFORM_NAME-runbook"
     }
   ]
 }
@@ -84,7 +69,7 @@ All IAM roles and policies follow the principle of least privilege—granting on
 - ✅ No wildcards (`*`) for application resources
 - ✅ Scoped to specific log group (not all CloudWatch Logs)
 - ✅ Only write access to specific event bus (not all EventBridge buses)
-- ✅ Only PutItem on specific table (not all DynamoDB operations)
+- ✅ No access to DynamoDB, SNS or Step Functions at all; EventBridge rules deliver the events
 - ✅ Cannot read incidents or delete data
 
 #### 2. runbook_action Lambda Role
@@ -159,6 +144,16 @@ All IAM roles and policies follow the principle of least privilege—granting on
       "Effect": "Allow",
       "Action": ["lambda:InvokeFunction"],
       "Resource": "arn:aws:lambda:REGION:ACCOUNT_ID:function:PLATFORM_NAME-runbook-action"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["dynamodb:UpdateItem"],
+      "Resource": "arn:aws:dynamodb:REGION:ACCOUNT_ID:table/PLATFORM_NAME-incidents"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["events:PutEvents"],
+      "Resource": "arn:aws:events:REGION:ACCOUNT_ID:event-bus/PLATFORM_NAME-bus"
     }
   ]
 }
@@ -167,6 +162,28 @@ All IAM roles and policies follow the principle of least privilege—granting on
 **Why This Is Secure**:
 - ✅ CloudWatch Logs permissions required for Step Functions logging (cannot be scoped further)
 - ✅ Only invoke specific Lambda function (not all functions)
+- ✅ `UpdateItem` on the incidents table only, used to claim an incident before remediating it
+- ✅ `PutEvents` on the platform's bus only, for `action.completed`
+
+### Incident Recorder Role
+
+**Purpose**: The `incident-recorder` Express state machine writes incident events to DynamoDB.
+
+**Permissions**: `dynamodb:UpdateItem` on `PLATFORM_NAME-incidents`, nothing else. It can't read or delete records.
+
+### EventBridge Target Role
+
+**Purpose**: Lets the EventBridge rules start the two state machines.
+
+**Permissions**: `states:StartExecution` on `PLATFORM_NAME-runbook` and `PLATFORM_NAME-incident-recorder`.
+
+The other targets grant EventBridge access through resource policies, each limited with an `aws:SourceArn` condition where the service supports it:
+
+| Resource | Allows `events.amazonaws.com` to | Limited to |
+| --- | --- | --- |
+| SNS topic `PLATFORM_NAME-alerts` | `sns:Publish` | the `incident-created` and `incident-resolved` rules |
+| SQS queue `PLATFORM_NAME-events-dlq` | `sqs:SendMessage` | the platform's four rules |
+| Log group `/aws/events/PLATFORM_NAME` | `logs:CreateLogStream`, `logs:PutLogEvents` | that log group |
 
 ---
 

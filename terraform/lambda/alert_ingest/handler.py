@@ -3,12 +3,14 @@ alert_ingest: the Lambda behind POST /webhook.
 
 Accepts an Alertmanager webhook payload or a Datadog webhook payload (see
 docs/API.md), validates it, normalizes every alert into one format, enriches it
-with the account, region and receive time, and records it.
+with the account, region and receive time, and puts it on the EventBridge bus as
+incident.created or incident.resolved. EventBridge rules take it from there
+(terraform/event_routing.tf).
 
 Each alert gets a stable incident_id, derived from Alertmanager's fingerprint and
 start time or Datadog's alert cycle key. A firing alert and its later resolved
-notification therefore share an incident_id, and a re-sent firing alert doesn't
-start a second remediation run.
+notification therefore share an incident_id, and the runbook only claims each
+incident once.
 """
 import base64
 import json
@@ -25,15 +27,8 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 eventbridge = boto3.client("events")
-ddb = boto3.resource("dynamodb")
-sns = boto3.client("sns")
-sfn = boto3.client("stepfunctions")
 
 BUS = os.environ["EVENT_BUS_NAME"]
-TABLE = os.environ["INCIDENT_TABLE"]
-RUNBOOK_ARN = os.environ["RUNBOOK_ARN"]
-TOPIC = os.environ["SNS_TOPIC_ARN"]
-RUNBOOK_ACTION_ARN = os.environ.get("RUNBOOK_ACTION_ARN", "")
 
 SEVERITIES = ("critical", "warning", "info")
 STATUSES = ("firing", "resolved")
@@ -46,7 +41,8 @@ INCIDENT_NAMESPACE = uuid.UUID("6f0c8f52-2d1e-4b7e-9c4a-5b8f3e1d2a90")
 DATADOG_RESOLVED = {"recovered"}
 DATADOG_PRIORITY_SEVERITY = {"P1": "critical", "P2": "critical", "P3": "warning", "P4": "info", "P5": "info"}
 
-SNS_SUBJECT_MAX = 100
+# put_events accepts up to 10 entries per call
+PUT_EVENTS_BATCH = 10
 
 
 class PayloadError(Exception):
@@ -270,75 +266,28 @@ def _account_id(context):
     return parts[4] if len(parts) > 4 else None
 
 
-# ---------------------------------------------------------------- side effects
+# ---------------------------------------------------------------- publishing
 
-def _store(alert):
-    table = ddb.Table(TABLE)
-    if alert["status"] == "firing":
-        table.put_item(Item={
-            "incident_id": alert["incident_id"],
-            "ts": alert["timestamp"],
-            "received_at": alert["received_at"],
-            "source": alert["source"],
-            "correlation_id": alert["correlation_id"],
-            "service": alert["service"],
-            "alertname": alert["alertname"],
-            "severity": alert["severity"],
-            "status": "firing",
-            "payload": alert,
-        })
-    else:
-        table.update_item(
-            Key={"incident_id": alert["incident_id"]},
-            UpdateExpression="SET #status = :status, resolved_at = :resolved_at, "
-                             "alertname = :alertname, service = :service, severity = :severity",
-            ExpressionAttributeNames={"#status": "status"},
-            ExpressionAttributeValues={
-                ":status": "resolved",
-                ":resolved_at": alert["timestamp"],
-                ":alertname": alert["alertname"],
-                ":service": alert["service"],
-                ":severity": alert["severity"],
-            },
-        )
+def _entry(alert):
+    return {
+        "EventBusName": BUS,
+        "Source": f"sre.{alert['source']}",
+        "DetailType": "incident.created" if alert["status"] == "firing" else "incident.resolved",
+        "Detail": json.dumps(alert),
+    }
 
 
-def _publish_event(alert):
-    try:
-        resp = eventbridge.put_events(Entries=[{
-            "EventBusName": BUS,
-            "Source": f"sre.{alert['source']}",
-            "DetailType": "incident.created" if alert["status"] == "firing" else "incident.resolved",
-            "Detail": json.dumps(alert),
-        }])
-    except (ClientError, BotoCoreError) as exc:
-        raise EventBridgeError(str(exc)) from exc
-    if resp.get("FailedEntryCount"):
-        raise EventBridgeError(json.dumps(resp.get("Entries", [])))
-
-
-def _notify(alert):
-    subject = f"[{alert['severity'].upper()}] {alert['service']} - {alert['alertname']} ({alert['status']})"
-    sns.publish(
-        TopicArn=TOPIC,
-        Subject=subject[:SNS_SUBJECT_MAX],
-        Message=json.dumps(alert, indent=2)[:240000],
-    )
-
-
-def _start_runbook(alert):
-    # Firing alerts only; acting on a resolved notification would undo the recovery.
-    # The execution name is the incident_id, so a re-sent alert can't start a
-    # second run for the same incident.
-    try:
-        sfn.start_execution(stateMachineArn=RUNBOOK_ARN, name=alert["incident_id"],
-                            input=json.dumps(alert))
-        return True
-    except ClientError as exc:
-        if exc.response.get("Error", {}).get("Code") == "ExecutionAlreadyExists":
-            logger.info("Runbook already started for incident %s", alert["incident_id"])
-            return False
-        raise
+def _publish(alerts):
+    entries = [_entry(a) for a in alerts]
+    for i in range(0, len(entries), PUT_EVENTS_BATCH):
+        batch = entries[i:i + PUT_EVENTS_BATCH]
+        try:
+            resp = eventbridge.put_events(Entries=batch)
+        except (ClientError, BotoCoreError) as exc:
+            raise EventBridgeError(str(exc)) from exc
+        if resp.get("FailedEntryCount"):
+            failed = [e for e in resp.get("Entries", []) if e.get("ErrorCode")]
+            raise EventBridgeError(json.dumps(failed))
 
 
 # ---------------------------------------------------------------- handler
@@ -363,30 +312,24 @@ def lambda_handler(event, context):
             "correlation_id": correlation_id,
             "account_id": account_id,
             "region": region,
-            "runbook_action_arn": RUNBOOK_ACTION_ARN,
         })
 
-    incidents = []
     try:
-        for alert in alerts:
-            _store(alert)
-            _publish_event(alert)
-            _notify(alert)
-            started = _start_runbook(alert) if alert["status"] == "firing" else False
-            incidents.append({
-                "incident_id": alert["incident_id"],
-                "alertname": alert["alertname"],
-                "status": alert["status"],
-                "remediation_started": started,
-            })
+        _publish(alerts)
     except EventBridgeError as exc:
+        # Earlier batches may have gone through. Alertmanager retries the whole
+        # request, which is safe: the recorder upserts and the runbook claims
+        # each incident once.
         logger.exception("EventBridge publish failed (correlation_id %s)", correlation_id)
         return _error(502, "EVENTBRIDGE_ERROR", "Failed to publish event to EventBridge",
                       {"correlation_id": correlation_id, "reason": str(exc)[:500]})
-    except (ClientError, BotoCoreError):
+    except Exception:
         logger.exception("Failed to process alert (correlation_id %s)", correlation_id)
         return _error(500, "INTERNAL_ERROR", "Failed to process alert; check CloudWatch Logs",
                       {"correlation_id": correlation_id})
+
+    incidents = [{"incident_id": a["incident_id"], "alertname": a["alertname"], "status": a["status"]}
+                 for a in alerts]
 
     logger.info("Accepted %d alert(s), correlation_id %s", len(alerts), correlation_id)
     return _response(202, {

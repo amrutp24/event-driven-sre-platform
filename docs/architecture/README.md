@@ -79,7 +79,8 @@ graph TB
     L1 -->|Put Events| EB
 
     %% Event Routing
-    EB -->|Route: incident.created| DDB
+    EB -->|Route: incident.created,<br/>incident.resolved, action.completed| REC[incident-recorder<br/>Express state machine]
+    REC -->|UpdateItem| DDB
     EB -->|Route: incident.created| SNS
     EB -->|Route: incident.created| SF
     EB -->|Log All Events| CW
@@ -96,7 +97,7 @@ graph TB
     classDef storage fill:#3F8624,stroke:#fff,stroke-width:2px,color:#fff
     classDef external fill:#632CA6,stroke:#fff,stroke-width:2px,color:#fff
 
-    class APIGW,L1,L2,EB,SF,ALB,R53,CF,SNS,CW aws
+    class APIGW,L1,L2,EB,SF,REC,ALB,R53,CF,SNS,CW aws
     class APP,PROM,AM,GRAF,SM k8s
     class DDB,SSM storage
     class DD external
@@ -127,7 +128,7 @@ flowchart TD
 
     Step9[8. EventBridge routes to 4 targets] --> Multi{Fan-out}
 
-    Multi --> Target1[8a. DynamoDB PutItem<br/>Store incident record]
+    Multi --> Target1[8a. incident-recorder state machine<br/>DynamoDB: store incident record]
     Multi --> Target2[8b. SNS Publish<br/>Notify on-call engineer]
     Multi --> Target3[8c. CloudWatch Logs<br/>Audit trail]
     Multi --> Target4[8d. Step Functions StartExecution<br/>Begin runbook automation]
@@ -213,7 +214,7 @@ sequenceDiagram
 
     Note over EB,SNS: Fan-out Phase
     par Parallel Targets
-        EB->>DDB: PutItem: incident record<br/>{id, status=open, timestamp}
+        EB->>DDB: incident-recorder upserts record<br/>{id, status=open, first_seen_at}
         EB->>SNS: Publish notification<br/>Alert on-call engineer
         EB->>SF: StartExecution: incident-response-runbook
     end
@@ -242,7 +243,7 @@ sequenceDiagram
     AM->>APIGW: POST /webhook<br/>status=resolved
     APIGW->>L1: Process resolved event
     L1->>EB: PutEvents: incident.resolved
-    EB->>DDB: UpdateItem: status=resolved<br/>resolved_at=timestamp
+    EB->>DDB: incident-recorder: UpdateItem<br/>status=resolved, resolved_at
 
     Note over SNS,DDB: Completion
     EB->>SNS: Publish: Incident auto-resolved<br/>MTTR: 90 seconds
@@ -257,8 +258,8 @@ graph TB
     subgraph "IAM Roles & Policies"
         R1[alert_ingest Lambda Role<br/>Permissions:<br/>- eventbridge:PutEvents]
         R2[runbook_action Lambda Role<br/>Permissions:<br/>- eks:DescribeCluster<br/>- ssm:GetParameter<br/>- ssm:PutParameter<br/>- sts:GetCallerIdentity]
-        R3[EventBridge Role<br/>Permissions:<br/>- dynamodb:PutItem<br/>- sns:Publish<br/>- states:StartExecution<br/>- logs:PutLogEvents]
-        R4[Step Functions Role<br/>Permissions:<br/>- lambda:InvokeFunction<br/>- dynamodb:UpdateItem]
+        R3[EventBridge Role<br/>Permissions:<br/>- states:StartExecution<br/>SNS, SQS and Logs grant it<br/>through resource policies]
+        R4[Step Functions Role<br/>Permissions:<br/>- lambda:InvokeFunction<br/>- dynamodb:UpdateItem<br/>- events:PutEvents]
     end
 
     subgraph "EKS Access Entry"
@@ -355,14 +356,16 @@ graph TB
 ### 3. Event Routing Layer
 
 **EventBridge**
-- Custom event bus: `sre-platform-events`
+- Custom event bus: `event-driven-sre-bus` (`<name>-bus`)
 - Event sources: `sre.alertmanager`, `sre.datadog`
 - Event patterns for routing:
   - `incident.created` -> DynamoDB, SNS, Step Functions
   - `incident.resolved` -> DynamoDB, SNS
   - `action.completed` -> DynamoDB
+  - every `sre.*` event -> CloudWatch Logs, `/aws/events/<name>`, kept 30 days
+- DynamoDB writes go through the `incident-recorder` Express state machine, since DynamoDB isn't an EventBridge target
 - Archive: 7-day event replay capability
-- Dead-letter queue: Capture failed events for retry
+- Dead-letter queue: every target retries for up to an hour (20 attempts), then sends the event to an SQS queue that keeps it 14 days
 
 ### 4. Orchestration Layer
 
@@ -423,6 +426,7 @@ graph TB
   - `/aws/lambda/alert-ingest`
   - `/aws/lambda/runbook-action`
   - `/aws/states/incident-response-runbook`
+  - `/aws/events/<name>` (every event on the bus)
 - Retention: 30 days
 - Insights queries: Pre-built dashboards for MTTR, alert volume
 - Metric filters: Extract custom metrics (remediation success rate)

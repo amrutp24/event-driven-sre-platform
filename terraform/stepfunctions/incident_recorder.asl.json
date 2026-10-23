@@ -1,0 +1,142 @@
+{
+  "Comment": "Writes incident events to DynamoDB, since EventBridge can't target DynamoDB directly. Input is the whole EventBridge event.",
+  "StartAt": "WhichEvent",
+  "States": {
+    "WhichEvent": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.detail-type",
+          "StringEquals": "incident.created",
+          "Next": "RecordCreated"
+        },
+        {
+          "Variable": "$.detail-type",
+          "StringEquals": "incident.resolved",
+          "Next": "RecordResolved"
+        },
+        {
+          "And": [
+            { "Variable": "$.detail-type", "StringEquals": "action.completed" },
+            { "Variable": "$.detail.result", "StringEquals": "failed" }
+          ],
+          "Next": "RecordActionFailed"
+        },
+        {
+          "Variable": "$.detail-type",
+          "StringEquals": "action.completed",
+          "Next": "RecordActionCompleted"
+        }
+      ],
+      "Default": "Ignore"
+    },
+    "RecordCreated": {
+      "Comment": "Upsert. A re-sent firing alert bumps last_seen_at and notification_count but doesn't reset the status.",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${table_name}",
+        "Key": {
+          "incident_id": { "S.$": "$.detail.incident_id" }
+        },
+        "UpdateExpression": "SET #status = if_not_exists(#status, :open), alertname = :alertname, service = :service, severity = :severity, #source = :source, first_seen_at = if_not_exists(first_seen_at, :received_at), last_seen_at = :received_at, correlation_id = :correlation_id, payload = :payload ADD notification_count :one",
+        "ExpressionAttributeNames": { "#status": "status", "#source": "source" },
+        "ExpressionAttributeValues": {
+          ":open": { "S": "open" },
+          ":alertname": { "S.$": "$.detail.alertname" },
+          ":service": { "S.$": "$.detail.service" },
+          ":severity": { "S.$": "$.detail.severity" },
+          ":source": { "S.$": "$.detail.source" },
+          ":received_at": { "S.$": "$.detail.received_at" },
+          ":correlation_id": { "S.$": "$.detail.correlation_id" },
+          ":payload": { "S.$": "States.JsonToString($.detail)" },
+          ":one": { "N": "1" }
+        }
+      },
+      "End": true
+    },
+    "RecordResolved": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${table_name}",
+        "Key": {
+          "incident_id": { "S.$": "$.detail.incident_id" }
+        },
+        "UpdateExpression": "SET #status = :resolved, resolved_at = :received_at, last_seen_at = :received_at",
+        "ExpressionAttributeNames": { "#status": "status" },
+        "ExpressionAttributeValues": {
+          ":resolved": { "S": "resolved" },
+          ":received_at": { "S.$": "$.detail.received_at" }
+        }
+      },
+      "End": true
+    },
+    "RecordActionCompleted": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${table_name}",
+        "Key": {
+          "incident_id": { "S.$": "$.detail.incident_id" }
+        },
+        "UpdateExpression": "SET actions_taken = list_append(if_not_exists(actions_taken, :empty), :action), last_action = :name, last_action_result = :result, last_action_at = :at",
+        "ExpressionAttributeValues": {
+          ":empty": { "L": [] },
+          ":action": {
+            "L": [
+              {
+                "M": {
+                  "action": { "S.$": "$.detail.action" },
+                  "result": { "S.$": "$.detail.result" },
+                  "at": { "S.$": "$.time" },
+                  "execution": { "S.$": "$.detail.execution" }
+                }
+              }
+            ]
+          },
+          ":name": { "S.$": "$.detail.action" },
+          ":result": { "S.$": "$.detail.result" },
+          ":at": { "S.$": "$.time" }
+        }
+      },
+      "End": true
+    },
+    "RecordActionFailed": {
+      "Comment": "Remediation gave up after its retries, so the incident needs a person.",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${table_name}",
+        "Key": {
+          "incident_id": { "S.$": "$.detail.incident_id" }
+        },
+        "UpdateExpression": "SET #status = :escalated, actions_taken = list_append(if_not_exists(actions_taken, :empty), :action), last_action = :name, last_action_result = :result, last_action_at = :at",
+        "ExpressionAttributeNames": { "#status": "status" },
+        "ExpressionAttributeValues": {
+          ":escalated": { "S": "escalated" },
+          ":empty": { "L": [] },
+          ":action": {
+            "L": [
+              {
+                "M": {
+                  "action": { "S.$": "$.detail.action" },
+                  "result": { "S.$": "$.detail.result" },
+                  "at": { "S.$": "$.time" },
+                  "execution": { "S.$": "$.detail.execution" }
+                }
+              }
+            ]
+          },
+          ":name": { "S.$": "$.detail.action" },
+          ":result": { "S.$": "$.detail.result" },
+          ":at": { "S.$": "$.time" }
+        }
+      },
+      "End": true
+    },
+    "Ignore": {
+      "Type": "Succeed"
+    }
+  }
+}

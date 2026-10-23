@@ -44,21 +44,6 @@ resource "aws_iam_role_policy" "lambda_policy" {
         Effect   = "Allow",
         Action   = ["events:PutEvents"],
         Resource = aws_cloudwatch_event_bus.sre.arn
-      },
-      {
-        Effect   = "Allow",
-        Action   = ["dynamodb:PutItem", "dynamodb:UpdateItem"],
-        Resource = aws_dynamodb_table.incidents.arn
-      },
-      {
-        Effect   = "Allow",
-        Action   = ["sns:Publish"],
-        Resource = aws_sns_topic.alerts.arn
-      },
-      {
-        Effect   = "Allow",
-        Action   = ["states:StartExecution"],
-        Resource = aws_sfn_state_machine.runbook.arn
       }
     ]
   })
@@ -89,15 +74,31 @@ resource "aws_iam_role_policy" "sfn_policy" {
           "logs:DeleteLogDelivery", "logs:ListLogDeliveries", "logs:PutResourcePolicy",
         "logs:DescribeResourcePolicies", "logs:DescribeLogGroups"],
         Resource = "*"
+      },
+      {
+        # ClaimIncident: one remediation run per incident
+        Effect   = "Allow",
+        Action   = ["dynamodb:UpdateItem"],
+        Resource = aws_dynamodb_table.incidents.arn
+      },
+      {
+        # ReportCompleted / ReportFailed: action.completed events
+        Effect   = "Allow",
+        Action   = ["events:PutEvents"],
+        Resource = aws_cloudwatch_event_bus.sre.arn
       }
     ]
   })
 }
 
 resource "aws_sfn_state_machine" "runbook" {
-  name       = "${var.name}-runbook"
-  role_arn   = aws_iam_role.sfn_role.arn
-  definition = file("${path.module}/stepfunctions/runbook.asl.json")
+  name     = "${var.name}-runbook"
+  role_arn = aws_iam_role.sfn_role.arn
+  definition = templatefile("${path.module}/stepfunctions/runbook.asl.json", {
+    table_name         = aws_dynamodb_table.incidents.name
+    runbook_action_arn = aws_lambda_function.runbook_action.arn
+    event_bus_name     = aws_cloudwatch_event_bus.sre.name
+  })
 }
 
 resource "aws_lambda_function" "alert_ingest" {
@@ -114,11 +115,7 @@ resource "aws_lambda_function" "alert_ingest" {
 
   environment {
     variables = {
-      EVENT_BUS_NAME     = aws_cloudwatch_event_bus.sre.name
-      INCIDENT_TABLE     = aws_dynamodb_table.incidents.name
-      RUNBOOK_ARN        = aws_sfn_state_machine.runbook.arn
-      SNS_TOPIC_ARN      = aws_sns_topic.alerts.arn
-      RUNBOOK_ACTION_ARN = aws_lambda_function.runbook_action.arn
+      EVENT_BUS_NAME = aws_cloudwatch_event_bus.sre.name
     }
   }
 }
