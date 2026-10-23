@@ -128,9 +128,9 @@ All IAM roles and policies follow the principle of least privilege—granting on
 - ✅ Only describe specific EKS cluster (not all clusters)
 - ✅ SSM access limited to `/checkout/*` namespace (not all parameters)
 - ✅ Cannot delete SSM parameters or modify other application configs
-- ✅ `sts:GetCallerIdentity` required for IRSA token exchange (cannot be scoped)
+- ✅ `sts:GetCallerIdentity` required to sign the EKS authentication token (cannot be scoped)
 
-**Note**: The actual Kubernetes access is controlled by RBAC (see next section), not IAM.
+**Note**: The actual Kubernetes access is controlled by RBAC (see below), not IAM. The role also has the AWS-managed `AWSLambdaVPCAccessExecutionRole` policy so the Lambda can run in the private subnets.
 
 ### Step Functions Execution Role
 
@@ -183,7 +183,7 @@ IRSA allows Kubernetes pods to assume IAM roles via the EKS OIDC provider, elimi
 2. EKS mutating webhook injects AWS credentials as environment variables
 3. Pod calls AWS STS AssumeRoleWithWebIdentity using OIDC token
 4. STS returns temporary credentials (valid for 1 hour)
-5. Pod uses temporary credentials to call AWS APIs or Kubernetes API (via Lambda)
+5. Pod uses temporary credentials to call AWS APIs
 ```
 
 ### Security Benefits
@@ -193,45 +193,30 @@ IRSA allows Kubernetes pods to assume IAM roles via the EKS OIDC provider, elimi
 - **Audit Trail**: Every AssumeRoleWithWebIdentity call logged in CloudTrail
 - **Least Privilege**: ServiceAccount bound to specific IAM role and Kubernetes Role
 
-### IRSA Configuration for runbook_action Lambda
+### How the runbook_action Lambda authenticates
 
-**IAM Role Trust Policy**:
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Principal": {
-        "Federated": "arn:aws:iam::ACCOUNT_ID:oidc-provider/oidc.eks.REGION.amazonaws.com/id/OIDC_PROVIDER_ID"
-      },
-      "Action": "sts:AssumeRoleWithWebIdentity",
-      "Condition": {
-        "StringEquals": {
-          "oidc.eks.REGION.amazonaws.com/id/OIDC_PROVIDER_ID:sub": "system:serviceaccount:apps:checkout-remediation",
-          "oidc.eks.REGION.amazonaws.com/id/OIDC_PROVIDER_ID:aud": "sts.amazonaws.com"
-        }
-      }
-    }
-  ]
+IRSA only works for pods, and the Lambda isn't a pod. Instead it calls the Kubernetes API as its own IAM role, and the cluster maps that role to a Kubernetes group with an EKS access entry (`terraform/eks.tf`):
+
+```hcl
+access_entries = {
+  runbook_action = {
+    principal_arn     = aws_iam_role.runbook_lambda_role.arn
+    kubernetes_groups = ["checkout-remediation"]
+  }
 }
 ```
 
-**Kubernetes ServiceAccount**:
-```yaml
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: checkout-remediation
-  namespace: apps
-  annotations:
-    eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT_ID:role/PLATFORM_NAME-runbook-action-role
-```
+1. The Lambda calls `eks:DescribeCluster` for the API endpoint and CA certificate.
+2. It presigns an STS `GetCallerIdentity` request with its role's temporary credentials and sends it as a bearer token.
+3. EKS verifies the token with STS, finds the access entry for the role, and treats the caller as a member of `checkout-remediation`.
+4. Kubernetes RBAC decides what that group may do (next section).
+
+The Lambda runs in the private subnets and reaches the cluster's private API endpoint. The cluster security group allows HTTPS from the Lambda's security group only.
 
 **Security Properties**:
-- ✅ Only the specific ServiceAccount in `apps` namespace can assume this role
-- ✅ Cannot be assumed by other namespaces or ServiceAccounts
-- ✅ Requires valid OIDC token signed by EKS
+- ✅ No kubeconfig, static token or long-lived key is stored anywhere
+- ✅ Only this IAM role is mapped to the `checkout-remediation` group
+- ✅ The group has no permissions outside the `apps` namespace
 
 ---
 
@@ -239,7 +224,7 @@ metadata:
 
 ### Principle: Namespace Isolation
 
-The runbook_action Lambda (via IRSA) has limited Kubernetes permissions scoped to the `apps` namespace.
+The runbook_action Lambda (through its access entry) has limited Kubernetes permissions scoped to the `apps` namespace. The Role and RoleBinding are in `k8s/rbac/remediation-role.yaml` and applied by `scripts/deploy.sh`.
 
 ### Role Definition
 
@@ -275,9 +260,9 @@ metadata:
   name: checkout-remediation
   namespace: apps
 subjects:
-  - kind: ServiceAccount
+  - kind: Group
     name: checkout-remediation
-    namespace: apps
+    apiGroup: rbac.authorization.k8s.io
 roleRef:
   kind: Role
   name: checkout-remediation
@@ -298,16 +283,16 @@ roleRef:
 
 **Test RBAC Permissions**:
 ```bash
-# Verify ServiceAccount can patch deployments
-kubectl auth can-i patch deployments --as=system:serviceaccount:apps:checkout-remediation -n apps
+# Verify the remediation group can patch deployments
+kubectl auth can-i patch deployments -n apps --as=runbook-action --as-group=checkout-remediation
 # Expected: yes
 
-# Verify ServiceAccount CANNOT delete deployments
-kubectl auth can-i delete deployments --as=system:serviceaccount:apps:checkout-remediation -n apps
+# Verify it CANNOT delete deployments
+kubectl auth can-i delete deployments -n apps --as=runbook-action --as-group=checkout-remediation
 # Expected: no
 
-# Verify ServiceAccount CANNOT access other namespaces
-kubectl auth can-i get pods --as=system:serviceaccount:apps:checkout-remediation -n kube-system
+# Verify it CANNOT access other namespaces
+kubectl auth can-i get pods -n kube-system --as=runbook-action --as-group=checkout-remediation
 # Expected: no
 ```
 
@@ -520,8 +505,8 @@ Every incident is logged with:
 ### ✅ Implemented
 
 1. **Least-Privilege IAM**: All roles have specific ARNs, no wildcards for application resources
-2. **IRSA for Kubernetes Access**: No long-lived credentials stored
-3. **Kubernetes RBAC**: ServiceAccount limited to specific namespace and operations
+2. **IRSA and EKS access entries**: No long-lived credentials stored
+3. **Kubernetes RBAC**: the remediation group is limited to the `apps` namespace and specific operations
 4. **Encryption at Rest**: KMS for all data stores
 5. **Encryption in Transit**: TLS 1.2+ for all endpoints
 6. **Network Segmentation**: Private subnets for EKS, security groups for isolation
@@ -638,7 +623,7 @@ Use this checklist before deploying to production:
 
 **Mitigations**:
 - ✅ Keep EKS version up-to-date (patches security issues)
-- ✅ RBAC limits ServiceAccount to specific namespace
+- ✅ RBAC limits the remediation group to the `apps` namespace
 - ✅ Pod Security Standards (PSS) enforce best practices
 - ✅ Network policies isolate namespaces
 - ✅ Audit logs capture unauthorized access attempts
