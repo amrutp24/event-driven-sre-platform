@@ -54,3 +54,40 @@ output "datadog_api_key" {
 output "runbook_action_lambda_arn" {
   value = aws_lambda_function.runbook_action.arn
 }
+
+output "event_bus_name" {
+  value = aws_cloudwatch_event_bus.sre.name
+}
+
+output "step_functions_arn" {
+  description = "Runbook state machine, started by the incident.created rule"
+  value       = aws_sfn_state_machine.runbook.arn
+}
+
+output "incident_recorder_arn" {
+  description = "Express state machine that writes incident events to DynamoDB"
+  value       = aws_sfn_state_machine.incident_recorder.arn
+}
+
+output "incidents_table" {
+  value = aws_dynamodb_table.incidents.name
+}
+
+output "sns_topic_arn" {
+  value = aws_sns_topic.alerts.arn
+}
+
+output "events_dlq_url" {
+  description = "Events EventBridge couldn't deliver after retries"
+  value       = aws_sqs_queue.events_dlq.url
+}
+
+output "events_log_group" {
+  description = "Every event on the bus"
+  value       = aws_cloudwatch_log_group.events.name
+}
+
+output "events_archive_arn" {
+  description = "Replay source; events are kept 7 days"
+  value       = aws_cloudwatch_event_archive.sre.arn
+}

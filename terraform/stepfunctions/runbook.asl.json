@@ -1,29 +1,117 @@
 {
-  "Comment": "SRE Runbook Automation (event-driven) - invokes runbook action Lambda",
-  "StartAt": "InvokeRunbookAction",
+  "Comment": "Remediation for one incident. Started by the incident.created EventBridge rule with the incident as input.",
+  "StartAt": "ClaimIncident",
   "States": {
+    "ClaimIncident": {
+      "Comment": "One run per incident. Alertmanager re-sends firing alerts and EventBridge delivers at least once, so later runs stop here.",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${table_name}",
+        "Key": {
+          "incident_id": { "S.$": "$.incident_id" }
+        },
+        "UpdateExpression": "SET #status = :remediating, remediation_started_at = :now",
+        "ConditionExpression": "attribute_not_exists(remediation_started_at)",
+        "ExpressionAttributeNames": { "#status": "status" },
+        "ExpressionAttributeValues": {
+          ":remediating": { "S": "remediating" },
+          ":now": { "S.$": "$$.State.EnteredTime" }
+        }
+      },
+      "ResultPath": null,
+      "Catch": [
+        {
+          "ErrorEquals": ["DynamoDB.ConditionalCheckFailedException"],
+          "ResultPath": null,
+          "Next": "AlreadyHandled"
+        }
+      ],
+      "Next": "InvokeRunbookAction"
+    },
+    "AlreadyHandled": {
+      "Type": "Succeed"
+    },
     "InvokeRunbookAction": {
       "Type": "Task",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
-        "FunctionName.$": "$.runbook_action_arn",
+        "FunctionName": "${runbook_action_arn}",
         "Payload.$": "$"
       },
       "Retry": [
         {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
+          "ErrorEquals": ["States.ALL"],
           "IntervalSeconds": 2,
           "MaxAttempts": 3,
           "BackoffRate": 2.0
         }
       ],
+      "ResultSelector": {
+        "action.$": "$.Payload.action",
+        "output.$": "$.Payload"
+      },
       "ResultPath": "$.runbook_result",
-      "Next": "Done"
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "ReportFailed"
+        }
+      ],
+      "Next": "ReportCompleted"
     },
-    "Done": {
-      "Type": "Succeed"
+    "ReportCompleted": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::events:putEvents",
+      "Parameters": {
+        "Entries": [
+          {
+            "EventBusName": "${event_bus_name}",
+            "Source": "sre.runbook",
+            "DetailType": "action.completed",
+            "Detail": {
+              "incident_id.$": "$.incident_id",
+              "alertname.$": "$.alertname",
+              "action.$": "$.runbook_result.action",
+              "result": "success",
+              "output.$": "$.runbook_result.output",
+              "execution.$": "$$.Execution.Id"
+            }
+          }
+        ]
+      },
+      "ResultPath": null,
+      "End": true
+    },
+    "ReportFailed": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::events:putEvents",
+      "Parameters": {
+        "Entries": [
+          {
+            "EventBusName": "${event_bus_name}",
+            "Source": "sre.runbook",
+            "DetailType": "action.completed",
+            "Detail": {
+              "incident_id.$": "$.incident_id",
+              "alertname.$": "$.alertname",
+              "action": "unknown",
+              "result": "failed",
+              "error.$": "$.error.Error",
+              "cause.$": "$.error.Cause",
+              "execution.$": "$$.Execution.Id"
+            }
+          }
+        ]
+      },
+      "ResultPath": null,
+      "Next": "RemediationFailed"
+    },
+    "RemediationFailed": {
+      "Type": "Fail",
+      "Error": "RemediationFailed",
+      "Cause": "runbook_action failed after retries; the error is in the execution history and the action.completed event"
     }
   }
 }
