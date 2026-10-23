@@ -1,0 +1,33 @@
+{
+  "$schema": "http://json-schema.org/draft-04/schema#",
+  "title": "AlertPayload",
+  "description": "An Alertmanager webhook payload, or the Datadog webhook payload in docs/API.md. API Gateway checks the structure; alert_ingest checks which format it is and the required values (alertname, severity, status), so those come back with specific error codes.",
+  "type": "object",
+  "properties": {
+    "alerts": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["labels"],
+        "properties": {
+          "status": { "type": "string" },
+          "labels": { "type": "object" },
+          "annotations": { "type": "object" },
+          "startsAt": { "type": "string" },
+          "endsAt": { "type": "string" },
+          "fingerprint": { "type": "string" }
+        }
+      }
+    },
+    "alert_id": { "type": ["string", "number"] },
+    "alert_transition": { "type": "string" },
+    "alert_cycle_key": { "type": ["string", "number"] },
+    "title": { "type": "string" },
+    "body": { "type": "string" },
+    "priority": { "type": "string" },
+    "tags": { "type": ["string", "array"] },
+    "date_happened": { "type": ["string", "number"] },
+    "event_url": { "type": "string" }
+  }
+}

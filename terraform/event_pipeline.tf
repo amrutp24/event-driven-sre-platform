@@ -47,7 +47,7 @@ resource "aws_iam_role_policy" "lambda_policy" {
       },
       {
         Effect   = "Allow",
-        Action   = ["dynamodb:PutItem"],
+        Action   = ["dynamodb:PutItem", "dynamodb:UpdateItem"],
         Resource = aws_dynamodb_table.incidents.arn
       },
       {
@@ -104,9 +104,13 @@ resource "aws_lambda_function" "alert_ingest" {
   function_name = "${var.name}-alert-ingest"
   role          = aws_iam_role.lambda_role.arn
   handler       = "handler.lambda_handler"
-  runtime       = "python3.12"
+  runtime       = "python3.13"
   filename      = "${path.module}/lambda/alert_ingest.zip"
-  timeout       = 15
+  memory_size   = 256
+  timeout       = 30
+
+  # Caps concurrent alert processing; -1 leaves it unreserved
+  reserved_concurrent_executions = var.alert_ingest_reserved_concurrency
 
   environment {
     variables = {
@@ -114,43 +118,9 @@ resource "aws_lambda_function" "alert_ingest" {
       INCIDENT_TABLE     = aws_dynamodb_table.incidents.name
       RUNBOOK_ARN        = aws_sfn_state_machine.runbook.arn
       SNS_TOPIC_ARN      = aws_sns_topic.alerts.arn
-      CLUSTER_NAME       = var.eks_cluster_name
-      REGION             = var.aws_region
-      DEGRADED_PARAM     = "/checkout/degraded_mode"
       RUNBOOK_ACTION_ARN = aws_lambda_function.runbook_action.arn
     }
   }
-}
-
-resource "aws_apigatewayv2_api" "alerts_api" {
-  name          = "${var.name}-alerts-api"
-  protocol_type = "HTTP"
-}
-
-resource "aws_apigatewayv2_integration" "lambda" {
-  api_id           = aws_apigatewayv2_api.alerts_api.id
-  integration_type = "AWS_PROXY"
-  integration_uri  = aws_lambda_function.alert_ingest.invoke_arn
-}
-
-resource "aws_apigatewayv2_route" "alert" {
-  api_id    = aws_apigatewayv2_api.alerts_api.id
-  route_key = "POST /alert"
-  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
-}
-
-resource "aws_apigatewayv2_stage" "prod" {
-  api_id      = aws_apigatewayv2_api.alerts_api.id
-  name        = "prod"
-  auto_deploy = true
-}
-
-resource "aws_lambda_permission" "apigw" {
-  statement_id  = "AllowAPIGatewayInvoke"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.alert_ingest.function_name
-  principal     = "apigateway.amazonaws.com"
-  source_arn    = "${aws_apigatewayv2_api.alerts_api.execution_arn}/*/*"
 }
 
 resource "aws_ssm_parameter" "checkout_degraded_mode" {
@@ -231,7 +201,7 @@ resource "aws_lambda_function" "runbook_action" {
   function_name = "${var.name}-runbook-action"
   role          = aws_iam_role.runbook_lambda_role.arn
   handler       = "handler.lambda_handler"
-  runtime       = "python3.12"
+  runtime       = "python3.13"
   filename      = "${path.module}/lambda/runbook_action.zip"
   memory_size   = 512
   timeout       = 120

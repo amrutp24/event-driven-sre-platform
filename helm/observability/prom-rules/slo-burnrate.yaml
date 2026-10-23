@@ -20,7 +20,7 @@ spec:
       expr: checkout:error_ratio:5m > 0.00144
       for: 5m
       labels:
-        severity: page
+        severity: critical
         service: checkout
       annotations:
         summary: "FAST burn: checkout error budget burning quickly (5m)"
@@ -34,7 +34,7 @@ spec:
         clamp_min(sum(rate(http_requests_total{route="/checkout"}[1h])), 1) > 0.00036
       for: 1h
       labels:
-        severity: ticket
+        severity: warning
         service: checkout
       annotations:
         summary: "SLOW burn: checkout error budget burning (1h)"

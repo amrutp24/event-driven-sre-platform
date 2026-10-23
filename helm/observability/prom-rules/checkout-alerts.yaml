@@ -12,13 +12,13 @@ spec:
       expr: |
         sum(rate(http_requests_total{route="/checkout",code=~"5.."}[5m]))
         /
-        sum(rate(http_requests_total{route="/checkout"}[5m])) > 0.02
+        sum(rate(http_requests_total{route="/checkout"}[5m])) > 0.05
       for: 5m
       labels:
-        severity: page
+        severity: critical
         service: checkout
       annotations:
-        summary: "Checkout 5xx rate > 2% (5m)"
+        summary: "Checkout 5xx rate > 5% (5m)"
         runbook: "stepfunctions:RunbookCheckoutDegradeOrRollback"
 
     - alert: CheckoutHighLatencyP95
@@ -26,7 +26,7 @@ spec:
         histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{route="/checkout"}[5m])) by (le)) > 1
       for: 5m
       labels:
-        severity: page
+        severity: critical
         service: checkout
       annotations:
         summary: "Checkout p95 latency > 1s (5m)"
@@ -36,7 +36,7 @@ spec:
       expr: up == 0
       for: 2m
       labels:
-        severity: page
+        severity: critical
         service: checkout
       annotations:
         summary: "Prometheus target down"

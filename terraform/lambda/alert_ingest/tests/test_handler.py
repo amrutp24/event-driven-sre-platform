@@ -1,29 +1,27 @@
 """
-Unit tests for alert_ingest Lambda handler
+Unit tests for the alert_ingest Lambda (POST /webhook).
 
-Tests cover:
-- Alert ingestion from Alertmanager webhook
-- Base64 encoded payload handling
-- Multiple alert processing
-- EventBridge event publishing
-- DynamoDB incident storage
-- SNS notification publishing
-- Step Functions execution triggering
-- Error handling for malformed payloads
-- Environment variable validation
+Covers:
+- Alertmanager and Datadog payloads, normalized to one format
+- 202 response format and enrichment (account, region, correlation_id)
+- Payload validation and the 400 error codes from docs/API.md
+- Firing vs resolved: storage, EventBridge detail type, remediation
+- Stable incident ids and de-duplicated remediation runs
+- EventBridge and other AWS failures (502 / 500)
 """
 import json
-import pytest
-from unittest.mock import Mock, patch, MagicMock
-import sys
 import os
+import sys
+from unittest.mock import Mock, patch
 
-# Add the parent directory to import the handler
+import pytest
+from botocore.exceptions import ClientError
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Mock boto3 and set environment variables before importing handler to avoid region errors
 test_env_vars = {
     'AWS_DEFAULT_REGION': 'us-east-1',
+    'AWS_REGION': 'us-east-1',
     'EVENT_BUS_NAME': 'test-event-bus',
     'INCIDENT_TABLE': 'test-incidents',
     'RUNBOOK_ARN': 'arn:aws:states:us-east-1:123456789012:stateMachine:test-runbook',
@@ -37,387 +35,368 @@ with patch.dict(os.environ, test_env_vars):
             import handler
 
 
+class FakeContext:
+    invoked_function_arn = 'arn:aws:lambda:us-east-1:123456789012:function:test-alert-ingest'
+
+
+@pytest.fixture
+def aws(monkeypatch):
+    """Patch the module's AWS clients and return them, with healthy defaults."""
+    monkeypatch.setenv('AWS_REGION', 'us-east-1')
+    eventbridge, ddb, sns, sfn, table = Mock(), Mock(), Mock(), Mock(), Mock()
+    ddb.Table.return_value = table
+    eventbridge.put_events.return_value = {'FailedEntryCount': 0, 'Entries': [{'EventId': 'e1'}]}
+    sns.publish.return_value = {'MessageId': 'm1'}
+    sfn.start_execution.return_value = {'executionArn': 'x1'}
+    with patch.object(handler, 'eventbridge', eventbridge), \
+         patch.object(handler, 'ddb', ddb), \
+         patch.object(handler, 'sns', sns), \
+         patch.object(handler, 'sfn', sfn):
+        yield type('AWS', (), dict(eventbridge=eventbridge, ddb=ddb, sns=sns, sfn=sfn, table=table))
+
+
+def am_alert(status='firing', alertname='CheckoutHighErrorRate', severity='critical',
+             service='checkout', fingerprint='a1b2c3d4e5f6', starts_at='2026-10-20T10:30:00Z', **extra):
+    labels = {'alertname': alertname, 'severity': severity, 'service': service}
+    alert = {'status': status, 'labels': labels, 'annotations': {'summary': 'High error rate'},
+             'fingerprint': fingerprint, 'startsAt': starts_at}
+    alert.update(extra)
+    return alert
+
+
+def request(payload):
+    return {'body': json.dumps(payload)}
+
+
+def body_of(result):
+    return json.loads(result['body'])
+
+
+# ---------------------------------------------------------------- Alertmanager
+
 class TestAlertIngestion:
-    """Test alert ingestion and processing"""
 
-    @patch('handler.eventbridge')
-    @patch('handler.ddb')
-    @patch('handler.sns')
-    @patch('handler.sfn')
-    @patch.dict(os.environ, {
-        'EVENT_BUS_NAME': 'test-event-bus',
-        'INCIDENT_TABLE': 'test-incidents',
-        'RUNBOOK_ARN': 'arn:aws:states:us-east-1:123456789012:stateMachine:test-runbook',
-        'SNS_TOPIC_ARN': 'arn:aws:sns:us-east-1:123456789012:test-topic',
-        'RUNBOOK_ACTION_ARN': 'arn:aws:lambda:us-east-1:123456789012:function:test-action'
-    })
-    def test_single_alert_processing(self, mock_sfn, mock_sns, mock_ddb, mock_eventbridge, sample_alertmanager_event):
-        """Test processing of a single alert"""
-        # Setup mocks
-        mock_table = Mock()
-        mock_ddb.Table.return_value = mock_table
-        mock_eventbridge.put_events.return_value = {'FailedEntryCount': 0}
-        mock_sns.publish.return_value = {'MessageId': 'test-message-id'}
-        mock_sfn.start_execution.return_value = {'executionArn': 'test-execution-arn'}
+    def test_single_alert_processing(self, aws, sample_alertmanager_event):
+        result = handler.lambda_handler(sample_alertmanager_event, FakeContext())
 
-        # Execute
-        result = handler.lambda_handler(sample_alertmanager_event, {})
+        assert result['statusCode'] == 202
+        body = body_of(result)
+        assert body['status'] == 'accepted'
+        assert body['message'] == 'Alert received and queued for processing'
+        assert body['alert_count'] == 1
+        assert body['correlation_id']
+        assert body['incidents'][0]['alertname'] == 'CheckoutHighErrorRate'
+        assert body['incidents'][0]['remediation_started'] is True
 
-        # Verify response
-        assert result['statusCode'] == 200
-        response_body = json.loads(result['body'])
-        assert response_body['ok'] is True
-        assert len(response_body['processed']) == 1
-        assert 'incident_id' in response_body['processed'][0]
-        assert response_body['processed'][0]['alertname'] == 'CheckoutHighErrorRate'
+        aws.table.put_item.assert_called_once()
+        aws.eventbridge.put_events.assert_called_once()
+        aws.sns.publish.assert_called_once()
+        aws.sfn.start_execution.assert_called_once()
 
-        # Verify AWS service calls
-        mock_table.put_item.assert_called_once()
-        mock_eventbridge.put_events.assert_called_once()
-        mock_sns.publish.assert_called_once()
-        mock_sfn.start_execution.assert_called_once()
+    def test_multiple_alert_processing(self, aws, sample_alertmanager_event_multiple):
+        result = handler.lambda_handler(sample_alertmanager_event_multiple, FakeContext())
 
-    @patch('handler.eventbridge')
-    @patch('handler.ddb')
-    @patch('handler.sns')
-    @patch('handler.sfn')
-    @patch.dict(os.environ, {
-        'EVENT_BUS_NAME': 'test-event-bus',
-        'INCIDENT_TABLE': 'test-incidents',
-        'RUNBOOK_ARN': 'arn:aws:states:us-east-1:123456789012:stateMachine:test-runbook',
-        'SNS_TOPIC_ARN': 'arn:aws:sns:us-east-1:123456789012:test-topic'
-    })
-    def test_multiple_alert_processing(self, mock_sfn, mock_sns, mock_ddb, mock_eventbridge, sample_alertmanager_event_multiple):
-        """Test processing of multiple alerts in one event"""
-        # Setup mocks
-        mock_table = Mock()
-        mock_ddb.Table.return_value = mock_table
-        mock_eventbridge.put_events.return_value = {'FailedEntryCount': 0}
-        mock_sns.publish.return_value = {'MessageId': 'test-message-id'}
-        mock_sfn.start_execution.return_value = {'executionArn': 'test-execution-arn'}
+        assert result['statusCode'] == 202
+        body = body_of(result)
+        assert body['alert_count'] == 2
+        assert [i['alertname'] for i in body['incidents']] == ['CheckoutHighErrorRate', 'CheckoutHighLatencyP95']
+        assert aws.table.put_item.call_count == 2
+        assert aws.eventbridge.put_events.call_count == 2
+        assert aws.sns.publish.call_count == 2
+        assert aws.sfn.start_execution.call_count == 2
 
-        # Execute
-        result = handler.lambda_handler(sample_alertmanager_event_multiple, {})
+    def test_base64_encoded_payload(self, aws, sample_base64_event):
+        result = handler.lambda_handler(sample_base64_event, FakeContext())
 
-        # Verify response
-        assert result['statusCode'] == 200
-        response_body = json.loads(result['body'])
-        assert response_body['ok'] is True
-        assert len(response_body['processed']) == 2
+        assert result['statusCode'] == 202
+        assert body_of(result)['incidents'][0]['alertname'] == 'CheckoutDown'
 
-        # Verify each alert was processed
-        processed_alerts = response_body['processed']
-        alertnames = [alert['alertname'] for alert in processed_alerts]
-        assert 'CheckoutHighErrorRate' in alertnames
-        assert 'CheckoutHighLatencyP95' in alertnames
+    def test_enrichment(self, aws):
+        handler.lambda_handler(request({'alerts': [am_alert()]}), FakeContext())
 
-        # Verify AWS service calls (should be called twice for each service)
-        assert mock_table.put_item.call_count == 2
-        assert mock_eventbridge.put_events.call_count == 2
-        assert mock_sns.publish.call_count == 2
-        assert mock_sfn.start_execution.call_count == 2
+        detail = json.loads(aws.eventbridge.put_events.call_args[1]['Entries'][0]['Detail'])
+        assert detail['account_id'] == '123456789012'
+        assert detail['region'] == 'us-east-1'
+        assert detail['received_at'].endswith('Z')
+        assert isinstance(detail['timestamp'], int)
+        assert detail['source'] == 'alertmanager'
+        assert detail['runbook_action_arn'].endswith(':function:test-action')
 
-    @patch('handler.eventbridge')
-    @patch('handler.ddb')
-    @patch('handler.sns')
-    @patch('handler.sfn')
-    @patch.dict(os.environ, {
-        'EVENT_BUS_NAME': 'test-event-bus',
-        'INCIDENT_TABLE': 'test-incidents',
-        'RUNBOOK_ARN': 'arn:aws:states:us-east-1:123456789012:stateMachine:test-runbook',
-        'SNS_TOPIC_ARN': 'arn:aws:sns:us-east-1:123456789012:test-topic'
-    })
-    def test_base64_encoded_payload(self, mock_sfn, mock_sns, mock_ddb, mock_eventbridge, sample_base64_event):
-        """Test handling of base64 encoded payloads"""
-        # Setup mocks
-        mock_table = Mock()
-        mock_ddb.Table.return_value = mock_table
-        mock_eventbridge.put_events.return_value = {'FailedEntryCount': 0}
-        mock_sns.publish.return_value = {'MessageId': 'test-message-id'}
-        mock_sfn.start_execution.return_value = {'executionArn': 'test-execution-arn'}
+    def test_correlation_id_shared_across_one_request(self, aws):
+        payload = {'alerts': [am_alert(), am_alert(alertname='CheckoutDown', fingerprint='ffff')]}
+        result = handler.lambda_handler(request(payload), FakeContext())
 
-        # Execute
-        result = handler.lambda_handler(sample_base64_event, {})
-
-        # Verify response
-        assert result['statusCode'] == 200
-        response_body = json.loads(result['body'])
-        assert response_body['ok'] is True
-        assert len(response_body['processed']) == 1
-
-        # Verify AWS service calls
-        mock_table.put_item.assert_called_once()
-        mock_eventbridge.put_events.assert_called_once()
-        mock_sns.publish.assert_called_once()
-        mock_sfn.start_execution.assert_called_once()
+        details = [json.loads(c[1]['Entries'][0]['Detail']) for c in aws.eventbridge.put_events.call_args_list]
+        assert {d['correlation_id'] for d in details} == {body_of(result)['correlation_id']}
 
 
-class TestAlertNormalization:
-    """Test alert normalization and data transformation"""
+class TestResolvedAlerts:
 
-    @patch('handler.eventbridge')
-    @patch('handler.ddb')
-    @patch('handler.sns')
-    @patch('handler.sfn')
-    @patch.dict(os.environ, {
-        'EVENT_BUS_NAME': 'test-event-bus',
-        'INCIDENT_TABLE': 'test-incidents',
-        'RUNBOOK_ARN': 'arn:aws:states:us-east-1:123456789012:stateMachine:test-runbook',
-        'SNS_TOPIC_ARN': 'arn:aws:sns:us-east-1:123456789012:test-topic'
-    })
-    def test_alert_with_missing_fields(self, mock_sfn, mock_sns, mock_ddb, mock_eventbridge):
-        """Test handling of alerts with missing optional fields"""
-        # Create event with minimal alert data
-        minimal_event = {
-            "body": json.dumps({
-                "alerts": [
-                    {
-                        "labels": {},
-                        "annotations": {}
-                    }
-                ]
-            })
+    def test_resolved_alert_updates_record_and_skips_remediation(self, aws):
+        result = handler.lambda_handler(request({'alerts': [am_alert(status='resolved')]}), FakeContext())
+
+        assert result['statusCode'] == 202
+        assert body_of(result)['incidents'][0]['remediation_started'] is False
+        aws.table.put_item.assert_not_called()
+        aws.table.update_item.assert_called_once()
+        values = aws.table.update_item.call_args[1]['ExpressionAttributeValues']
+        assert values[':status'] == 'resolved'
+        aws.sfn.start_execution.assert_not_called()
+        entry = aws.eventbridge.put_events.call_args[1]['Entries'][0]
+        assert entry['DetailType'] == 'incident.resolved'
+        assert '(resolved)' in aws.sns.publish.call_args[1]['Subject']
+
+    def test_firing_and_resolved_share_incident_id(self, aws):
+        handler.lambda_handler(request({'alerts': [am_alert(status='firing')]}), FakeContext())
+        handler.lambda_handler(request({'alerts': [am_alert(status='resolved')]}), FakeContext())
+
+        fired_id = aws.table.put_item.call_args[1]['Item']['incident_id']
+        resolved_id = aws.table.update_item.call_args[1]['Key']['incident_id']
+        assert fired_id == resolved_id
+
+    def test_different_start_times_are_different_incidents(self, aws):
+        handler.lambda_handler(request({'alerts': [am_alert(starts_at='2026-10-20T10:00:00Z')]}), FakeContext())
+        handler.lambda_handler(request({'alerts': [am_alert(starts_at='2026-10-21T10:00:00Z')]}), FakeContext())
+
+        ids = {c[1]['Item']['incident_id'] for c in aws.table.put_item.call_args_list}
+        assert len(ids) == 2
+
+
+class TestRemediationDeduplication:
+
+    def test_execution_named_after_incident(self, aws):
+        handler.lambda_handler(request({'alerts': [am_alert()]}), FakeContext())
+
+        kwargs = aws.sfn.start_execution.call_args[1]
+        assert kwargs['name'] == aws.table.put_item.call_args[1]['Item']['incident_id']
+
+    def test_resent_alert_does_not_fail_or_restart(self, aws):
+        aws.sfn.start_execution.side_effect = ClientError(
+            {'Error': {'Code': 'ExecutionAlreadyExists', 'Message': 'exists'}}, 'StartExecution')
+
+        result = handler.lambda_handler(request({'alerts': [am_alert()]}), FakeContext())
+
+        assert result['statusCode'] == 202
+        assert body_of(result)['incidents'][0]['remediation_started'] is False
+
+
+# ---------------------------------------------------------------- Datadog
+
+class TestDatadog:
+
+    def datadog(self, transition='Triggered', **extra):
+        payload = {
+            'body': 'High error rate detected on checkout service',
+            'title': 'CheckoutHighErrorRate on checkout service',
+            'priority': 'P2',
+            'tags': 'service:checkout,namespace:apps,alertname:CheckoutHighErrorRate',
+            'date_happened': 1761000000,
+            'alert_id': '12345678',
+            'alert_transition': transition,
+            'alert_cycle_key': '987654321',
+            'event_url': 'https://app.datadoghq.com/monitors/12345678',
         }
+        payload.update(extra)
+        return request(payload)
 
-        # Setup mocks
-        mock_table = Mock()
-        mock_ddb.Table.return_value = mock_table
-        mock_eventbridge.put_events.return_value = {'FailedEntryCount': 0}
-        mock_sns.publish.return_value = {'MessageId': 'test-message-id'}
-        mock_sfn.start_execution.return_value = {'executionArn': 'test-execution-arn'}
+    def test_triggered(self, aws):
+        result = handler.lambda_handler(self.datadog(), FakeContext())
 
-        # Execute
-        result = handler.lambda_handler(minimal_event, {})
+        assert result['statusCode'] == 202
+        entry = aws.eventbridge.put_events.call_args[1]['Entries'][0]
+        assert entry['Source'] == 'sre.datadog'
+        assert entry['DetailType'] == 'incident.created'
+        detail = json.loads(entry['Detail'])
+        assert detail['alertname'] == 'CheckoutHighErrorRate'
+        assert detail['service'] == 'checkout'
+        assert detail['severity'] == 'critical'  # P2
+        assert detail['labels']['namespace'] == 'apps'
+        assert detail['starts_at'] == '2025-10-20T22:40:00Z'
+        aws.sfn.start_execution.assert_called_once()
 
-        # Verify response
-        assert result['statusCode'] == 200
-        response_body = json.loads(result['body'])
-        assert response_body['ok'] is True
+    def test_recovered_closes_same_incident(self, aws):
+        handler.lambda_handler(self.datadog('Triggered'), FakeContext())
+        handler.lambda_handler(self.datadog('Recovered'), FakeContext())
 
-        # Verify default values were applied
-        mock_table.put_item.assert_called_once()
-        call_args = mock_table.put_item.call_args[1]['Item']
-        assert call_args['severity'] == 'ticket'  # default severity
-        assert call_args['service'] == 'unknown'  # default service
-        assert call_args['alertname'] == 'UnknownAlert'  # default alertname
-        assert call_args['status'] == 'firing'  # default status
+        assert (aws.table.put_item.call_args[1]['Item']['incident_id']
+                == aws.table.update_item.call_args[1]['Key']['incident_id'])
+        assert aws.sfn.start_execution.call_count == 1
 
-    @patch('handler.eventbridge')
-    @patch('handler.ddb')
-    @patch('handler.sns')
-    @patch('handler.sfn')
-    @patch.dict(os.environ, {
-        'EVENT_BUS_NAME': 'test-event-bus',
-        'INCIDENT_TABLE': 'test-incidents',
-        'RUNBOOK_ARN': 'arn:aws:states:us-east-1:123456789012:stateMachine:test-runbook',
-        'SNS_TOPIC_ARN': 'arn:aws:sns:us-east-1:123456789012:test-topic'
-    })
-    def test_alert_with_all_fields(self, mock_sfn, mock_sns, mock_ddb, mock_eventbridge):
-        """Test handling of alerts with all possible fields"""
-        complete_event = {
-            "body": json.dumps({
-                "alerts": [
-                    {
-                        "labels": {
-                            "alertname": "CustomAlert",
-                            "severity": "warning",
-                            "service": "payment",
-                            "team": "backend"
-                        },
-                        "annotations": {
-                            "description": "Custom alert description",
-                            "runbook": "https://runbook.url"
-                        },
-                        "status": "resolved"
-                    }
-                ]
-            })
-        }
+    def test_tags_as_array_and_severity_tag(self, aws):
+        handler.lambda_handler(self.datadog(tags=['service:payments', 'severity:info']), FakeContext())
 
-        # Setup mocks
-        mock_table = Mock()
-        mock_ddb.Table.return_value = mock_table
-        mock_eventbridge.put_events.return_value = {'FailedEntryCount': 0}
-        mock_sns.publish.return_value = {'MessageId': 'test-message-id'}
-        mock_sfn.start_execution.return_value = {'executionArn': 'test-execution-arn'}
+        detail = json.loads(aws.eventbridge.put_events.call_args[1]['Entries'][0]['Detail'])
+        assert detail['service'] == 'payments'
+        assert detail['severity'] == 'info'
+        assert detail['alertname'] == 'CheckoutHighErrorRate on checkout service'  # no alertname tag, so the title
 
-        # Execute
-        result = handler.lambda_handler(complete_event, {})
+    @pytest.mark.parametrize('happened', [1761000000, '1761000000', 1761000000000, '1761000000000'])
+    def test_date_in_seconds_or_milliseconds(self, aws, happened):
+        result = handler.lambda_handler(self.datadog(date_happened=happened), FakeContext())
 
-        # Verify response
-        assert result['statusCode'] == 200
-        response_body = json.loads(result['body'])
-        assert response_body['ok'] is True
+        assert result['statusCode'] == 202
+        detail = json.loads(aws.eventbridge.put_events.call_args[1]['Entries'][0]['Detail'])
+        assert detail['starts_at'] == '2025-10-20T22:40:00Z'
 
-        # Verify all fields were properly stored
-        mock_table.put_item.assert_called_once()
-        call_args = mock_table.put_item.call_args[1]['Item']
-        assert call_args['severity'] == 'warning'
-        assert call_args['service'] == 'payment'
-        assert call_args['alertname'] == 'CustomAlert'
-        assert call_args['status'] == 'resolved'
+    def test_unknown_priority_defaults_to_warning(self, aws):
+        handler.lambda_handler(self.datadog(priority='normal'), FakeContext())
 
+        detail = json.loads(aws.eventbridge.put_events.call_args[1]['Entries'][0]['Detail'])
+        assert detail['severity'] == 'warning'
+
+    def test_invalid_severity_tag(self, aws):
+        result = handler.lambda_handler(self.datadog(tags='severity:page'), FakeContext())
+
+        assert result['statusCode'] == 400
+        assert body_of(result)['error_code'] == 'INVALID_SEVERITY'
+
+    def test_missing_alert_id(self, aws):
+        result = handler.lambda_handler(self.datadog(alert_id=None), FakeContext())
+
+        assert result['statusCode'] == 400
+        assert body_of(result)['details']['field'] == 'alert_id'
+
+
+# ---------------------------------------------------------------- validation
 
 class TestErrorHandling:
-    """Test error handling and edge cases"""
 
-    def test_empty_body(self):
-        """Test handling of event with empty body"""
-        empty_event = {"body": ""}
-        
-        result = handler.lambda_handler(empty_event, {})
-        
-        assert result['statusCode'] == 200
-        response_body = json.loads(result['body'])
-        assert response_body['ok'] is True
-        assert len(response_body['processed']) == 0
+    @pytest.mark.parametrize('event', [{}, {'body': ''}, {'body': None}])
+    def test_empty_body(self, aws, event):
+        result = handler.lambda_handler(event, FakeContext())
 
-    def test_malformed_json_body(self):
-        """Test handling of malformed JSON in body"""
-        malformed_event = {"body": "invalid json"}
-        
-        # Should raise json.JSONDecodeError
-        with pytest.raises(json.JSONDecodeError):
-            handler.lambda_handler(malformed_event, {})
+        assert result['statusCode'] == 400
+        body = body_of(result)
+        assert body['status'] == 'error'
+        assert body['error_code'] == 'INVALID_PAYLOAD'
 
-    def test_no_alerts_in_payload(self):
-        """Test handling of payload with no alerts array"""
-        no_alerts_event = {
-            "body": json.dumps({
-                "some_other_field": "value"
-            })
-        }
-        
-        result = handler.lambda_handler(no_alerts_event, {})
-        
-        assert result['statusCode'] == 200
-        response_body = json.loads(result['body'])
-        assert response_body['ok'] is True
-        assert len(response_body['processed']) == 0
+    def test_malformed_json_body(self, aws):
+        result = handler.lambda_handler({'body': 'invalid json'}, FakeContext())
 
-    def test_empty_alerts_array(self):
-        """Test handling of payload with empty alerts array"""
-        empty_alerts_event = {
-            "body": json.dumps({
-                "alerts": []
-            })
-        }
-        
-        result = handler.lambda_handler(empty_alerts_event, {})
-        
-        assert result['statusCode'] == 200
-        response_body = json.loads(result['body'])
-        assert response_body['ok'] is True
-        assert len(response_body['processed']) == 0
+        assert result['statusCode'] == 400
+        assert body_of(result)['details']['received'] == 'invalid JSON'
 
-    def test_missing_body_key(self):
-        """Test handling of event with no body key"""
-        no_body_event = {}
-        
-        result = handler.lambda_handler(no_body_event, {})
-        
-        assert result['statusCode'] == 200
-        response_body = json.loads(result['body'])
-        assert response_body['ok'] is True
-        assert len(response_body['processed']) == 0
+    def test_body_not_an_object(self, aws):
+        result = handler.lambda_handler(request([1, 2]), FakeContext())
 
+        assert result['statusCode'] == 400
+        assert body_of(result)['details'] == {'field': 'body', 'expected': 'object', 'received': 'array'}
+
+    def test_no_alerts_in_payload(self, aws):
+        result = handler.lambda_handler(request({'some_other_field': 'value'}), FakeContext())
+
+        assert result['statusCode'] == 400
+        body = body_of(result)
+        assert body['message'] == "Invalid alert payload: missing required field 'alerts'"
+        assert body['details'] == {'field': 'alerts', 'expected': 'array', 'received': 'null'}
+
+    def test_empty_alerts_array(self, aws):
+        result = handler.lambda_handler(request({'alerts': []}), FakeContext())
+
+        assert result['statusCode'] == 400
+        assert body_of(result)['details']['received'] == 'empty array'
+
+    def test_missing_alertname(self, aws):
+        alert = am_alert()
+        del alert['labels']['alertname']
+        result = handler.lambda_handler(request({'alerts': [alert]}), FakeContext())
+
+        assert result['statusCode'] == 400
+        body = body_of(result)
+        assert body['error_code'] == 'MISSING_ALERT_NAME'
+        assert body['details']['field'] == 'alerts[0].labels.alertname'
+
+    @pytest.mark.parametrize('severity', [None, 'page', 'CRITICAL', ''])
+    def test_invalid_severity(self, aws, severity):
+        alert = am_alert(severity=severity)
+        result = handler.lambda_handler(request({'alerts': [alert]}), FakeContext())
+
+        assert result['statusCode'] == 400
+        assert body_of(result)['error_code'] == 'INVALID_SEVERITY'
+
+    def test_invalid_status(self, aws):
+        result = handler.lambda_handler(request({'alerts': [am_alert(status='pending')]}), FakeContext())
+
+        assert result['statusCode'] == 400
+        assert body_of(result)['details']['field'] == 'alerts[0].status'
+
+    def test_one_bad_alert_rejects_the_whole_request(self, aws):
+        payload = {'alerts': [am_alert(), am_alert(severity='page', fingerprint='ffff')]}
+        result = handler.lambda_handler(request(payload), FakeContext())
+
+        assert result['statusCode'] == 400
+        aws.table.put_item.assert_not_called()
+        aws.eventbridge.put_events.assert_not_called()
+        aws.sfn.start_execution.assert_not_called()
+
+
+class TestAWSFailures:
+
+    def test_eventbridge_rejects_entry(self, aws):
+        aws.eventbridge.put_events.return_value = {'FailedEntryCount': 1, 'Entries': [{'ErrorCode': 'InternalFailure'}]}
+
+        result = handler.lambda_handler(request({'alerts': [am_alert()]}), FakeContext())
+
+        assert result['statusCode'] == 502
+        body = body_of(result)
+        assert body['error_code'] == 'EVENTBRIDGE_ERROR'
+        assert body['details']['correlation_id']
+
+    def test_eventbridge_client_error(self, aws):
+        aws.eventbridge.put_events.side_effect = ClientError(
+            {'Error': {'Code': 'AccessDeniedException', 'Message': 'no'}}, 'PutEvents')
+
+        result = handler.lambda_handler(request({'alerts': [am_alert()]}), FakeContext())
+
+        assert result['statusCode'] == 502
+
+    def test_other_aws_error(self, aws):
+        aws.table.put_item.side_effect = ClientError(
+            {'Error': {'Code': 'ProvisionedThroughputExceededException', 'Message': 'slow down'}}, 'PutItem')
+
+        result = handler.lambda_handler(request({'alerts': [am_alert()]}), FakeContext())
+
+        assert result['statusCode'] == 500
+        assert body_of(result)['error_code'] == 'INTERNAL_ERROR'
+
+
+# ---------------------------------------------------------------- formats
 
 class TestAWSServiceIntegration:
-    """Test AWS service integration details"""
 
-    @patch('handler.eventbridge')
-    @patch('handler.ddb')
-    @patch('handler.sns')
-    @patch('handler.sfn')
-    @patch.dict(os.environ, {
-        'EVENT_BUS_NAME': 'test-event-bus',
-        'INCIDENT_TABLE': 'test-incidents',
-        'RUNBOOK_ARN': 'arn:aws:states:us-east-1:123456789012:stateMachine:test-runbook',
-        'SNS_TOPIC_ARN': 'arn:aws:sns:us-east-1:123456789012:test-topic'
-    })
-    def test_eventbridge_event_format(self, mock_sfn, mock_sns, mock_ddb, mock_eventbridge, sample_alertmanager_event):
-        """Test EventBridge event is formatted correctly"""
-        mock_table = Mock()
-        mock_ddb.Table.return_value = mock_table
-        mock_eventbridge.put_events.return_value = {'FailedEntryCount': 0}
-        mock_sns.publish.return_value = {'MessageId': 'test-message-id'}
-        mock_sfn.start_execution.return_value = {'executionArn': 'test-execution-arn'}
+    def test_eventbridge_event_format(self, aws, sample_alertmanager_event):
+        handler.lambda_handler(sample_alertmanager_event, FakeContext())
 
-        handler.lambda_handler(sample_alertmanager_event, {})
-
-        # Verify EventBridge event format
-        mock_eventbridge.put_events.assert_called_once()
-        call_args = mock_eventbridge.put_events.call_args[1]['Entries'][0]
-        assert call_args['EventBusName'] == 'test-event-bus'
-        assert call_args['Source'] == 'prometheus.alertmanager'
-        assert call_args['DetailType'] == 'SREAlert'
-        
-        # Verify Detail contains normalized alert data
-        detail = json.loads(call_args['Detail'])
+        entry = aws.eventbridge.put_events.call_args[1]['Entries'][0]
+        assert entry['EventBusName'] == 'test-event-bus'
+        assert entry['Source'] == 'sre.alertmanager'
+        assert entry['DetailType'] == 'incident.created'
+        detail = json.loads(entry['Detail'])
         assert 'incident_id' in detail
         assert 'timestamp' in detail
         assert detail['alertname'] == 'CheckoutHighErrorRate'
         assert detail['severity'] == 'critical'
 
-    @patch('handler.eventbridge')
-    @patch('handler.ddb')
-    @patch('handler.sns')
-    @patch('handler.sfn')
-    @patch.dict(os.environ, {
-        'EVENT_BUS_NAME': 'test-event-bus',
-        'INCIDENT_TABLE': 'test-incidents',
-        'RUNBOOK_ARN': 'arn:aws:states:us-east-1:123456789012:stateMachine:test-runbook',
-        'SNS_TOPIC_ARN': 'arn:aws:sns:us-east-1:123456789012:test-topic'
-    })
-    def test_sns_notification_format(self, mock_sfn, mock_sns, mock_ddb, mock_eventbridge, sample_alertmanager_event):
-        """Test SNS notification is formatted correctly"""
-        mock_table = Mock()
-        mock_ddb.Table.return_value = mock_table
-        mock_eventbridge.put_events.return_value = {'FailedEntryCount': 0}
-        mock_sns.publish.return_value = {'MessageId': 'test-message-id'}
-        mock_sfn.start_execution.return_value = {'executionArn': 'test-execution-arn'}
+    def test_sns_notification_format(self, aws, sample_alertmanager_event):
+        handler.lambda_handler(sample_alertmanager_event, FakeContext())
 
-        handler.lambda_handler(sample_alertmanager_event, {})
+        kwargs = aws.sns.publish.call_args[1]
+        assert kwargs['TopicArn'] == 'arn:aws:sns:us-east-1:123456789012:test-topic'
+        assert kwargs['Subject'] == '[CRITICAL] checkout - CheckoutHighErrorRate (firing)'
+        message = json.loads(kwargs['Message'])
+        assert message['alertname'] == 'CheckoutHighErrorRate'
 
-        # Verify SNS notification format
-        mock_sns.publish.assert_called_once()
-        call_args = mock_sns.publish.call_args
-        assert call_args[1]['TopicArn'] == 'arn:aws:sns:us-east-1:123456789012:test-topic'
-        assert '[CRITICAL] checkout - CheckoutHighErrorRate (firing)' == call_args[1]['Subject']
-        
-        # Verify message contains incident details
-        message = call_args[1]['Message']
-        incident_data = json.loads(message)
-        assert incident_data['alertname'] == 'CheckoutHighErrorRate'
-        assert incident_data['severity'] == 'critical'
+    def test_sns_subject_capped_at_100_chars(self, aws):
+        handler.lambda_handler(request({'alerts': [am_alert(alertname='X' * 200)]}), FakeContext())
 
-    @patch('handler.eventbridge')
-    @patch('handler.ddb')
-    @patch('handler.sns')
-    @patch('handler.sfn')
-    @patch.dict(os.environ, {
-        'EVENT_BUS_NAME': 'test-event-bus',
-        'INCIDENT_TABLE': 'test-incidents',
-        'RUNBOOK_ARN': 'arn:aws:states:us-east-1:123456789012:stateMachine:test-runbook',
-        'SNS_TOPIC_ARN': 'arn:aws:sns:us-east-1:123456789012:test-topic'
-    })
-    def test_step_functions_input_format(self, mock_sfn, mock_sns, mock_ddb, mock_eventbridge, sample_alertmanager_event):
-        """Test Step Functions execution input is formatted correctly"""
-        mock_table = Mock()
-        mock_ddb.Table.return_value = mock_table
-        mock_eventbridge.put_events.return_value = {'FailedEntryCount': 0}
-        mock_sns.publish.return_value = {'MessageId': 'test-message-id'}
-        mock_sfn.start_execution.return_value = {'executionArn': 'test-execution-arn'}
+        assert len(aws.sns.publish.call_args[1]['Subject']) == 100
 
-        handler.lambda_handler(sample_alertmanager_event, {})
+    def test_step_functions_input_format(self, aws, sample_alertmanager_event):
+        handler.lambda_handler(sample_alertmanager_event, FakeContext())
 
-        # Verify Step Functions execution call
-        mock_sfn.start_execution.assert_called_once()
-        call_args = mock_sfn.start_execution.call_args
-        assert call_args[1]['stateMachineArn'] == 'arn:aws:states:us-east-1:123456789012:stateMachine:test-runbook'
-        
-        # Verify input contains normalized alert data
-        input_data = json.loads(call_args[1]['input'])
-        assert 'incident_id' in input_data
+        kwargs = aws.sfn.start_execution.call_args[1]
+        assert kwargs['stateMachineArn'] == 'arn:aws:states:us-east-1:123456789012:stateMachine:test-runbook'
+        input_data = json.loads(kwargs['input'])
         assert input_data['alertname'] == 'CheckoutHighErrorRate'
         assert input_data['severity'] == 'critical'
+        assert input_data['annotations'] == {'description': 'High error rate detected'}

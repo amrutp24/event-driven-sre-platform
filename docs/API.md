@@ -20,17 +20,19 @@ This document describes the API endpoints exposed by the event-driven SRE platfo
 
 ## Alert Webhook Endpoint
 
-### POST /alert
+### POST /webhook
 
 **Description**: Receives alerts from Prometheus Alertmanager or Datadog, validates the payload, enriches with metadata, and publishes to EventBridge.
 
-**URL**: `https://{api-gateway-id}.execute-api.{region}.amazonaws.com/prod/alert`
+**URL**: `https://{api-gateway-id}.execute-api.{region}.amazonaws.com/prod/webhook`
 
 **Method**: `POST`
 
 **Content-Type**: `application/json`
 
-**Timeout**: 30 seconds
+**Authentication**: `X-API-Key` header (see [Authentication](#authentication))
+
+**Timeout**: 30 seconds for `alert_ingest`; API Gateway stops waiting after 29 seconds and returns `504`
 
 ---
 
@@ -109,28 +111,46 @@ Prometheus Alertmanager sends alerts in the following format:
 | `alerts[].generatorURL` | string | Link to Prometheus query |
 | `alerts[].fingerprint` | string | Unique identifier for this alert |
 
+API Gateway checks the body's structure against a JSON schema (`terraform/api/alert_payload.schema.json`). `alert_ingest` then checks the values above, so a missing `alertname` or an unknown severity comes back with its own error code.
+
+The incident id is derived from `fingerprint` and `startsAt`, which Alertmanager keeps the same while an alert fires and when it resolves. A resolved notification therefore updates the incident its firing alert created. Alerts without both fields get a new incident id each time.
+
 ### Datadog Webhook Format
 
-Datadog sends alerts in a different format:
+Datadog's webhook payload is whatever you define in the Webhooks integration, so set it to this (the `$` values are Datadog template variables):
 
 ```json
 {
-  "body": "High error rate detected on checkout service",
-  "title": "CheckoutHighErrorRate on checkout service",
-  "priority": "normal",
-  "tags": [
-    "service:checkout",
-    "namespace:apps",
-    "severity:critical"
-  ],
-  "alert_type": "error",
-  "date_happened": 1738491000,
-  "alert_id": "12345678",
-  "alert_status": "alert",
-  "alert_transition": "Triggered",
-  "event_url": "https://app.datadoghq.com/monitors/12345678"
+  "title": "$EVENT_TITLE",
+  "body": "$TEXT_ONLY_MSG",
+  "priority": "$ALERT_PRIORITY",
+  "tags": "$TAGS",
+  "date_happened": "$DATE_POSIX",
+  "alert_id": "$ALERT_ID",
+  "alert_status": "$ALERT_STATUS",
+  "alert_transition": "$ALERT_TRANSITION",
+  "alert_cycle_key": "$ALERT_CYCLE_KEY",
+  "event_url": "$LINK"
 }
 ```
+
+and add a custom header with the key from `terraform output -raw datadog_api_key`, stored as a hidden custom variable:
+
+```json
+{"X-API-Key": "$WEBHOOK_API_KEY"}
+```
+
+What it becomes:
+
+| Datadog field | Normalized as |
+| --- | --- |
+| `alert_transition` | `Recovered` is `resolved`; `Triggered`, `Re-Triggered`, `Warn`, `No Data` and `Renotify` are `firing` |
+| `alert_cycle_key` | the incident id, so the trigger and its recovery are one incident. Required for that to work. |
+| `tags` (`"a:b,c:d"` or a JSON array) | labels. An `alertname:` tag sets the alert name, otherwise `title` is used. `service:` sets the service. |
+| `severity:` tag | the severity (`critical`, `warning` or `info`); otherwise `priority` P1 and P2 are `critical`, P3 is `warning`, P4 and P5 are `info`, and anything else is `warning` |
+| `date_happened` | epoch seconds or milliseconds |
+
+A Datadog payload is recognized by its `alert_transition` field, and it's published to EventBridge with source `sre.datadog` (Alertmanager's is `sre.alertmanager`).
 
 **Note**: The `alert_ingest` Lambda normalizes both formats into a common schema before publishing to EventBridge.
 
@@ -145,7 +165,15 @@ Datadog sends alerts in a different format:
   "status": "accepted",
   "message": "Alert received and queued for processing",
   "alert_count": 1,
-  "correlation_id": "550e8400-e29b-41d4-a716-446655440000"
+  "correlation_id": "550e8400-e29b-41d4-a716-446655440000",
+  "incidents": [
+    {
+      "incident_id": "1f8a2b52-3c0e-5d6f-9a1b-7c2d3e4f5a6b",
+      "alertname": "CheckoutHighErrorRate",
+      "status": "firing",
+      "remediation_started": true
+    }
+  ]
 }
 ```
 
@@ -155,6 +183,7 @@ Datadog sends alerts in a different format:
 | `message` | string | Human-readable confirmation |
 | `alert_count` | integer | Number of alerts processed in this request |
 | `correlation_id` | string (UUID) | Unique identifier for tracking this request through the pipeline |
+| `incidents` | array | One entry per alert. `remediation_started` is false for resolved alerts and for a firing alert whose incident already has a remediation run. |
 
 ### Error Response (400 Bad Request)
 
@@ -182,15 +211,22 @@ Datadog sends alerts in a different format:
 
 ## Authentication
 
-### API Key (Optional)
+### API Key
 
-For production deployments, enable API key authentication on API Gateway:
+On by default (`webhook_require_api_key = true`). Terraform creates one key for Alertmanager and one for Datadog, so either can be rotated or revoked on its own:
+
+```bash
+terraform -chdir=terraform output -raw alertmanager_api_key
+terraform -chdir=terraform output -raw datadog_api_key
+```
+
+`scripts/deploy.sh` gives Alertmanager its key. Set `webhook_require_api_key = false` to accept requests without one.
 
 **Header**: `X-API-Key: YOUR_API_KEY`
 
 **Example**:
 ```bash
-curl -X POST "https://abc123.execute-api.us-west-2.amazonaws.com/prod/alert" \
+curl -X POST "https://abc123.execute-api.us-west-2.amazonaws.com/prod/webhook" \
   -H "X-API-Key: YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d @alert.json
@@ -233,18 +269,21 @@ For maximum security, use a VPC endpoint to restrict access to the API Gateway:
 | `INVALID_PAYLOAD` | 400 | Request body is not valid JSON or missing required fields | Check JSON syntax and required fields |
 | `MISSING_ALERT_NAME` | 400 | Alert is missing `alertname` label | Add `alertname` label to Prometheus alert rule |
 | `INVALID_SEVERITY` | 400 | Severity is not one of `critical`, `warning`, `info` | Use valid severity values |
+| `INVALID_API_KEY` | 403 | `X-API-Key` header missing or wrong | Use the key from `terraform output` |
 | `RATE_LIMIT_EXCEEDED` | 429 | Too many requests in a short time | Reduce alert frequency or request throttle increase |
 | `INTERNAL_ERROR` | 500 | Lambda function encountered an error | Check CloudWatch Logs for details |
 | `EVENTBRIDGE_ERROR` | 502 | Failed to publish event to EventBridge | Check EventBridge service health |
-| `TIMEOUT` | 504 | Lambda function timed out (> 30 seconds) | Retry request; contact support if persistent |
+| `TIMEOUT` | 504 | API Gateway stopped waiting for the Lambda (29 seconds) | Retry the request; check CloudWatch Logs if it keeps happening |
+
+`INVALID_PAYLOAD` comes from API Gateway when the body doesn't match the schema, and from `alert_ingest` otherwise. Errors from API Gateway have `details.request_id` instead of field details. `INTERNAL_ERROR` and `EVENTBRIDGE_ERROR` include `details.correlation_id`.
 
 ---
 
 ## Rate Limiting
 
 **Default Limits**:
-- **Requests per second**: 1000 (burst: 2000)
-- **Concurrent requests**: 100
+- **Requests per second**: 1000 (burst: 2000), set by `webhook_rate_limit` and `webhook_burst_limit`
+- **Concurrent requests**: 100, the `alert_ingest` reserved concurrency (`alert_ingest_reserved_concurrency`)
 
 **Behavior**:
 - If rate limit exceeded, API Gateway returns `429 Too Many Requests`
@@ -258,12 +297,20 @@ For maximum security, use a VPC endpoint to restrict access to the API Gateway:
 
 ## Examples
 
+The examples read the URL and key from Terraform:
+
+```bash
+WEBHOOK_URL=$(terraform -chdir=terraform output -raw alert_webhook_url)
+API_KEY=$(terraform -chdir=terraform output -raw alertmanager_api_key)
+```
+
 ### Example 1: Test Alert (cURL)
 
 Send a simple test alert to verify webhook configuration:
 
 ```bash
-curl -X POST "https://abc123.execute-api.us-west-2.amazonaws.com/prod/alert" \
+curl -X POST "$WEBHOOK_URL" \
+  -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "alerts": [
@@ -290,18 +337,25 @@ curl -X POST "https://abc123.execute-api.us-west-2.amazonaws.com/prod/alert" \
   "status": "accepted",
   "message": "Alert received and queued for processing",
   "alert_count": 1,
-  "correlation_id": "550e8400-e29b-41d4-a716-446655440000"
+  "correlation_id": "550e8400-e29b-41d4-a716-446655440000",
+  "incidents": [
+    {"incident_id": "6f1c2c1e-5d1a-4f0e-9a43-2b8f6a0c9e71", "alertname": "TestAlert", "status": "firing", "remediation_started": true}
+  ]
 }
 ```
+
+`TestAlert` has `runbook_action: notify_only`, so the runbook runs but changes nothing in the cluster.
 
 ### Example 2: High Error Rate Alert (Python)
 
 ```python
-import requests
 import json
+import os
 
-url = "https://abc123.execute-api.us-west-2.amazonaws.com/prod/alert"
-headers = {"Content-Type": "application/json"}
+import requests
+
+url = os.environ["WEBHOOK_URL"]
+headers = {"Content-Type": "application/json", "X-API-Key": os.environ["API_KEY"]}
 
 payload = {
     "alerts": [
@@ -338,7 +392,8 @@ else:
 Send a resolved alert to close an incident:
 
 ```bash
-curl -X POST "https://abc123.execute-api.us-west-2.amazonaws.com/prod/alert" \
+curl -X POST "$WEBHOOK_URL" \
+  -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "alerts": [
@@ -365,7 +420,8 @@ curl -X POST "https://abc123.execute-api.us-west-2.amazonaws.com/prod/alert" \
 Alertmanager groups related alerts and sends them in a single request:
 
 ```bash
-curl -X POST "https://abc123.execute-api.us-west-2.amazonaws.com/prod/alert" \
+curl -X POST "$WEBHOOK_URL" \
+  -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "alerts": [
@@ -393,7 +449,7 @@ curl -X POST "https://abc123.execute-api.us-west-2.amazonaws.com/prod/alert" \
 
 Configure Alertmanager to send alerts to the webhook:
 
-**alertmanager.yml**:
+`helm/observability/alertmanager-values.yaml` sets this up through kube-prometheus-stack; the equivalent plain **alertmanager.yml** is:
 ```yaml
 global:
   resolve_timeout: 5m
@@ -408,13 +464,13 @@ route:
 receivers:
   - name: 'sre-webhook'
     webhook_configs:
-      - url: 'https://abc123.execute-api.us-west-2.amazonaws.com/prod/alert'
+      - url: 'https://abc123.execute-api.us-west-2.amazonaws.com/prod/webhook'
         send_resolved: true
         http_config:
-          # Optional: Add API key if enabled
-          # authorization:
-          #   type: Bearer
-          #   credentials: YOUR_API_KEY
+          http_headers:
+            X-API-Key:
+              files:
+                - /etc/alertmanager/secrets/alertmanager-webhook-key/api-key
 ```
 
 ### Example 6: Test with Fake Alert Data File
@@ -460,7 +516,8 @@ receivers:
 
 **Send with cURL**:
 ```bash
-curl -X POST "https://abc123.execute-api.us-west-2.amazonaws.com/prod/alert" \
+curl -X POST "$WEBHOOK_URL" \
+  -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
   -d @alert.json
 ```
@@ -479,8 +536,9 @@ aws logs tail /aws/lambda/PLATFORM_NAME-alert-ingest --follow --format short
 
 **Common log entries**:
 ```
-Received alert: CheckoutHighErrorRate, severity: critical
-Published event to EventBridge: event_id=550e8400-e29b-41d4-a716-446655440000
+Accepted 1 alert(s), correlation_id 550e8400-e29b-41d4-a716-446655440000
+Rejected payload (INVALID_SEVERITY): Severity must be one of critical, warning, info {'field': 'alerts[0].labels.severity', ...}
+Runbook already started for incident 1f8a2b52-3c0e-5d6f-9a1b-7c2d3e4f5a6b
 ```
 
 ### Check EventBridge Events
@@ -499,7 +557,7 @@ Verify incidents are being stored:
 aws dynamodb scan \
   --table-name PLATFORM_NAME-incidents \
   --max-items 5 \
-  --query 'Items[*].[incident_id.S, alertname.S, status.S, timestamp.S]' \
+  --query 'Items[*].[incident_id.S, alertname.S, status.S, received_at.S]' \
   --output table
 ```
 
@@ -523,7 +581,7 @@ aws stepfunctions list-executions \
 
 1. **Alert Ingestion Rate**: Number of alerts received per minute
    - CloudWatch metric: `AWS/Lambda Invocations` for `alert-ingest` function
-   - Target: < 1000/minute (default throttle limit)
+   - Target: well under 1000/second (the throttle limit)
 
 2. **Alert Processing Latency**: Time from webhook to EventBridge publish
    - CloudWatch metric: `AWS/Lambda Duration` for `alert-ingest` function
@@ -591,6 +649,7 @@ aws cloudwatch put-metric-alarm \
 | Version | Date | Changes |
 |---------|------|---------|
 | 1.0 | 2026-02-02 | Initial API documentation |
+| 1.1 | 2026-10-23 | `POST /webhook` on a REST API with schema validation, API keys and throttling; Datadog payloads; `202` and `400` responses as documented |
 
 ---
 
@@ -598,10 +657,9 @@ aws cloudwatch put-metric-alarm \
 
 For API issues or questions:
 - Check CloudWatch Logs: `/aws/lambda/PLATFORM_NAME-alert-ingest`
-- Open GitHub issue: https://github.com/YOUR_ORG/YOUR_REPO/issues
-- Contact: sre-platform@example.com
+- Open an issue: https://github.com/amrutp24/event-driven-sre-platform/issues
 
 ---
 
-**Last Updated**: 2026-02-02
-**API Version**: 1.0
+**Last Updated**: 2026-10-23
+**API Version**: 1.1

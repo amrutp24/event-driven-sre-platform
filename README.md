@@ -2,13 +2,13 @@
 
 Automated incident response for a service running on EKS. Prometheus alerts for a demo `checkout` service are sent to an endpoint on AWS, recorded, and passed to a Lambda function that changes the deployment in response: it switches the service to degraded mode, restarts it, or scales it up.
 
-The alert path (Alertmanager to API Gateway to Lambda to DynamoDB, SNS and Step Functions) is in place and covered by unit tests. Remediation against a real cluster still needs one piece the repo doesn't include; see [Known gaps](#known-gaps).
+The alert path (Alertmanager to API Gateway to Lambda to DynamoDB, SNS and Step Functions) and remediation are in place and covered by unit tests. See [Known gaps](#known-gaps) for what's still missing.
 
 ## How it works
 
 1. Prometheus, installed with kube-prometheus-stack, evaluates five alert rules for `checkout`: `CheckoutHighErrorRate`, `CheckoutHighLatencyP95`, `CheckoutDown`, `CheckoutSLOBurnFast` and `CheckoutSLOBurnSlow`.
-2. Alertmanager posts firing and resolved alerts to an API Gateway HTTP API at `POST /alert`.
-3. The `alert-ingest` Lambda handles each alert in the payload. It writes an incident record to DynamoDB, publishes a notification to SNS, puts an event on an EventBridge bus, and starts a Step Functions execution.
+2. Alertmanager posts firing and resolved alerts to `POST /webhook` on an API Gateway REST API, with an `X-API-Key` header. API Gateway checks the body against a JSON schema and rate-limits requests (1000 per second, bursts of 2000). Datadog monitors can send to the same endpoint; see [docs/API.md](docs/API.md).
+3. The `alert-ingest` Lambda validates the payload (anything invalid gets a `400` with an error code), normalizes Alertmanager and Datadog alerts into one format, and adds the account, region and receive time. Each alert gets a stable incident id, so a firing alert and its resolution belong to the same incident. For each alert it records the incident in DynamoDB, puts an `incident.created` or `incident.resolved` event on the EventBridge bus, and publishes to SNS. Firing alerts also start a Step Functions execution named after the incident, so a re-sent alert doesn't start a second run. It answers `202 Accepted`.
 4. The Step Functions state machine invokes the `runbook-action` Lambda, retrying up to three times with backoff.
 5. `runbook-action` picks an action from the alert name and applies it through the Kubernetes API. It authenticates with an EKS token signed by its own IAM role.
 
@@ -52,7 +52,7 @@ Requires the AWS CLI, Terraform, kubectl, Helm, Python 3, Docker and `zip`.
 ```bash
 bash scripts/bootstrap.sh       # build the Lambdas, create the VPC, EKS and event pipeline, configure kubectl
 bash scripts/install-addons.sh  # AWS Load Balancer Controller, ExternalDNS, cert-manager
-bash scripts/deploy.sh          # kube-prometheus-stack, the alert rules, the checkout app and the remediation RBAC
+bash scripts/deploy.sh          # Alertmanager's API key, kube-prometheus-stack, the alert rules, the checkout app and the remediation RBAC
 ```
 
 Before `deploy.sh`, set three values in `helm/checkout/values.yaml`:
@@ -63,20 +63,9 @@ Before `deploy.sh`, set three values in `helm/checkout/values.yaml`:
 
 The ingress creates an internet-facing HTTPS load balancer through the AWS Load Balancer Controller. Set `ingress.enabled=false` if you don't want one.
 
-Then point Alertmanager at the webhook. Get the URL:
+`deploy.sh` also connects Alertmanager to the webhook: it stores `terraform output alertmanager_api_key` in the `alertmanager-webhook-key` secret and fills the URL from `terraform output alert_webhook_url` into `helm/observability/alertmanager-values.yaml`. Run it again after a `terraform apply` that changes either.
 
-```bash
-terraform -chdir=terraform output -raw alert_webhook_url
-```
-
-Put it in `helm/observability/alertmanager-values.yaml` in place of the placeholder URL, and upgrade the release:
-
-```bash
-helm upgrade mon prometheus-community/kube-prometheus-stack \
-  -f helm/observability/kube-prometheus-stack-values.yaml \
-  -f helm/observability/alertmanager-values.yaml \
-  -n monitoring
-```
+To send alerts from Datadog, see [docs/API.md](docs/API.md#datadog-webhook-format). Its key is `terraform output -raw datadog_api_key`.
 
 To tear it down, uninstall the Helm releases first. The load balancer the controller created isn't in Terraform state, and it blocks the VPC from being deleted while it exists.
 
@@ -128,11 +117,9 @@ CI (`.github/workflows/integration-tests.yml`) runs Checkov on the Terraform, Tr
 
 ## Known gaps
 
-- **Resolved alerts trigger remediation again.** Alertmanager sends resolved notifications (`send_resolved: true`), and `alert-ingest` starts a Step Functions run for every alert regardless of status. When an error-rate alert clears, the service is degraded and scaled again.
-- **The webhook has no authentication.** Anyone with the URL can post an alert and trigger an action.
 - **Nothing consumes the EventBridge events.** Every alert is put on the bus, but no rules are attached to it.
 - **Remediation always targets one deployment**, set by `TARGET_DEPLOYMENT` (`checkout`), not the alert's `service` label.
-- **Incident records aren't updated.** The DynamoDB record is written when the alert arrives; the action taken and the outcome aren't added to it.
+- **Incident records don't show the action taken.** A resolved alert sets the record's status and resolved time, but the remediation outcome isn't written back yet.
 - **The default Kubernetes version is retired.** `eks_version` defaults to `1.29`, which reached the end of EKS extended support in March 2026, so a new cluster needs a newer version.
 
 ## Cost
