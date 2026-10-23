@@ -1,0 +1,37 @@
+# What the runbook-action Lambda may do in the cluster.
+#
+# The Lambda calls the Kubernetes API as its IAM role. terraform/eks.tf gives
+# that role an EKS access entry in the "checkout-remediation" group, and this
+# binding is the only thing that group is granted. Applied by scripts/deploy.sh.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: checkout-remediation
+  namespace: apps
+rules:
+  # Read, scale, restart and set env vars on deployments
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "patch"]
+  # Look at pods to verify a rollout
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  # Read app config
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: checkout-remediation
+  namespace: apps
+subjects:
+  - kind: Group
+    name: checkout-remediation
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: checkout-remediation
+  apiGroup: rbac.authorization.k8s.io

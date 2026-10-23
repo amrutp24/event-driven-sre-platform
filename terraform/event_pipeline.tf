@@ -203,13 +203,46 @@ resource "aws_iam_role_policy" "runbook_lambda_policy" {
   })
 }
 
+# ENI management for running in the VPC. AWS-managed; uses Resource "*"
+# because ENIs don't exist until Lambda creates them.
+resource "aws_iam_role_policy_attachment" "runbook_vpc_access" {
+  role       = aws_iam_role.runbook_lambda_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+}
+
+resource "aws_security_group" "runbook_lambda" {
+  name        = "${var.name}-runbook-action"
+  description = "runbook-action Lambda"
+  vpc_id      = module.vpc.vpc_id
+
+  # The Kubernetes API, and AWS APIs (EKS, SSM, STS) through the NAT gateways
+  egress {
+    description = "HTTPS out"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = var.tags
+}
+
 resource "aws_lambda_function" "runbook_action" {
   function_name = "${var.name}-runbook-action"
   role          = aws_iam_role.runbook_lambda_role.arn
   handler       = "handler.lambda_handler"
   runtime       = "python3.12"
   filename      = "${path.module}/lambda/runbook_action.zip"
-  timeout       = 30
+  memory_size   = 512
+  timeout       = 120
+
+  # Private subnets, so it reaches the cluster through the private API endpoint
+  vpc_config {
+    subnet_ids         = module.vpc.private_subnets
+    security_group_ids = [aws_security_group.runbook_lambda.id]
+  }
+
+  depends_on = [aws_iam_role_policy_attachment.runbook_vpc_access]
 
   environment {
     variables = {

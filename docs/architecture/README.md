@@ -86,7 +86,7 @@ graph TB
 
     %% Remediation Flow
     SF -->|Execute Action| L2
-    L2 -->|IRSA + RBAC| APP
+    L2 -->|Access entry + RBAC| APP
     L2 -->|Update SSM| SSM[SSM Parameter Store<br/>Feature Flags]
     SSM -.->|Read Config| APP
 
@@ -139,7 +139,7 @@ flowchart TD
     Decision -->|Yes| Step11
 
     Step11[10. Invoke runbook_action Lambda<br/>Pass: namespace, deployment, action] --> Step12
-    Step12[11. Lambda authenticates to EKS<br/>IRSA: AssumeRoleWithWebIdentity] --> Step13
+    Step12[11. Lambda authenticates to EKS<br/>IAM role + EKS access entry] --> Step13
     Step13[12. Execute remediation action] --> ActionType{Action Type}
 
     ActionType -->|Scale| Scale[kubectl scale deployment<br/>Increase replicas]
@@ -221,7 +221,7 @@ sequenceDiagram
     Note over SF,K8s: Remediation Phase
     SF->>SF: Evaluate runbook logic<br/>IF severity=critical THEN auto-remediate
     SF->>L2: Invoke with task input<br/>{action: enable_degraded_mode}
-    L2->>K8s: Authenticate via IRSA<br/>AssumeRole: checkout-remediation-role
+    L2->>K8s: Authenticate with an EKS token<br/>Access entry: checkout-remediation group
     L2->>SSM: PutParameter: /checkout/degraded_mode=true
     SSM-->>L2: Success
     L2->>K8s: Get Deployment: apps/checkout
@@ -256,20 +256,18 @@ sequenceDiagram
 graph TB
     subgraph "IAM Roles & Policies"
         R1[alert_ingest Lambda Role<br/>Permissions:<br/>- eventbridge:PutEvents]
-        R2[runbook_action Lambda Role<br/>Permissions:<br/>- eks:DescribeCluster<br/>- ssm:GetParameter<br/>- ssm:PutParameter<br/>- sts:AssumeRole]
+        R2[runbook_action Lambda Role<br/>Permissions:<br/>- eks:DescribeCluster<br/>- ssm:GetParameter<br/>- ssm:PutParameter<br/>- sts:GetCallerIdentity]
         R3[EventBridge Role<br/>Permissions:<br/>- dynamodb:PutItem<br/>- sns:Publish<br/>- states:StartExecution<br/>- logs:PutLogEvents]
         R4[Step Functions Role<br/>Permissions:<br/>- lambda:InvokeFunction<br/>- dynamodb:UpdateItem]
     end
 
-    subgraph "IRSA (IAM Roles for Service Accounts)"
-        SA[Kubernetes ServiceAccount<br/>checkout-remediation<br/>Namespace: apps]
-        OIDC[EKS OIDC Provider<br/>Federated Identity]
-        Trust[Trust Policy:<br/>AssumeRoleWithWebIdentity]
+    subgraph "EKS Access Entry"
+        AE[Access entry<br/>Principal: runbook_action Lambda Role<br/>Kubernetes group: checkout-remediation]
     end
 
     subgraph "Kubernetes RBAC"
         Role[Role: checkout-remediation<br/>Namespace: apps<br/>Permissions:<br/>- get/patch deployments<br/>- list pods]
-        RB[RoleBinding<br/>ServiceAccount -> Role]
+        RB[RoleBinding<br/>Group checkout-remediation -> Role]
     end
 
     subgraph "Network Security"
@@ -283,9 +281,8 @@ graph TB
         SSM_Sec[SSM Parameter Store<br/>SecureString type<br/>Encrypted with KMS]
     end
 
-    R2 -->|AssumeRole| OIDC
-    OIDC -->|Federate| SA
-    SA -->|Bound by| RB
+    R2 -->|Mapped by| AE
+    AE -->|Group bound by| RB
     RB -->|Grants| Role
 
     R1 -.->|Least Privilege| R3
@@ -302,8 +299,8 @@ graph TB
     classDef network fill:#FF9900,stroke:#232F3E,stroke-width:2px,color:#fff
     classDef encryption fill:#5C6AC4,stroke:#fff,stroke-width:2px,color:#fff
 
-    class R1,R2,R3,R4,OIDC,Trust iam
-    class SA,Role,RB k8s
+    class R1,R2,R3,R4,AE iam
+    class Role,RB k8s
     class SG1,SG2,SG3 network
     class KMS,SSM_Sec encryption
 ```
@@ -392,7 +389,7 @@ graph TB
   - **scale_deployment**: Increase replica count
   - **restart_deployment**: Force pod recreation
   - **drain_node**: Safely evict pods from unhealthy node
-- IRSA: Assumes Kubernetes ServiceAccount via OIDC
+- Kubernetes access: an EKS access entry maps its IAM role to the `checkout-remediation` group (IRSA only applies to pods)
 - RBAC: Limited to `apps` namespace, `deployments` resource
 
 ### 5. Storage & Notification Layer
@@ -467,17 +464,17 @@ graph TB
 - Vendor lock-in to AWS
 - Debugging across distributed services
 
-### 2. IRSA for Kubernetes Access
-**Decision**: Use IAM Roles for Service Accounts instead of long-lived credentials
+### 2. IAM-Based Kubernetes Access
+**Decision**: Use IAM identities instead of long-lived credentials: IRSA for pods, and an EKS access entry for the runbook_action Lambda, since IRSA only applies to pods
 **Rationale**:
 - No secrets to rotate or leak
-- Temporary credentials (1-hour expiration)
+- Short-lived credentials
 - Audit trail in CloudTrail
 - Fine-grained permissions per namespace
 
 **Trade-offs**:
-- Complex initial setup (OIDC provider)
-- Requires EKS 1.13+
+- Complex initial setup (OIDC provider for IRSA, access entries for the Lambda)
+- Access entries need the cluster's authentication mode set to `API` or `API_AND_CONFIG_MAP`
 
 ### 3. EventBridge as Central Bus
 **Decision**: Route all events through EventBridge instead of direct integrations
@@ -596,7 +593,7 @@ graph TB
 - ✅ Least-privilege IAM policies (no wildcards for application resources)
 - ✅ Encryption at rest (KMS for all data stores)
 - ✅ Encryption in transit (TLS 1.2+ for all endpoints)
-- ✅ IRSA instead of long-lived credentials
+- ✅ IRSA and EKS access entries instead of long-lived credentials
 - ✅ Kubernetes RBAC (namespace-scoped roles)
 - ✅ VPC security groups (allow-list only)
 - ✅ CloudTrail logging (API audit trail)

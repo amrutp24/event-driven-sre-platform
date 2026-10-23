@@ -18,6 +18,28 @@ module "eks" {
 
   enable_irsa = true
 
+  # The runbook-action Lambda calls the Kubernetes API as its IAM role. IRSA only
+  # applies to pods, so the role gets an access entry instead, in a group that
+  # k8s/rbac/remediation-role.yaml binds to the apps namespace.
+  access_entries = {
+    runbook_action = {
+      principal_arn     = aws_iam_role.runbook_lambda_role.arn
+      kubernetes_groups = ["checkout-remediation"]
+    }
+  }
+
+  # The Lambda runs in the private subnets and reaches the private API endpoint.
+  cluster_security_group_additional_rules = {
+    runbook_lambda_https = {
+      description              = "runbook-action Lambda to the Kubernetes API"
+      protocol                 = "tcp"
+      from_port                = 443
+      to_port                  = 443
+      type                     = "ingress"
+      source_security_group_id = aws_security_group.runbook_lambda.id
+    }
+  }
+
   # Managed node groups (production baseline)
   eks_managed_node_groups = {
     system = {

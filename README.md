@@ -52,7 +52,7 @@ Requires the AWS CLI, Terraform, kubectl, Helm, Python 3, Docker and `zip`.
 ```bash
 bash scripts/bootstrap.sh       # build the Lambdas, create the VPC, EKS and event pipeline, configure kubectl
 bash scripts/install-addons.sh  # AWS Load Balancer Controller, ExternalDNS, cert-manager
-bash scripts/deploy.sh          # kube-prometheus-stack, the alert rules, and the checkout app
+bash scripts/deploy.sh          # kube-prometheus-stack, the alert rules, the checkout app and the remediation RBAC
 ```
 
 Before `deploy.sh`, set three values in `helm/checkout/values.yaml`:
@@ -128,7 +128,6 @@ CI (`.github/workflows/integration-tests.yml`) runs Checkov on the Terraform, Tr
 
 ## Known gaps
 
-- **The runbook Lambda can't reach the cluster yet.** Its IAM role, `event-driven-sre-runbook-action-role`, isn't granted anything inside EKS: there's no access entry and no RBAC binding. Its Kubernetes API calls are rejected until it gets an EKS access entry with permission to patch deployments in the `apps` namespace.
 - **Resolved alerts trigger remediation again.** Alertmanager sends resolved notifications (`send_resolved: true`), and `alert-ingest` starts a Step Functions run for every alert regardless of status. When an error-rate alert clears, the service is degraded and scaled again.
 - **The webhook has no authentication.** Anyone with the URL can post an alert and trigger an action.
 - **Nothing consumes the EventBridge events.** Every alert is put on the bus, but no rules are attached to it.
