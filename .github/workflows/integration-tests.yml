@@ -139,6 +139,25 @@ jobs:
           path: stepfunctions/test-results.xml
           retention-days: 30
 
+  # terraform test against a mocked AWS provider (tests/module.tftest.hcl).
+  # Mock providers need Terraform 1.7+, while infrastructure-tests stays on
+  # 1.5.7, the oldest version the module supports.
+  module-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.11.2"
+
+      - name: Run module tests
+        run: |
+          terraform init -input=false -backend=false
+          terraform test -no-color
+
   infrastructure-tests:
     runs-on: ubuntu-latest
     steps:
