@@ -105,9 +105,10 @@ Prometheus Alertmanager sends alerts in the following format:
 | Field | Type | Description |
 |-------|------|-------------|
 | `alerts[].annotations` | object | Human-readable metadata (summary, description, runbook_url) |
-| `alerts[].annotations.runbook_action` | string | Override the default action: `degrade`, `scale`, `restart` or `degrade_or_scale`. `notify_only` skips the runbook: the alert is recorded and sent to SNS, nothing more. Any other value escalates a critical alert. |
-| `alerts[].annotations.desired_replicas` | string | Replica count for `scale` and `degrade_or_scale` (default 4, at most `remediation_max_replicas`) |
+| `alerts[].annotations.runbook_action` | string | Override the default action: `degrade`, `scale`, `restart`, `degrade_or_scale` or `drain_node`. `notify_only` skips the runbook: the alert is recorded and sent to SNS, nothing more. Any other value escalates a critical alert. |
+| `alerts[].annotations.desired_replicas` | string | Replica count for `scale` and `degrade_or_scale` (default 4, at most `remediation_max_replicas`). With an HPA, this becomes the HPA's minimum instead. |
 | `alerts[].labels.namespace`, `alerts[].labels.deployment` | string | What the runbook acts on. Without them it uses the `service` label as the deployment, then `apps/checkout`. Namespaces other than `apps` are refused. |
+| `alerts[].labels.node` | string | The node `drain_node` drains. `NodeUnderPressure` carries it from kube-state-metrics. Only nodes labelled `nodegroup=apps` are drained. |
 | `alerts[].startsAt` | string (ISO 8601) | When the alert started firing |
 | `alerts[].endsAt` | string (ISO 8601) | When the alert resolved (0001-01-01 means still firing) |
 | `alerts[].generatorURL` | string | Link to Prometheus query |
@@ -148,7 +149,7 @@ What it becomes:
 | --- | --- |
 | `alert_transition` | `Recovered` is `resolved`; `Triggered`, `Re-Triggered`, `Warn`, `No Data` and `Renotify` are `firing` |
 | `alert_cycle_key` | the incident id, so the trigger and its recovery are one incident. Required for that to work. |
-| `tags` (`"a:b,c:d"` or a JSON array) | labels. An `alertname:` tag sets the alert name, otherwise `title` is used. `service:` sets the service. The runbook takes its target from `kube_namespace:` and `kube_deployment:` tags when there are no `namespace`/`deployment` tags. |
+| `tags` (`"a:b,c:d"` or a JSON array) | labels. An `alertname:` tag sets the alert name, otherwise `title` is used. `service:` sets the service. The runbook takes its target from `kube_namespace:` and `kube_deployment:` tags when there are no `namespace`/`deployment` tags, and the node to drain from a `host:` tag when there's no `node:` tag. |
 | `severity:` tag | the severity (`critical`, `warning` or `info`); otherwise `priority` P1 and P2 are `critical`, P3 is `warning`, P4 and P5 are `info`, and anything else is `warning` |
 | `date_happened` | epoch seconds or milliseconds |
 
@@ -667,6 +668,7 @@ aws cloudwatch put-metric-alarm \
 | Version | Date | Changes |
 |---------|------|---------|
 | 1.0 | 2026-02-02 | Initial API documentation |
+| 1.4 | 2026-10-23 | `drain_node` action and the `node` label (or Datadog `host` tag). `desired_replicas` raises the HPA's minimum when the deployment has one. |
 | 1.3 | 2026-10-23 | The runbook state machine picks the action; `runbook_action: notify_only` skips the runbook and other unknown values escalate. `namespace`/`deployment` labels and `desired_replicas` set the target. |
 | 1.2 | 2026-10-23 | `alert_ingest` publishes to EventBridge only; rules route to DynamoDB, SNS and Step Functions. `remediation_started` removed from the response. |
 | 1.1 | 2026-10-23 | `POST /webhook` on a REST API with schema validation, API keys and throttling; Datadog payloads; `202` and `400` responses as documented |
@@ -682,4 +684,4 @@ For API issues or questions:
 ---
 
 **Last Updated**: 2026-10-23
-**API Version**: 1.3
+**API Version**: 1.4

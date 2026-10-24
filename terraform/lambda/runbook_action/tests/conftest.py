@@ -16,7 +16,10 @@ def lambda_env(monkeypatch):
     monkeypatch.setenv("REGION", "us-east-1")
     monkeypatch.setenv("CLUSTER_NAME", "test-cluster")
     monkeypatch.setenv("ALLOWED_NAMESPACES", "apps")
+    monkeypatch.setenv("DEGRADED_DEPLOYMENT", "checkout")
     monkeypatch.setenv("DEGRADED_PARAM", "/checkout/degraded_mode")
+    monkeypatch.setenv("DRAINABLE_NODE_LABEL", "nodegroup=apps")
+    monkeypatch.setenv("MIN_SCHEDULABLE_NODES", "1")
     monkeypatch.delenv("MAX_REPLICAS", raising=False)
 
 
@@ -31,4 +34,21 @@ def runbook_payload():
         "namespace": "apps",
         "deployment": "checkout",
         "replicas": 4,
+        "node": "",
+    }
+
+
+@pytest.fixture
+def drain_payload():
+    """A NodeUnderPressure alert comes from kube-state-metrics, so its labels
+    carry the exporter's namespace and the 'cluster' service"""
+    return {
+        "incident_id": "test-incident-456",
+        "alertname": "NodeUnderPressure",
+        "severity": "critical",
+        "action": "drain_node",
+        "namespace": "monitoring",
+        "deployment": "cluster",
+        "replicas": 4,
+        "node": "ip-10-0-1-23.ec2.internal",
     }

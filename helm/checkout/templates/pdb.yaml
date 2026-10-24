@@ -1,0 +1,12 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+# Keeps at least two replicas up while a node is drained
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: checkout
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      app: checkout
+{{- end }}

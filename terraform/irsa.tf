@@ -35,6 +35,40 @@ module "external_dns_irsa" {
   tags = var.tags
 }
 
+# Checkout reads its degraded-mode flag from SSM, and only that parameter
+resource "aws_iam_policy" "checkout_degraded_flag" {
+  name        = "${var.name}-checkout-degraded-flag"
+  description = "Read the checkout degraded-mode parameter"
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [{
+      Effect   = "Allow",
+      Action   = ["ssm:GetParameter"],
+      Resource = aws_ssm_parameter.checkout_degraded_mode.arn
+    }]
+  })
+  tags = var.tags
+}
+
+module "checkout_irsa" {
+  source  = "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts-eks"
+  version = "~> 5.0"
+
+  role_name = "${var.name}-checkout"
+  role_policy_arns = {
+    degraded_flag = aws_iam_policy.checkout_degraded_flag.arn
+  }
+
+  oidc_providers = {
+    main = {
+      provider_arn               = module.eks.oidc_provider_arn
+      namespace_service_accounts = ["apps:checkout"]
+    }
+  }
+
+  tags = var.tags
+}
+
 # Cert-manager IRSA is optional depending on DNS01 integrations (Route53)
 module "cert_manager_irsa" {
   source  = "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts-eks"

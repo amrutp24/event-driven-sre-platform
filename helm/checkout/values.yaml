@@ -2,10 +2,30 @@ image:
   repository: "<YOUR_ECR_REPO>/checkout"
   tag: "latest"
 
-replicaCount: 2
+# Only used when autoscaling is off
+replicaCount: 3
+
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  # Matches runbook_action's MAX_REPLICAS
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 2
+
+serviceAccount:
+  name: checkout
+  # IRSA role that can read the degraded-mode parameter. scripts/deploy.sh sets it.
+  roleArn: ""
 
 env:
   DEGRADED_MODE: "false"
+  # The runbook's degrade action sets this; the app re-reads it every 15 seconds
+  DEGRADED_PARAM: "/checkout/degraded_mode"
+  AWS_REGION: "us-east-1"
   ERROR_RATE: "0.00"
   LATENCY_MS: "0"
   CHAOS: "false"
@@ -18,8 +38,8 @@ ingress:
 
 resources:
   requests:
-    cpu: "200m"
-    memory: "256Mi"
+    cpu: "100m"
+    memory: "128Mi"
   limits:
     cpu: "500m"
     memory: "512Mi"

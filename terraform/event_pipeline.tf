@@ -281,11 +281,14 @@ resource "aws_lambda_function" "runbook_action" {
 
   environment {
     variables = {
-      REGION             = var.aws_region
-      CLUSTER_NAME       = var.eks_cluster_name
-      ALLOWED_NAMESPACES = local.remediation_namespace
-      MAX_REPLICAS       = var.remediation_max_replicas
-      DEGRADED_PARAM     = aws_ssm_parameter.checkout_degraded_mode.name
+      REGION                = var.aws_region
+      CLUSTER_NAME          = var.eks_cluster_name
+      ALLOWED_NAMESPACES    = local.remediation_namespace
+      MAX_REPLICAS          = var.remediation_max_replicas
+      DEGRADED_DEPLOYMENT   = local.remediation_deployment
+      DEGRADED_PARAM        = aws_ssm_parameter.checkout_degraded_mode.name
+      DRAINABLE_NODE_LABEL  = "nodegroup=apps"
+      MIN_SCHEDULABLE_NODES = var.drain_min_schedulable_nodes
     }
   }
 }

@@ -40,10 +40,12 @@ module "eks" {
     }
   }
 
-  # Managed node groups (production baseline)
+  # Managed node groups (production baseline). EKS stopped publishing Amazon
+  # Linux 2 AMIs after Kubernetes 1.32, so both groups run AL2023.
   eks_managed_node_groups = {
     system = {
       name           = "${var.eks_cluster_name}-system"
+      ami_type       = "AL2023_x86_64_STANDARD"
       instance_types = [var.node_instance_type_system]
       min_size       = 2
       max_size       = 6
@@ -64,6 +66,7 @@ module "eks" {
 
     apps = {
       name           = "${var.eks_cluster_name}-apps"
+      ami_type       = "AL2023_x86_64_STANDARD"
       instance_types = [var.node_instance_type_apps]
       min_size       = 2
       max_size       = 10
@@ -82,6 +85,8 @@ module "eks" {
     coredns    = { most_recent = true }
     kube-proxy = { most_recent = true }
     vpc-cni    = { most_recent = true }
+    # Community add-on; the checkout HPA needs the metrics API
+    metrics-server = { most_recent = true }
   }
 
   tags = merge(var.tags, {

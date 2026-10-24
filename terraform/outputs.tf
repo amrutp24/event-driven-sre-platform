@@ -34,6 +34,11 @@ output "external_dns_role_arn" {
   value = module.external_dns_irsa.iam_role_arn
 }
 
+output "checkout_role_arn" {
+  description = "IRSA role for the checkout service account; reads the degraded-mode parameter"
+  value       = module.checkout_irsa.iam_role_arn
+}
+
 output "alert_webhook_url" {
   description = "POST alerts here"
   value       = "${aws_api_gateway_stage.prod.invoke_url}/webhook"

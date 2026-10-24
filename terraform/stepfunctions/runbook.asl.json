@@ -16,7 +16,8 @@
           "CheckoutHighErrorRate": { "action": "degrade_or_scale" },
           "CheckoutHighLatencyP95": { "action": "degrade_or_scale" },
           "CheckoutSLOBurnFast": { "action": "degrade_or_scale" },
-          "CheckoutDown": { "action": "restart" }
+          "CheckoutDown": { "action": "restart" },
+          "NodeUnderPressure": { "action": "drain_node" }
         }
       },
       "Next": "ShouldRemediate"
@@ -86,14 +87,15 @@
       "Type": "Succeed"
     },
     "ChooseAction": {
-      "Comment": "Step 3. Maps the alert to an action. A runbook_action annotation on the alert wins over the table. The target comes from the alert's labels (or Datadog's kube_namespace and kube_deployment tags), falling back to the checkout deployment.",
+      "Comment": "Step 3. Maps the alert to an action. A runbook_action annotation on the alert wins over the table. The target comes from the alert's labels (or Datadog's kube_namespace and kube_deployment tags), falling back to the checkout deployment. drain_node uses the node label, or Datadog's host tag.",
       "Type": "Pass",
       "Assign": {
         "action": "{% $exists($incident.annotations.runbook_action) ? $incident.annotations.runbook_action : ($exists($lookup($routes, $incident.alertname)) ? $lookup($routes, $incident.alertname).action : 'none') %}",
         "target": {
           "namespace": "{% $exists($incident.labels.namespace) ? $incident.labels.namespace : ($exists($incident.labels.kube_namespace) ? $incident.labels.kube_namespace : '${default_namespace}') %}",
           "deployment": "{% $exists($incident.labels.deployment) ? $incident.labels.deployment : ($exists($incident.labels.kube_deployment) ? $incident.labels.kube_deployment : (($exists($incident.service) and $incident.service != 'unknown') ? $incident.service : '${default_deployment}')) %}",
-          "replicas": "{% $exists($incident.annotations.desired_replicas) ? $incident.annotations.desired_replicas : ${default_replicas} %}"
+          "replicas": "{% $exists($incident.annotations.desired_replicas) ? $incident.annotations.desired_replicas : ${default_replicas} %}",
+          "node": "{% $exists($incident.labels.node) ? $incident.labels.node : ($exists($incident.labels.host) ? $incident.labels.host : '') %}"
         },
         "escalationReason": "{% $exists($incident.annotations.runbook_action) ? 'unknown runbook_action ' & $incident.annotations.runbook_action & ' on ' & $incident.alertname : 'no runbook for ' & $incident.alertname %}"
       },
@@ -103,7 +105,7 @@
       "Type": "Choice",
       "Choices": [
         {
-          "Condition": "{% $action in ['degrade', 'restart', 'scale', 'degrade_or_scale'] %}",
+          "Condition": "{% $action in ['degrade', 'restart', 'scale', 'degrade_or_scale', 'drain_node'] %}",
           "Next": "ExecuteAction"
         }
       ],
@@ -123,7 +125,8 @@
           "action": "{% $action %}",
           "namespace": "{% $target.namespace %}",
           "deployment": "{% $target.deployment %}",
-          "replicas": "{% $target.replicas %}"
+          "replicas": "{% $target.replicas %}",
+          "node": "{% $target.node %}"
         }
       },
       "Retry": [

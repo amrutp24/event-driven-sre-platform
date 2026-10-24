@@ -29,7 +29,7 @@ graph TB
 
         subgraph "Amazon EKS Cluster"
             subgraph "apps namespace"
-                APP[Checkout Service Pods<br/>Flask + Gunicorn<br/>/checkout /metrics /healthz]
+                APP[Checkout Service Pods<br/>Flask + Gunicorn, HPA 3-10<br/>/checkout /metrics /healthz /readyz]
             end
 
             subgraph "monitoring namespace"
@@ -145,18 +145,19 @@ flowchart TD
     Decision -->|No| Escalate
     Decision -->|Yes| Step11
 
-    Step11[11. Invoke runbook_action Lambda<br/>Pass: action, namespace, deployment, replicas] --> Step12
+    Step11[11. Invoke runbook_action Lambda<br/>Pass: action, namespace, deployment, replicas, node] --> Step12
     Step12[12. Lambda authenticates to EKS<br/>IAM role + EKS access entry] --> ActionType{Action Type}
 
-    ActionType -->|Scale| Scale[Patch replicas<br/>Up to MAX_REPLICAS]
+    ActionType -->|Scale| Scale[Raise the HPA minimum<br/>Up to MAX_REPLICAS]
     ActionType -->|Restart| Restart[Restart annotation<br/>Rolling restart pods]
-    ActionType -->|Degrade| Degrade[DEGRADED_MODE=true + restart<br/>Flag recorded in SSM]
-    ActionType -.->|Drain, not built yet| Drain[kubectl drain node<br/>Evict pods safely]
+    ActionType -->|Degrade| Degrade[Set the SSM flag<br/>Pods pick it up within 15s]
+    ActionType -->|Drain| Drain[Cordon the node<br/>Evict its pods, PDBs respected]
     ActionType -->|Failed after 3 retries| Escalate
 
     Scale --> Step13
     Restart --> Step13
     Degrade --> Step13
+    Drain --> Step13
 
     Step13[13. Publish action.completed<br/>Wait 60s for metrics to settle] --> Step14
     Step14[14. Read the incident every 30s<br/>until the recorder marks it resolved] --> Step15
@@ -233,10 +234,11 @@ sequenceDiagram
     L2->>K8s: Authenticate with an EKS token<br/>Access entry: checkout-remediation group
     L2->>SSM: PutParameter: /checkout/degraded_mode=true
     SSM-->>L2: Success
-    L2->>K8s: Patch Deployment apps/checkout<br/>DEGRADED_MODE=true, restart annotation
-    L2->>K8s: Patch Deployment apps/checkout<br/>replicas=4
-    K8s-->>L2: Success: rollout triggered
-    L2-->>SF: Return: {action, degraded: true, scaled_to: 4}
+    L2->>K8s: Get HPA apps/checkout
+    K8s-->>L2: minReplicas 3, maxReplicas 10
+    L2->>K8s: Patch HPA apps/checkout<br/>minReplicas=4
+    K8s-->>L2: Success: HPA adds a pod
+    L2-->>SF: Return: {action, degraded: true, scaled_to: 4, scaled_via: hpa}
     SF->>EB: PutEvents: action.completed
     EB->>DDB: incident-recorder appends to actions_taken
 
@@ -244,7 +246,9 @@ sequenceDiagram
     SF->>SF: Wait 60 seconds for metrics to settle
 
     Note over App,Prom: Recovery
-    App->>App: DEGRADED_MODE=true<br/>Skips the injected errors and latency
+    App->>SSM: GetParameter: /checkout/degraded_mode<br/>at most every 15 seconds
+    SSM-->>App: true
+    App->>App: Degraded mode on<br/>Skips the injected errors and latency
     App->>Prom: Expose metrics<br/>error_rate=0.01 (1%)
     Prom->>AM: Resolve alert: CheckoutHighErrorRate
     AM->>APIGW: POST /webhook<br/>status=resolved
@@ -273,6 +277,7 @@ graph TB
         R2[runbook_action Lambda Role<br/>Permissions:<br/>- eks:DescribeCluster<br/>- ssm:GetParameter<br/>- ssm:PutParameter<br/>- sts:GetCallerIdentity]
         R3[EventBridge Role<br/>Permissions:<br/>- states:StartExecution<br/>SNS, SQS and Logs grant it<br/>through resource policies]
         R4[Step Functions Role<br/>Permissions:<br/>- lambda:InvokeFunction<br/>- dynamodb:UpdateItem<br/>- dynamodb:GetItem<br/>- events:PutEvents]
+        R5[checkout pod role, IRSA<br/>Service account: apps/checkout<br/>Permissions:<br/>- ssm:GetParameter on<br/>/checkout/degraded_mode]
     end
 
     subgraph "EKS Access Entry"
@@ -280,8 +285,10 @@ graph TB
     end
 
     subgraph "Kubernetes RBAC"
-        Role[Role: checkout-remediation<br/>Namespace: apps<br/>Permissions:<br/>- get/patch deployments<br/>- list pods]
+        Role[Role: checkout-remediation<br/>Namespace: apps<br/>Permissions:<br/>- get/list/patch deployments<br/>- get/patch horizontalpodautoscalers<br/>- get/list pods]
         RB[RoleBinding<br/>Group checkout-remediation -> Role]
+        CRole[ClusterRole: checkout-remediation-nodes<br/>Permissions:<br/>- get/list/patch nodes<br/>- list pods<br/>- create pods/eviction]
+        CRB[ClusterRoleBinding<br/>Group checkout-remediation -> ClusterRole]
     end
 
     subgraph "Network Security"
@@ -298,6 +305,8 @@ graph TB
     R2 -->|Mapped by| AE
     AE -->|Group bound by| RB
     RB -->|Grants| Role
+    AE -->|Group bound by| CRB
+    CRB -->|Grants| CRole
 
     R1 -.->|Least Privilege| R3
     R3 -.->|Least Privilege| R4
@@ -313,8 +322,8 @@ graph TB
     classDef network fill:#FF9900,stroke:#232F3E,stroke-width:2px,color:#fff
     classDef encryption fill:#5C6AC4,stroke:#fff,stroke-width:2px,color:#fff
 
-    class R1,R2,R3,R4,AE iam
-    class Role,RB k8s
+    class R1,R2,R3,R4,R5,AE iam
+    class Role,RB,CRole,CRB k8s
     class SG1,SG2,SG3 network
     class KMS,SSM_Sec encryption
 ```
@@ -389,7 +398,7 @@ graph TB
 - Steps:
   1. **Evaluate Alert**: only firing alerts with a severity in `auto_remediate_severities` (default `critical`) go on. Warnings, info alerts and alerts annotated `runbook_action: notify_only` stop here; SNS has already notified on-call.
   2. **Log Incident**: a conditional `UpdateItem` sets `status=remediating`, `remediation_started_at` and `runbook_execution`. It only succeeds once per incident, and not after the alert has resolved, so re-sent alerts and duplicate deliveries stop here.
-  3. **Choose Action**: map the alert name to an action. `CheckoutHighErrorRate`, `CheckoutHighLatencyP95` and `CheckoutSLOBurnFast` get `degrade_or_scale`, `CheckoutDown` gets `restart`. A `runbook_action` annotation overrides the table. The namespace comes from the alert's `namespace` label (or Datadog's `kube_namespace` tag), else `apps`; the deployment from its `deployment` label, `kube_deployment` tag or `service` label, else `checkout`; replicas from a `desired_replicas` annotation, else 4. No runbook for the alert means escalate.
+  3. **Choose Action**: map the alert name to an action. `CheckoutHighErrorRate`, `CheckoutHighLatencyP95` and `CheckoutSLOBurnFast` get `degrade_or_scale`, `CheckoutDown` gets `restart`, `NodeUnderPressure` gets `drain_node`. A `runbook_action` annotation overrides the table. The namespace comes from the alert's `namespace` label (or Datadog's `kube_namespace` tag), else `apps`; the deployment from its `deployment` label, `kube_deployment` tag or `service` label, else `checkout`; replicas from a `desired_replicas` annotation, else 4; the node from its `node` label or Datadog's `host` tag (the EC2 private DNS name, which is the node name). No runbook for the alert means escalate.
   4. **Execute Action**: invoke runbook_action. `InvalidRequest` (bad input) isn't retried; anything else gets 3 retries with exponential backoff and jitter. Either way the result goes out as an `action.completed` event, and a failure escalates.
   5. **Wait for Stabilization**: 60 seconds (`stabilization_seconds`)
   6. **Verify Resolution**: read the incident from DynamoDB every 30 seconds (`verify_poll_seconds`) until the incident recorder has marked it resolved, for up to 10 minutes after the action (`verify_timeout_seconds`). The original plan was 5 minutes, but the alert's 5 minute rate window plus Alertmanager's 2 minute `group_interval` mean a fixed service usually reads as resolved 3 to 7 minutes after the action.
@@ -404,16 +413,22 @@ graph TB
 - Memory: 512 MB
 - Timeout: 120 seconds
 - VPC: Attached to private subnets (access to EKS API)
-- Input: `{incident_id, alertname, severity, action, namespace, deployment, replicas}` from the state machine. It runs the action it's given and doesn't choose one itself.
+- Input: `{incident_id, alertname, severity, action, namespace, deployment, replicas, node}` from the state machine. It runs the action it's given and doesn't choose one itself.
 - Actions:
-  - **degrade**: set the SSM parameter, set `DEGRADED_MODE=true` on the deployment and restart it
-  - **scale**: set the replica count
+  - **degrade**: set the SSM parameter `/checkout/degraded_mode` to `true`. The checkout pods read it live, so there's no restart. Only checkout has a degraded mode (`DEGRADED_DEPLOYMENT`); degrading any other deployment is an `InvalidRequest`.
+  - **scale**: if the deployment has an HPA, raise its `minReplicas` to the target (and `maxReplicas` too if the target is above it); patching the deployment's replicas directly would be undone by the HPA within seconds. Without an HPA it patches the replicas.
   - **restart**: rolling restart through the restart annotation
   - **degrade_or_scale**: degrade, then scale
-  - **drain_node**: evict pods from an unhealthy node. Not built yet.
-- Validation: raises `InvalidRequest` for an unknown action, a namespace that isn't in `ALLOWED_NAMESPACES` (`apps`), a deployment name that isn't a valid Kubernetes name, or replicas outside 1 to `MAX_REPLICAS` (`remediation_max_replicas`, default 10)
+  - **drain_node**: cordon the node, then evict its pods through the Eviction API the way `kubectl drain` does, skipping DaemonSet and mirror pods and pods that are finished or already terminating. A pod with no owner isn't evicted, since nothing would recreate it; it's listed under `unmanaged`. Evictions a PodDisruptionBudget blocks are retried every 5 seconds for up to a minute, then left; the result lists them, and the verify step decides whether the alert cleared. The node stays cordoned; replacing or uncordoning it is left to a person.
+- Validation: raises `InvalidRequest` for an unknown action, a namespace that isn't in `ALLOWED_NAMESPACES` (`apps`), a deployment name that isn't a valid Kubernetes name, or replicas outside 1 to `MAX_REPLICAS` (`remediation_max_replicas`, default 10, the HPA's maximum). For `drain_node`: a missing or invalid node name, a node that doesn't exist, a node without the `nodegroup=apps` label (`DRAINABLE_NODE_LABEL`; system nodes need a person), or fewer than 1 other Ready, schedulable apps node to take its pods (`drain_min_schedulable_nodes`).
+- Nothing is put back after the incident resolves. Degraded mode stays on and the HPA minimum stays raised until someone reverts them (a `helm upgrade` of the checkout chart also resets the minimum to 3):
+  ```bash
+  aws ssm put-parameter --name /checkout/degraded_mode --value false --overwrite
+  kubectl patch hpa checkout -n apps --type merge -p '{"spec":{"minReplicas":3}}'
+  kubectl uncordon NODE_NAME   # after a drain, once the node is healthy
+  ```
 - Kubernetes access: an EKS access entry maps its IAM role to the `checkout-remediation` group (IRSA only applies to pods)
-- RBAC: Limited to `apps` namespace, `deployments` resource
+- RBAC: a Role in `apps` for deployments and HPAs, and a ClusterRole for nodes, listing pods and creating evictions. Nodes are cluster-scoped and a node runs pods from every namespace, so draining can't be done with a namespaced Role. There's no permission to delete pods.
 
 ### 5. Storage & Notification Layer
 
@@ -458,22 +473,28 @@ graph TB
 ### 6. Application Layer
 
 **Checkout Service**
-- Framework: Flask + Gunicorn
-- Replicas: 3 (horizontal pod autoscaling)
+- Framework: Flask on Gunicorn, 1 worker with 8 threads. prometheus_client keeps its metrics per process, so with several workers each scrape would only see one worker's counters; it scales with replicas instead.
+- Image: `python:3.13-slim`, running as a non-root user (UID 10001)
+- Replicas: 3 to 10, set by a HorizontalPodAutoscaler at 70% CPU. metrics-server runs as an EKS add-on for it. The chart's `replicaCount` (3) only applies with autoscaling turned off.
+- PodDisruptionBudget: at least 2 pods available, so a drain evicts them a few at a time
+- Spread: pods are spread across nodes (`topologySpreadConstraints` on the hostname, best effort)
 - Resources:
   - Requests: 100m CPU, 128Mi memory
   - Limits: 500m CPU, 512Mi memory
 - Health checks:
   - Liveness: `/healthz` (timeout 5s)
-  - Readiness: `/healthz` (failure threshold 3)
+  - Readiness: `/readyz` (failure threshold 3)
+- Degraded mode: starts from the `DEGRADED_MODE` env var, then follows the SSM parameter `/checkout/degraded_mode` (`DEGRADED_PARAM`). `/checkout` requests and Prometheus scrapes of `/metrics` check it at most every 15 seconds (`DEGRADED_REFRESH_SECONDS`). The SSM call has a 1 second timeout and no retries, so a slow SSM doesn't hold up a checkout. If it can't be read, the pod keeps the last value and logs one warning until a read works again. Degraded mode skips the injected latency and errors.
+- AWS access: the `checkout` service account has an IRSA role that can only `ssm:GetParameter` that one parameter
 - Metrics: Prometheus client library
-  - Counters: `checkout_requests_total`, `checkout_errors_total`
-  - Histograms: `checkout_request_duration_seconds`
-  - Gauges: `checkout_degraded_mode_enabled`
+  - Counters: `http_requests_total` (by route and code), `checkout_success_total`, `checkout_failure_total`, `dependency_errors_total`
+  - Histograms: `http_request_duration_seconds`
+  - Gauges: `in_flight_requests`, `checkout_degraded_mode_enabled` (0 or 1)
 - Chaos engineering:
   - `LATENCY_MS`: Inject artificial latency
   - `ERROR_RATE`: Random error injection (0.0-1.0)
-  - `DEGRADED_MODE`: Disable optional features
+  - `CHAOS`: Count random fake dependency errors in `dependency_errors_total`; responses aren't affected
+  - `DEGRADED_MODE`: Degraded mode's starting value
 
 ---
 

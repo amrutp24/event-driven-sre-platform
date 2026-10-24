@@ -1,18 +1,22 @@
 # What the runbook-action Lambda may do in the cluster.
 #
 # The Lambda calls the Kubernetes API as its IAM role. terraform/eks.tf gives
-# that role an EKS access entry in the "checkout-remediation" group, and this
-# binding is the only thing that group is granted. Applied by scripts/deploy.sh.
+# that role an EKS access entry in the "checkout-remediation" group, and these
+# bindings are the only things that group is granted. Applied by scripts/deploy.sh.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: checkout-remediation
   namespace: apps
 rules:
-  # Read, scale, restart and set env vars on deployments
+  # Read, scale and restart deployments
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["get", "list", "patch"]
+  # scale raises the HPA's minimum instead of fighting it over replicas
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "patch"]
   # Look at pods to verify a rollout
   - apiGroups: [""]
     resources: ["pods"]
@@ -34,4 +38,38 @@ subjects:
 roleRef:
   kind: Role
   name: checkout-remediation
+  apiGroup: rbac.authorization.k8s.io
+---
+# drain_node. Nodes are cluster-scoped and a node runs pods from every
+# namespace, so this can't be a namespaced Role. Eviction goes through the
+# Eviction API, which respects PodDisruptionBudgets; the Lambda has no
+# permission to delete pods outright.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: checkout-remediation-nodes
+rules:
+  # Check the node's labels and readiness, then cordon it
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "patch"]
+  # Find the pods on the node
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]
+  - apiGroups: [""]
+    resources: ["pods/eviction"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: checkout-remediation-nodes
+subjects:
+  - kind: Group
+    name: checkout-remediation
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: checkout-remediation-nodes
   apiGroup: rbac.authorization.k8s.io

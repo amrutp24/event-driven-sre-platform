@@ -6,6 +6,8 @@ helm repo update >/dev/null
 
 WEBHOOK_URL="$(terraform -chdir=terraform output -raw alert_webhook_url)"
 API_KEY="$(terraform -chdir=terraform output -raw alertmanager_api_key)"
+CHECKOUT_ROLE_ARN="$(terraform -chdir=terraform output -raw checkout_role_arn)"
+REGION="$(terraform -chdir=terraform output -raw aws_region)"
 
 echo "[1/5] Store the webhook API key for Alertmanager"
 kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
@@ -24,9 +26,13 @@ helm upgrade --install mon prometheus-community/kube-prometheus-stack \
 echo "[3/5] Apply alert rules"
 kubectl apply -n monitoring -f helm/observability/prom-rules/checkout-alerts.yaml
 kubectl apply -n monitoring -f helm/observability/prom-rules/slo-burnrate.yaml
+kubectl apply -n monitoring -f helm/observability/prom-rules/node-alerts.yaml
 
 echo "[4/5] Deploy app"
-helm upgrade --install checkout helm/checkout -n apps --create-namespace
+# The service account's IRSA role lets the app read its degraded-mode flag from SSM
+helm upgrade --install checkout helm/checkout -n apps --create-namespace \
+  --set serviceAccount.roleArn="$CHECKOUT_ROLE_ARN" \
+  --set env.AWS_REGION="$REGION"
 
 echo "[5/5] Allow the runbook Lambda to remediate in apps"
 kubectl apply -f k8s/rbac/remediation-role.yaml

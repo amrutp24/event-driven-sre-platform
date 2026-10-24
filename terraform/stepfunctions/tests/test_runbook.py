@@ -104,6 +104,7 @@ def test_lambda_gets_the_action_and_target():
         "namespace": "apps",
         "deployment": "checkout",
         "replicas": 4,
+        "node": "",
     }
 
 
@@ -112,6 +113,7 @@ def test_lambda_gets_the_action_and_target():
     ("CheckoutHighLatencyP95", "degrade_or_scale"),
     ("CheckoutSLOBurnFast", "degrade_or_scale"),
     ("CheckoutDown", "restart"),
+    ("NodeUnderPressure", "drain_node"),
 ])
 def test_route_table(alertname, action):
     assert payload(run(incident(alertname=alertname)))["action"] == action
@@ -204,6 +206,41 @@ def test_target_comes_from_labels():
     assert (sent["namespace"], sent["deployment"], sent["replicas"]) == ("payments", "payments-api", "6")
 
 
+NODE = "ip-10-0-1-23.ec2.internal"
+
+
+def node_pressure(**labels):
+    return incident(
+        alertname="NodeUnderPressure",
+        service="unknown",
+        labels={"alertname": "NodeUnderPressure", "severity": "critical", **labels},
+        annotations={"summary": f"{labels.get('node', 'A node')} has MemoryPressure"},
+    )
+
+
+def test_node_under_pressure_drains_the_node_from_its_label():
+    detail = node_pressure(node=NODE, condition="MemoryPressure", namespace="monitoring")
+    result = run(detail)
+    sent = payload(result)
+    assert (sent["action"], sent["node"]) == ("drain_node", NODE)
+    assert result.end_state == "AutoResolved"
+
+
+def test_drain_node_takes_the_host_tag_from_datadog():
+    detail = node_pressure(host=NODE, kube_cluster_name="event-driven-sre-eks")
+    detail["source"] = "datadog"
+    assert payload(run(detail))["node"] == NODE
+
+
+def test_node_label_wins_over_host():
+    assert payload(run(node_pressure(node=NODE, host="something-else")))["node"] == NODE
+
+
+def test_missing_node_reaches_the_lambda_as_empty():
+    # Always defined, so the Lambda can reject it with a clear message
+    assert payload(run(node_pressure()))["node"] == ""
+
+
 def test_target_comes_from_datadog_kube_tags():
     detail = incident(
         source="datadog",
@@ -260,9 +297,9 @@ def test_unknown_alert_is_claimed_then_escalated():
 
 
 def test_unknown_annotated_action_is_escalated_without_calling_the_lambda():
-    result = run(incident(annotations={"runbook_action": "drain_node"}))
+    result = run(incident(annotations={"runbook_action": "reboot_cluster"}))
     assert result.end_state == "Escalated"
-    assert result.cause == "unknown runbook_action drain_node on CheckoutHighErrorRate"
+    assert result.cause == "unknown runbook_action reboot_cluster on CheckoutHighErrorRate"
     assert not result.calls_to("ExecuteAction")
 
 

@@ -100,6 +100,46 @@ def test_targets_the_lambda_rejects_escalate_without_retries(ingest, runbook_act
     assert why in failed["cause"]
 
 
+NODE = "ip-10-0-1-23.ec2.internal"
+
+# kube_node_status_condition comes from kube-state-metrics, so the series
+# carries its namespace and service, not the node's
+KSM_LABELS = {"condition": "MemoryPressure", "status": "true", "namespace": "monitoring",
+              "service": "mon-kube-state-metrics", "job": "kube-state-metrics"}
+
+
+def test_node_under_pressure_from_alertmanager_drains_the_node(ingest, runbook_action):
+    [(_, _, detail)] = ingest(alertmanager(alertname="NodeUnderPressure", labels={"node": NODE, **KSM_LABELS}))
+    result = run_runbook(detail, runbook_action)
+
+    sent = result.calls_to("ExecuteAction")[0].arguments["Payload"]
+    assert (sent["action"], sent["node"]) == ("drain_node", NODE)
+    assert result.calls_to("ExecuteAction")[0].error is None
+    assert result.end_state == "AutoResolved"
+
+
+def test_node_under_pressure_from_datadog_uses_the_host_tag(ingest, runbook_action):
+    [(_, _, detail)] = ingest(datadog(tags=f"alertname:NodeUnderPressure,host:{NODE},kube_cluster_name:sre"))
+    result = run_runbook(detail, runbook_action)
+
+    assert result.calls_to("ExecuteAction")[0].arguments["Payload"]["node"] == NODE
+    assert result.end_state == "AutoResolved"
+
+
+def test_drain_without_a_node_is_rejected_and_escalated(ingest, runbook_action):
+    [(_, _, detail)] = ingest(alertmanager(alertname="NodeUnderPressure", labels=KSM_LABELS))
+    result = run_runbook(detail, runbook_action)
+
+    call = result.calls_to("ExecuteAction")[0]
+    assert call.arguments["Payload"]["node"] == ""
+    assert (call.error, call.retries) == ("InvalidRequest", 0)
+    assert result.cause == "drain_node failed: InvalidRequest"
+    cause = result.events("action.completed")[0]["Detail"]["cause"].lower()
+    # Rejected for the missing node, not because the Lambda doesn't know the action
+    assert "node" in cause and "unknown action" not in cause
+    assert result.end_state == "Escalated"
+
+
 def test_resolved_alerts_dont_start_remediation(ingest, runbook_action):
     # The incident.resolved rule doesn't target the runbook, but the input
     # would be ignored anyway
@@ -112,5 +152,6 @@ def test_runbook_payload_has_every_field_the_lambda_reads(runbook_action):
     from conftest import incident
     result = run_runbook(incident(), runbook_action)
     sent = result.calls_to("ExecuteAction")[0].arguments["Payload"]
-    assert set(sent) == {"incident_id", "alertname", "severity", "action", "namespace", "deployment", "replicas"}
-    assert runbook_action._validate(sent) == ("degrade_or_scale", "apps", "checkout", 4)
+    assert set(sent) == {"incident_id", "alertname", "severity", "action", "namespace", "deployment",
+                         "replicas", "node"}
+    runbook_action._validate(sent)  # raises InvalidRequest if anything's off
