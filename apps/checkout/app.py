@@ -23,8 +23,11 @@ CHAOS = os.getenv("CHAOS", "false").lower() == "true"
 
 
 def _ssm_client():
-    # Short timeouts and no retries: a slow SSM shouldn't hold up a checkout
-    return boto3.client("ssm", config=Config(connect_timeout=1, read_timeout=1, retries={"max_attempts": 1}))
+    # Short timeouts and no retries: a slow SSM shouldn't hold up a checkout.
+    # boto3 only reads AWS_DEFAULT_REGION, so pass AWS_REGION (set by the chart) on.
+    region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION")
+    return boto3.client("ssm", region_name=region,
+                        config=Config(connect_timeout=1, read_timeout=1, retries={"max_attempts": 1}))
 
 
 class DegradedMode:

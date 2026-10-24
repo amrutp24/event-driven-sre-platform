@@ -13,7 +13,14 @@ alertmanager:
       group_wait: 30s
       group_interval: 2m
       repeat_interval: 30m
+      routes:
+      # The chart's always-firing heartbeat alerts go nowhere instead of
+      # becoming incidents
+      - receiver: "null"
+        matchers:
+          - alertname =~ "InfoInhibitor|Watchdog"
     receivers:
+    - name: "null"
     - name: "aws-webhook"
       webhook_configs:
       - url: "<WEBHOOK_URL>"

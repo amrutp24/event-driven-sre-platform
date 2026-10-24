@@ -3,7 +3,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py .
-RUN useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin app
+RUN useradd --uid 10001 --create-home --shell /usr/sbin/nologin app
 USER 10001
 EXPOSE 8080
 # One worker: prometheus_client keeps a registry per process, so with several
