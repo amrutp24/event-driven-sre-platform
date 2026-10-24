@@ -22,6 +22,14 @@ module "vpc" {
   enable_dns_hostnames = true
   enable_dns_support   = true
 
+  # Flow logs to CloudWatch, encrypted, 30 days. Billed per GB ingested.
+  enable_flow_log                                 = true
+  create_flow_log_cloudwatch_log_group            = true
+  create_flow_log_cloudwatch_iam_role             = true
+  flow_log_max_aggregation_interval               = 60
+  flow_log_cloudwatch_log_group_retention_in_days = 30
+  flow_log_cloudwatch_log_group_kms_key_id        = aws_kms_key.platform.arn
+
   # Required by AWS Load Balancer Controller for subnet discovery
   public_subnet_tags = {
     "kubernetes.io/role/elb"                        = "1"
@@ -66,6 +74,7 @@ locals {
 }
 
 resource "aws_security_group" "vpc_endpoints" {
+  #checkov:skip=CKV2_AWS_5:attached to aws_vpc_endpoint.interface
   count = length(local.interface_endpoints) > 0 ? 1 : 0
 
   name        = "${var.name}-vpc-endpoints"

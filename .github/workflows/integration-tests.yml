@@ -21,13 +21,14 @@ jobs:
         run: |
           pip install "pydantic<2.0.0" "checkov"
 
-      # --soft-fail keeps failed checks from failing the job, but a Checkov
+      # Settings and skipped checks (with reasons) are in .checkov.yaml.
+      # soft-fail keeps failed checks from failing the job, but a Checkov
       # error still does. pipefail (shell: bash) keeps tee from hiding it.
       - name: Run Checkov locally
         shell: bash
         run: |
           mkdir -p reports
-          checkov -d terraform/ --var-file ${{ env.TF_VAR_FILE }} --skip-download --download-external-modules true --soft-fail --compact --skip-check CKV_AWS_1,CKV_AWS_2,CKV_AWS_3,CKV_AWS_20,CKV_AWS_21,CKV_AWS_41,CKV_AWS_57,CKV_AWS_58,CKV_AWS_61,CKV_AWS_84,CKV_AWS_88,CKV_AWS_93,CKV_AWS_94,CKV_AWS_95,CKV_AWS_98,CKV_AWS_99 | tee reports/checkov-results.txt
+          checkov --config-file .checkov.yaml -d terraform/ --var-file ${{ env.TF_VAR_FILE }} | tee reports/checkov-results.txt
 
       - name: Upload Checkov results
         uses: actions/upload-artifact@v4

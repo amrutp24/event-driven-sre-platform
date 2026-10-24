@@ -10,9 +10,11 @@ module "eks" {
   vpc_id     = module.vpc.vpc_id
   subnet_ids = module.vpc.private_subnets
 
-  # Private endpoint recommended; public enabled for ease of first bootstrap.
-  cluster_endpoint_private_access = true
-  cluster_endpoint_public_access  = true
+  # The public endpoint is how deploy.sh reaches the cluster from a laptop.
+  # Narrow eks_public_access_cidrs to your own address.
+  cluster_endpoint_private_access      = true
+  cluster_endpoint_public_access       = true
+  cluster_endpoint_public_access_cidrs = var.eks_public_access_cidrs
 
   cluster_enabled_log_types = ["api", "audit", "authenticator", "controllerManager", "scheduler"]
 
@@ -37,6 +39,16 @@ module "eks" {
       to_port                  = 443
       type                     = "ingress"
       source_security_group_id = aws_security_group.runbook_lambda.id
+    }
+  }
+
+  # IMDSv2 only, with a hop limit of 1 so pods can't reach the node's IAM role
+  # through instance metadata. Pods that need AWS access use IRSA.
+  eks_managed_node_group_defaults = {
+    metadata_options = {
+      http_endpoint               = "enabled"
+      http_tokens                 = "required"
+      http_put_response_hop_limit = 1
     }
   }
 

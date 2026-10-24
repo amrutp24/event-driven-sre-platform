@@ -297,6 +297,9 @@ resource "aws_lambda_function" "runbook_action" {
   memory_size   = 512
   timeout       = 120
 
+  # At most this many remediations run against the cluster at once
+  reserved_concurrent_executions = var.runbook_action_reserved_concurrency
+
   # Private subnets, so it reaches the cluster through the private API endpoint
   vpc_config {
     subnet_ids         = module.vpc.private_subnets

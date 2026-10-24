@@ -94,6 +94,8 @@ The ingress creates an internet-facing HTTPS load balancer through the AWS Load 
 
 Security options in `terraform/variables.tf`:
 
+- `eks_public_access_cidrs` (default `["0.0.0.0/0"]`): who can reach the EKS public API endpoint. Set it to your own address.
+- `runbook_action_reserved_concurrency` (default `10`): the most remediations that run against the cluster at once
 - `enable_vpc_endpoints` (default `false`): interface endpoints for ECR, STS, SSM, EKS and CloudWatch Logs, so that traffic skips the NAT gateways. About $88 a month. The S3 and DynamoDB gateway endpoints are always on.
 - `webhook_private` (default `false`): make the webhook a private API, reachable only through an execute-api endpoint in the VPC. Datadog can't reach it then.
 - `enable_cloudtrail` (default `true`): a multi-region trail for the account. Turn it off if an organization trail already covers it.
@@ -182,10 +184,11 @@ cd terraform/stepfunctions && pip install -r tests/requirements.txt && pytest te
 
 `tests/integration/` runs the alert path end to end against LocalStack (`setup.sh`, then pytest, then `cleanup.sh`). It isn't part of CI.
 
-CI (`.github/workflows/integration-tests.yml`) runs Checkov on the Terraform, Trivy on the container image, the app, Lambda and state machine tests, and `terraform fmt`, `validate` and `tflint`.
+CI (`.github/workflows/integration-tests.yml`) runs Checkov on the Terraform (settings and skipped checks, with reasons, in `.checkov.yaml`), Trivy on the container image, the app, Lambda and state machine tests, and `terraform fmt`, `validate` and `tflint`.
 
 ## Known gaps
 
+- **The EKS public endpoint is open to the internet by default.** `deploy.sh` reaches the cluster through it from your machine. Set `eks_public_access_cidrs` to your own address.
 - **Remediation isn't reverted automatically.** After an incident resolves, degraded mode stays on, the HPA minimum stays raised, and a drained node stays cordoned. Put them back by hand (re-running `deploy.sh` also resets the HPA minimum, since `helm upgrade` applies the chart's 3):
 
   ```bash

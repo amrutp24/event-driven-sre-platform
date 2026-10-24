@@ -19,6 +19,12 @@ variable "eks_version" {
   default     = "1.36"
 }
 
+variable "eks_public_access_cidrs" {
+  description = "CIDRs allowed to reach the EKS public API endpoint. The default is open to the internet; set it to your own address, e.g. [\"203.0.113.10/32\"]."
+  type        = list(string)
+  default     = ["0.0.0.0/0"]
+}
+
 variable "vpc_cidr" {
   type    = string
   default = "10.40.0.0/16"
@@ -74,6 +80,12 @@ variable "webhook_burst_limit" {
   description = "Burst of requests allowed on the webhook"
   type        = number
   default     = 2000
+}
+
+variable "runbook_action_reserved_concurrency" {
+  description = "Concurrent executions reserved for runbook_action, which caps how many remediations hit the cluster at once. -1 leaves it unreserved."
+  type        = number
+  default     = 10
 }
 
 variable "alert_ingest_reserved_concurrency" {

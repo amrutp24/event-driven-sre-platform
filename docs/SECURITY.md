@@ -616,24 +616,27 @@ Every incident is logged with:
 9. **DynamoDB Incident History**: Complete audit trail
 10. **No Secrets in SSM**: the degraded flag is a plain String; the webhook API keys are in a Kubernetes Secret that EKS encrypts
 11. **Container Image Scanning**: ECR scans on push, and Trivy scans the image in CI
-12. **Infrastructure Scanning**: Checkov and tflint run on the Terraform in CI (Checkov doesn't fail the build yet)
+12. **Infrastructure Scanning**: Checkov and tflint run on the Terraform in CI. Checkov's settings and every skipped check, each with its reason, are in `.checkov.yaml`; it reports but doesn't fail the build.
 13. **VPC Endpoints**: S3 and DynamoDB gateway endpoints always; interface endpoints optional (`enable_vpc_endpoints`)
 14. **API Gateway Throttling**: Rate limiting to prevent abuse
 15. **Non-root Container**: the checkout image runs as an unprivileged user
 16. **Immutable Image Tags**: each build is tagged with its git SHA, and ECR refuses to overwrite a tag
+17. **VPC Flow Logs**: all traffic, to CloudWatch Logs, encrypted with the platform key and kept 30 days
+18. **No Node Credentials for Pods**: nodes require IMDSv2 with a hop limit of 1, so pods can't use the node's IAM role; pods that need AWS use IRSA
+19. **Remediation Concurrency Cap**: runbook_action runs at most 10 at once (`runbook_action_reserved_concurrency`)
 
 ### 🚧 Recommended for Production
 
-17. **Multi-Factor Authentication (MFA)**: Require MFA for all AWS console access
-18. **Service Control Policies (SCPs)**: Prevent deletion of CloudTrail, KMS keys
-19. **GuardDuty**: Threat detection for AWS accounts
-20. **Security Hub**: Centralized security findings
-21. **Config Rules**: Continuous compliance monitoring (e.g., ensure encryption enabled)
-22. **Secrets Rotation**: Rotate the webhook API keys on a schedule
-23. **WAF Rules**: Protect the ALB and API Gateway from common attacks (SQL injection, XSS)
-24. **DDoS Protection**: AWS Shield Standard (free) or Advanced (paid)
-25. **VPC Flow Logs**: Network traffic analysis
-26. **TLS Policy on the Webhook**: once the repo moves to AWS provider 6
+20. **Restrict the EKS Public Endpoint**: it's open to `0.0.0.0/0` by default; set `eks_public_access_cidrs` to your own address
+21. **Multi-Factor Authentication (MFA)**: Require MFA for all AWS console access
+22. **Service Control Policies (SCPs)**: Prevent deletion of CloudTrail, KMS keys
+23. **GuardDuty**: Threat detection for AWS accounts
+24. **Security Hub**: Centralized security findings
+25. **Config Rules**: Continuous compliance monitoring (e.g., ensure encryption enabled)
+26. **Secrets Rotation**: Rotate the webhook API keys on a schedule
+27. **WAF Rules**: Protect the ALB and API Gateway from common attacks (SQL injection, XSS)
+28. **DDoS Protection**: AWS Shield Standard (free) or Advanced (paid)
+29. **TLS Policy on the Webhook**: once the repo moves to AWS provider 6
 
 ---
 
@@ -653,6 +656,7 @@ Use this checklist before deploying to production:
 - [ ] Security groups allow only required traffic
 - [ ] VPC endpoints configured for AWS services
 - [ ] VPC Flow Logs enabled
+- [ ] EKS public endpoint limited to your own CIDRs (`eks_public_access_cidrs`)
 - [ ] ALB has TLS certificate from ACM
 - [ ] WAF rules enabled on API Gateway (if public)
 
