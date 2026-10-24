@@ -26,6 +26,19 @@ module "eks" {
   # The sre module adds runbook_action's access entry and its 443 rule on the
   # cluster security group, so neither is set here.
 
+  # The metrics-server add-on listens on 10251, which the module's default
+  # node rules don't open. Without it the HPA never gets CPU metrics.
+  node_security_group_additional_rules = {
+    metrics_server = {
+      description                   = "Control plane to metrics-server"
+      protocol                      = "tcp"
+      from_port                     = 10251
+      to_port                       = 10251
+      type                          = "ingress"
+      source_cluster_security_group = true
+    }
+  }
+
   # IMDSv2 only, with a hop limit of 1 so pods can't reach the node's IAM role
   # through instance metadata. Pods that need AWS access use IRSA.
   eks_managed_node_group_defaults = {
@@ -40,12 +53,15 @@ module "eks" {
   # Linux 2 AMIs after Kubernetes 1.32, so both groups run AL2023.
   eks_managed_node_groups = {
     system = {
-      name           = "${var.eks_cluster_name}-system"
-      ami_type       = "AL2023_x86_64_STANDARD"
-      instance_types = [var.node_instance_type_system]
-      min_size       = 2
-      max_size       = 6
-      desired_size   = 2
+      name     = "${var.eks_cluster_name}-system"
+      ami_type = "AL2023_x86_64_STANDARD"
+      # The module's default role name prefix runs past IAM's 38 character limit
+      iam_role_name            = "${var.eks_cluster_name}-system-node"
+      iam_role_use_name_prefix = false
+      instance_types           = [var.node_instance_type_system]
+      min_size                 = 2
+      max_size                 = 6
+      desired_size             = 2
 
       labels = {
         "nodegroup" = "system"
@@ -61,12 +77,15 @@ module "eks" {
     }
 
     apps = {
-      name           = "${var.eks_cluster_name}-apps"
-      ami_type       = "AL2023_x86_64_STANDARD"
-      instance_types = [var.node_instance_type_apps]
-      min_size       = 2
-      max_size       = 10
-      desired_size   = 2
+      name     = "${var.eks_cluster_name}-apps"
+      ami_type = "AL2023_x86_64_STANDARD"
+      # The module's default role name prefix runs past IAM's 38 character limit
+      iam_role_name            = "${var.eks_cluster_name}-apps-node"
+      iam_role_use_name_prefix = false
+      instance_types           = [var.node_instance_type_apps]
+      min_size                 = 2
+      max_size                 = 10
+      desired_size             = 2
 
       labels = {
         "nodegroup" = "apps"

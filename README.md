@@ -18,7 +18,7 @@ The module brings the pipeline (API Gateway, two Lambdas, EventBridge, Step Func
    | `incident.escalated`, `incident.auto_resolved` | `sre.runbook` | SNS |
    | any `sre.*` event | | CloudWatch Logs |
 
-   EventBridge can't write to DynamoDB, so the incident recorder, a small Express state machine, does those writes.
+   EventBridge can't write to DynamoDB, so the incident recorder, a small Express state machine, does those writes. With `chat_notifications` on, the four SNS rules also send to a second topic for Slack or Teams (see [Notifications](#notifications)).
 4. The runbook state machine only acts on firing `critical` alerts (`auto_remediate_severities`); the rest just notify. It claims the incident in DynamoDB first. Only one run can claim it, so an incident is remediated once even if the alert is re-sent or EventBridge delivers it twice.
 5. It picks an action from the alert name (`runbook_routes`) and invokes the `runbook-action` Lambda, retrying up to three times with backoff. The Lambda runs in your VPC and applies the action through the Kubernetes API, authenticating with an EKS token signed by its own IAM role. The result goes out as an `action.completed` event.
 6. It waits a minute, then checks DynamoDB every 30 seconds for the resolved alert. If the alert resolves within 10 minutes of the action, it records the MTTR and publishes `incident.auto_resolved`. If it doesn't, or the action failed, or there's no runbook for the alert, it marks the incident `escalated` and publishes `incident.escalated`. Both go to SNS.
@@ -64,13 +64,29 @@ The manifest's Role is for the `apps` namespace; add a copy for each other names
 
 Point Alertmanager's webhook receiver at `alert_webhook_url` and send `alertmanager_api_key` in the `X-API-Key` header. For Datadog, see [docs/API.md](docs/API.md#datadog-webhook-format).
 
+Neither Lambda has reserved concurrency by default (`-1`). New accounts often have a concurrency limit of 50, and AWS keeps at least 50 unreserved, so any reservation fails there. If your account has room, `runbook_action_reserved_concurrency = 10` caps how many remediations hit the cluster at once.
+
+### Notifications
+
+```hcl
+module "sre" {
+  # ...
+  notification_emails = ["oncall@example.com"]
+  chat_notifications  = true
+}
+```
+
+- `notification_emails` subscribes each address to the alerts topic (`sns_topic_arn`). SNS sends each one a confirmation email, and nothing arrives until its link is clicked.
+- `chat_notifications` adds a second topic, `chat_topic_arn`, encrypted with the same KMS key, with the same four events in the custom notification format of Amazon Q Developer in chat applications (AWS Chatbot). Subscribe a Slack or Teams channel configuration to it. Titles look like `critical: CheckoutHighErrorRate is firing on checkout`, `Escalated: CheckoutHighErrorRate on checkout needs a person`, `Resolved: ...` and `Auto-resolved: ...`, with the incident ID in the text. The module doesn't create the channel configuration, because the Chatbot API isn't in every region (not in `us-east-1`); [examples/complete](examples/complete/README.md#slack-and-email) does it for Slack with a provider in `us-east-2`.
+- PagerDuty isn't built in. A PagerDuty SNS integration would subscribe to `sns_topic_arn`.
+
 ## Examples
 
-- [examples/complete](examples/complete): the full demo. A VPC with flow logs, EKS 1.36, IRSA roles, ECR, CloudTrail, optional VPC endpoints, one KMS key passed to the module, and the `checkout` demo app with Prometheus alerting on top. Deploy it with the scripts, in order:
+- [examples/complete](examples/complete): the full demo. A VPC with flow logs, EKS 1.36, IRSA roles, ECR, CloudTrail, optional VPC endpoints, one KMS key passed to the module, optional email and Slack notifications, and the `checkout` demo app with Prometheus alerting on top. Deploy it with the scripts, in order:
 
   ```bash
   bash scripts/bootstrap.sh       # terraform apply in examples/complete, configure kubectl
-  bash scripts/install-addons.sh  # AWS Load Balancer Controller, ExternalDNS, cert-manager
+  bash scripts/install-addons.sh  # AWS Load Balancer Controller, ExternalDNS (only with route53_zone_arns), cert-manager
   bash scripts/build-image.sh     # build apps/checkout and push it to ECR, tagged with the short git SHA
   bash scripts/deploy.sh          # Alertmanager's API key, kube-prometheus-stack, the alert rules, the checkout app and the remediation RBAC
   bash scripts/destroy.sh         # after uninstalling the Helm releases; protections off, then terraform destroy
@@ -89,12 +105,13 @@ Point Alertmanager's webhook receiver at `alert_webhook_url` and send `alertmana
 ├── event_pipeline.tf         # both Lambdas, the runbook state machine, DynamoDB, SNS, the event bus, the EKS access entry
 ├── event_routing.tf          # EventBridge rules and targets, incident recorder, archive, dead-letter queue, audit log
 ├── kms.tf                    # the module's KMS key (create_kms_key)
+├── notifications.tf          # email subscriptions and the optional chat topic
 ├── api/                      # JSON schema for the webhook payload
 ├── stepfunctions/            # runbook and incident recorder definitions, with tests
 ├── lambda/                   # alert_ingest and runbook_action, each with unit tests; Terraform zips them
 ├── k8s/rbac/                 # the remediation Role and ClusterRole for the sre-remediation group
 ├── examples/
-│   ├── complete/             # VPC, EKS, IRSA, ECR, CloudTrail, VPC endpoints, KMS key, and the module
+│   ├── complete/             # VPC, EKS, IRSA, ECR, CloudTrail, VPC endpoints, KMS key, Slack, and the module
 │   └── existing-cluster/     # the module on a cluster you already have
 ├── apps/checkout/            # demo Flask service, Dockerfile, unit tests
 ├── helm/                     # checkout chart, kube-prometheus-stack values and alert rules, optional Datadog values
@@ -135,8 +152,8 @@ The module has no provider blocks. It needs an EKS cluster with access entries e
 | `drainable_node_label` | drain_node only drains nodes with this label, as key=value | `string` | `"nodegroup=apps"` | no |
 | `drain_min_schedulable_nodes` | drain_node refuses to drain a node unless at least this many other drainable nodes are Ready and schedulable | `number` | `1` | no |
 | `remediation_max_replicas` | Highest replica count runbook_action will scale a deployment to | `number` | `10` | no |
-| `runbook_action_reserved_concurrency` | Concurrent executions reserved for runbook_action, which caps how many remediations hit the cluster at once. -1 leaves it unreserved. | `number` | `10` | no |
-| `alert_ingest_reserved_concurrency` | Concurrent executions reserved for alert_ingest. AWS keeps 100 unreserved per account, so accounts with a low concurrency limit need -1 (no reservation). | `number` | `100` | no |
+| `runbook_action_reserved_concurrency` | Concurrent executions reserved for runbook_action, which caps how many remediations hit the cluster at once (10 is a good cap). -1 leaves it unreserved, the default, because AWS keeps at least 50 to 100 executions unreserved per account and new accounts often have a limit of 50. | `number` | `-1` | no |
+| `alert_ingest_reserved_concurrency` | Concurrent executions reserved for alert_ingest. -1 leaves it unreserved, the default, because AWS keeps at least 50 to 100 executions unreserved per account and new accounts often have a limit of 50. | `number` | `-1` | no |
 | `auto_remediate_severities` | Severities the runbook acts on. Others only notify. | `list(string)` | `["critical"]` | no |
 | `stabilization_seconds` | How long the runbook waits after an action before it checks whether the alert resolved | `number` | `60` | no |
 | `verify_poll_seconds` | How often the runbook checks for the resolved alert after the stabilization wait | `number` | `30` | no |
@@ -150,6 +167,8 @@ The module has no provider blocks. It needs an EKS cluster with access entries e
 | `webhook_rate_limit` | Steady-state requests per second allowed on the webhook | `number` | `1000` | no |
 | `webhook_burst_limit` | Burst of requests allowed on the webhook | `number` | `2000` | no |
 | `webhook_private` | Make the webhook a private API, reachable only through an execute-api VPC endpoint the module creates in vpc_id and subnet_ids. Datadog can't reach a private API, so only use this when Alertmanager is the only sender. | `bool` | `false` | no |
+| `notification_emails` | Email addresses subscribed to the alerts topic. Each one gets a confirmation email from SNS to accept first. | `list(string)` | `[]` | no |
+| `chat_notifications` | Also publish incidents to a second topic in the format Amazon Q Developer in chat applications (AWS Chatbot) renders, for a Slack or Teams channel to subscribe to. See examples/complete/chatbot.tf. | `bool` | `false` | no |
 
 ## Outputs
 
@@ -177,6 +196,7 @@ The module has no provider blocks. It needs an EKS cluster with access entries e
 | `kubernetes_group` | Group runbook_action's role is in; bind it with k8s/rbac/remediation-role.yaml |
 | `degraded_mode_parameter_name` | SSM parameter the degrade action sets to true; the app reads it |
 | `degraded_mode_parameter_arn` | Grant the degraded-mode deployment ssm:GetParameter on this |
+| `chat_topic_arn` | Topic for a Slack or Teams channel configuration to subscribe to; empty when chat_notifications is false |
 <!-- END_TF_TABLES -->
 
 ## Tests

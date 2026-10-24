@@ -14,3 +14,4 @@
 
 # Lambda zips built by the module at plan time
 /build/
+coverage.xml

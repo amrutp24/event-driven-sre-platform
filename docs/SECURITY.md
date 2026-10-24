@@ -184,8 +184,13 @@ The other targets grant EventBridge access through resource policies, each limit
 | Resource | Allows `events.amazonaws.com` to | Limited to |
 | --- | --- | --- |
 | SNS topic `PLATFORM_NAME-alerts` | `sns:Publish` | the `incident-created`, `incident-resolved`, `incident-escalated` and `incident-auto-resolved` rules |
+| SNS topic `PLATFORM_NAME-chat` (only with `chat_notifications`) | `sns:Publish` | the same four rules |
 | SQS queue `PLATFORM_NAME-events-dlq` | `sqs:SendMessage` | the platform's six rules |
 | Log group `/aws/events/PLATFORM_NAME` | `logs:CreateLogStream`, `logs:PutLogEvents` | that log group |
+
+### Slack Channel Role (complete example)
+
+`examples/complete/chatbot.tf` connects a Slack channel to the chat topic through Amazon Q Developer in chat applications (AWS Chatbot). The channel only receives notifications, so the role it runs as, `PLATFORM_NAME-chatbot`, has no permissions of its own, and the channel has the `ReadOnlyAccess` guardrail policy, which caps what anyone in the channel could do through the integration even if the role were given more later. Allowing the Slack workspace (Configure new client > Slack in the console) is a manual OAuth step; Terraform doesn't do it.
 
 ---
 
@@ -385,7 +390,7 @@ kubectl auth can-i delete pods -n apps --as=runbook-action --as-group=sre-remedi
 Created by the EKS module with its recommended rules:
 
 **Inbound Rules**:
-- From the control plane: HTTPS (443), the kubelet (10250) and the webhook ports
+- From the control plane: HTTPS (443), the kubelet (10250) and the webhook ports, plus 10251 for the metrics-server add-on, which the complete example adds (`node_security_group_additional_rules`)
 - From other nodes: DNS and the ephemeral port range (pod-to-pod traffic)
 - From the ALB to the pods; the AWS Load Balancer Controller adds this rule
 
@@ -444,7 +449,7 @@ The platform has one customer managed key, `alias/PLATFORM_NAME` (output `kms_ke
 | Data | Encryption | Key |
 |------|------------|-----|
 | **DynamoDB incidents table** | Enabled | Platform key |
-| **SNS topic** | Enabled | Platform key |
+| **SNS topics** (alerts, and chat when it's on) | Enabled | Platform key |
 | **SQS dead-letter queue** | Enabled | Platform key |
 | **Platform log groups** (both Lambdas, both state machines, the event log) | Enabled | Platform key |
 | **CloudTrail** (the trail and its S3 bucket, with an S3 bucket key) | Enabled | Platform key |
@@ -480,7 +485,7 @@ resource "aws_dynamodb_table" "incidents" {
 
 - **ALB**: HTTPS only, with an ACM certificate and the `ELBSecurityPolicy-TLS13-1-2-2021-06` policy (TLS 1.2 minimum, TLS 1.3 preferred)
 - **Webhook (API Gateway)**: HTTPS only, with API Gateway's default TLS policy for the default endpoint. Pinning a TLS 1.2 minimum there (`security_policy` on the REST API) needs AWS provider 6, and the EKS module (~> 20) holds the provider below 6. That comes with the move to EKS module v21.
-- **SNS, the dead-letter queue and the CloudTrail bucket**: their resource policies deny any request without TLS (`aws:SecureTransport` false)
+- **Both SNS topics, the dead-letter queue and the CloudTrail bucket**: their resource policies deny any request without TLS (`aws:SecureTransport` false)
 - **EKS API server**: TLS, managed by AWS
 - **Inside the cluster**: plain HTTP, ALB to pods included. There's no service mesh.
 
@@ -625,7 +630,7 @@ Every incident is logged with:
 16. **Immutable Image Tags**: each build is tagged with its git SHA, and ECR refuses to overwrite a tag
 17. **VPC Flow Logs**: all traffic, to CloudWatch Logs, encrypted with the platform key and kept 30 days
 18. **No Node Credentials for Pods**: nodes require IMDSv2 with a hop limit of 1, so pods can't use the node's IAM role; pods that need AWS use IRSA
-19. **Remediation Concurrency Cap**: runbook_action runs at most 10 at once (`runbook_action_reserved_concurrency`)
+19. **Remediation Concurrency Cap, opt-in**: `runbook_action_reserved_concurrency` caps how many remediations run at once (10 is a good cap). It's -1 (no cap) by default, because AWS keeps at least 50 to 100 executions unreserved per account and new accounts often have a limit of 50, so any reservation fails there.
 
 ### 🚧 Recommended for Production
 

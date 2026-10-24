@@ -127,7 +127,37 @@ variable "verify_timeout_seconds" {
 }
 
 variable "alert_ingest_reserved_concurrency" {
-  description = "Concurrent executions reserved for alert_ingest. AWS keeps 100 unreserved per account, so accounts with a low concurrency limit need -1 (no reservation)."
+  description = "Concurrent executions reserved for alert_ingest. -1 leaves it unreserved, the default, because AWS keeps at least 50 to 100 executions unreserved per account and new accounts often have a limit of 50."
   type        = number
-  default     = 100
+  default     = -1
+}
+
+variable "runbook_action_reserved_concurrency" {
+  description = "Concurrent executions reserved for runbook_action; -1 leaves it unreserved"
+  type        = number
+  default     = -1
+}
+
+variable "notification_emails" {
+  description = "Email addresses for incident notifications; each gets an SNS confirmation email first"
+  type        = list(string)
+  default     = []
+}
+
+variable "slack_workspace_id" {
+  description = "Slack workspace (team) ID, the T... part of the channel URL in a browser. Set with slack_channel_id to get incidents in Slack."
+  type        = string
+  default     = null
+}
+
+variable "slack_channel_id" {
+  description = "Slack channel ID, the C... part of the channel URL in a browser"
+  type        = string
+  default     = null
+}
+
+variable "chatbot_region" {
+  description = "A region where Amazon Q Developer in chat applications has its API"
+  type        = string
+  default     = "us-east-2"
 }

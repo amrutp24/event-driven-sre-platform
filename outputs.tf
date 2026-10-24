@@ -109,3 +109,8 @@ output "degraded_mode_parameter_arn" {
   description = "Grant the degraded-mode deployment ssm:GetParameter on this"
   value       = local.degraded_mode_parameter_arn
 }
+
+output "chat_topic_arn" {
+  description = "Topic for a Slack or Teams channel configuration to subscribe to; empty when chat_notifications is false"
+  value       = try(aws_sns_topic.chat[0].arn, "")
+}

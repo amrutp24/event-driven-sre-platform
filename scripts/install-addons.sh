@@ -23,11 +23,18 @@ kubectl -n kube-system annotate serviceaccount aws-load-balancer-controller eks.
 # Region and VPC are passed in because pods can't read them from instance
 # metadata (the nodes' hop limit is 1)
 helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller   -n kube-system   --set clusterName="$CLUSTER"   --set region="$REGION"   --set vpcId="$VPC_ID"   --set serviceAccount.create=false   --set serviceAccount.name=aws-load-balancer-controller
+# Its webhook checks every new Service, so nothing else installs until it's up
+kubectl -n kube-system rollout status deployment/aws-load-balancer-controller --timeout=300s
 
 echo "[2/3] ExternalDNS (Route53)"
-kubectl -n kube-system create serviceaccount external-dns --dry-run=client -o yaml | kubectl apply -f -
-kubectl -n kube-system annotate serviceaccount external-dns eks.amazonaws.com/role-arn="$DNS_ROLE_ARN" --overwrite
-helm upgrade --install external-dns bitnami/external-dns   -n kube-system   --set provider=aws   --set aws.region="$REGION"   --set serviceAccount.create=false   --set serviceAccount.name=external-dns
+# The role only exists when route53_zone_arns is set
+if [ -n "$DNS_ROLE_ARN" ]; then
+  kubectl -n kube-system create serviceaccount external-dns --dry-run=client -o yaml | kubectl apply -f -
+  kubectl -n kube-system annotate serviceaccount external-dns eks.amazonaws.com/role-arn="$DNS_ROLE_ARN" --overwrite
+  helm upgrade --install external-dns bitnami/external-dns   -n kube-system   --set provider=aws   --set aws.region="$REGION"   --set serviceAccount.create=false   --set serviceAccount.name=external-dns
+else
+  echo "No route53_zone_arns, skipping"
+fi
 
 echo "[3/3] cert-manager"
 kubectl get ns cert-manager >/dev/null 2>&1 || kubectl create ns cert-manager

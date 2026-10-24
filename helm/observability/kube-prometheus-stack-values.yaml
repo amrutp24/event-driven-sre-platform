@@ -9,3 +9,12 @@ prometheus:
 
 alertmanager:
   enabled: true
+
+# EKS runs the scheduler, controller manager and etcd itself, so Prometheus
+# can't scrape them, and the chart's rules would report them down for good
+kubeScheduler:
+  enabled: false
+kubeControllerManager:
+  enabled: false
+kubeEtcd:
+  enabled: false

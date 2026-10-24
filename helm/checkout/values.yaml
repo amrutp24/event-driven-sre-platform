@@ -30,8 +30,11 @@ env:
   LATENCY_MS: "0"
   CHAOS: "false"
 
+# Off until there's a real host and ACM certificate. With the placeholders the
+# load balancer controller can't build an ALB, but it still creates a security
+# group that then blocks the VPC from being deleted.
 ingress:
-  enabled: true
+  enabled: false
   host: "checkout.example.com"
   albGroup: "public"
   certificateArn: "<ACM_CERT_ARN>"

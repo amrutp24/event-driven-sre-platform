@@ -11,6 +11,14 @@ REGION="$(terraform -chdir=examples/complete output -raw aws_region)"
 IMAGE_REPO="$(terraform -chdir=examples/complete output -raw checkout_image_repository)"
 IMAGE_TAG="${IMAGE_TAG:-$(git rev-parse --short HEAD)}"
 
+# The tag follows the current commit, so a commit since the last build means a
+# tag that was never pushed. Stop here rather than leave pods unable to pull.
+if ! aws ecr describe-images --region "$REGION" --repository-name "${IMAGE_REPO#*/}" \
+    --image-ids imageTag="$IMAGE_TAG" >/dev/null 2>&1; then
+  echo "Image tag $IMAGE_TAG isn't in $IMAGE_REPO. Run scripts/build-image.sh first, or set IMAGE_TAG to a pushed tag." >&2
+  exit 1
+fi
+
 echo "[1/5] Store the webhook API key for Alertmanager"
 kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
 kubectl create secret generic alertmanager-webhook-key -n monitoring \

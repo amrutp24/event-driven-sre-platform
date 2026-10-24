@@ -134,15 +134,15 @@ variable "remediation_max_replicas" {
 }
 
 variable "runbook_action_reserved_concurrency" {
-  description = "Concurrent executions reserved for runbook_action, which caps how many remediations hit the cluster at once. -1 leaves it unreserved."
+  description = "Concurrent executions reserved for runbook_action, which caps how many remediations hit the cluster at once (10 is a good cap). -1 leaves it unreserved, the default, because AWS keeps at least 50 to 100 executions unreserved per account and new accounts often have a limit of 50."
   type        = number
-  default     = 10
+  default     = -1
 }
 
 variable "alert_ingest_reserved_concurrency" {
-  description = "Concurrent executions reserved for alert_ingest. AWS keeps 100 unreserved per account, so accounts with a low concurrency limit need -1 (no reservation)."
+  description = "Concurrent executions reserved for alert_ingest. -1 leaves it unreserved, the default, because AWS keeps at least 50 to 100 executions unreserved per account and new accounts often have a limit of 50."
   type        = number
-  default     = 100
+  default     = -1
 }
 
 variable "auto_remediate_severities" {
@@ -262,6 +262,23 @@ variable "webhook_burst_limit" {
 
 variable "webhook_private" {
   description = "Make the webhook a private API, reachable only through an execute-api VPC endpoint the module creates in vpc_id and subnet_ids. Datadog can't reach a private API, so only use this when Alertmanager is the only sender."
+  type        = bool
+  default     = false
+}
+
+variable "notification_emails" {
+  description = "Email addresses subscribed to the alerts topic. Each one gets a confirmation email from SNS to accept first."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for e in var.notification_emails : can(regex("^[^@ ]+@[^@ ]+[.][^@ ]+$", e))])
+    error_message = "Each notification email must be an email address."
+  }
+}
+
+variable "chat_notifications" {
+  description = "Also publish incidents to a second topic in the format Amazon Q Developer in chat applications (AWS Chatbot) renders, for a Slack or Teams channel to subscribe to. See examples/complete/chatbot.tf."
   type        = bool
   default     = false
 }
