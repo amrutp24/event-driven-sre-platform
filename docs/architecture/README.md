@@ -292,14 +292,17 @@ graph TB
     end
 
     subgraph "Network Security"
-        SG1[Security Group: EKS Nodes<br/>Ingress: ALB only<br/>Egress: Internet via NAT]
-        SG2[Security Group: ALB<br/>Ingress: 443 from CloudFront<br/>Egress: EKS nodes]
-        SG3[Security Group: VPC Endpoints<br/>Ingress: EKS nodes<br/>Private Link for AWS APIs]
+        SG1[Security Group: EKS Nodes<br/>Ingress: control plane, other nodes,<br/>ALB to pods<br/>Egress: Internet via NAT]
+        SG2[Security Group: ALB<br/>Ingress: 443 from anywhere<br/>TLS 1.2+ policy, 1.3 preferred<br/>CloudFront in front: not built yet]
+        SG3[Security Group: VPC Endpoints<br/>Ingress: 443 from the VPC CIDR<br/>Interface endpoints, off by default]
+        GW[Gateway endpoints<br/>S3 and DynamoDB, always on]
     end
 
     subgraph "Data Security"
-        KMS[KMS Key<br/>Encrypt:<br/>- DynamoDB tables<br/>- SNS topics<br/>- CloudWatch Logs<br/>- EKS secrets]
-        SSM_Sec[SSM Parameter Store<br/>SecureString type<br/>Encrypted with KMS]
+        KMS[Platform KMS key, rotated yearly<br/>Encrypts:<br/>- incidents table<br/>- SNS topic and the DLQ<br/>- platform log groups<br/>- CloudTrail bucket and trail]
+        EKSKMS[EKS module KMS key<br/>Encrypts Kubernetes secrets,<br/>the webhook API key included]
+        Trail[CloudTrail<br/>Multi-region, management events<br/>Log file validation]
+        SSM_Flag[SSM /checkout/degraded_mode<br/>String parameter, not a secret]
     end
 
     R2 -->|Mapped by| AE
@@ -312,10 +315,11 @@ graph TB
     R3 -.->|Least Privilege| R4
     R4 -.->|Invokes| R2
 
-    SG2 -->|Allow 443| SG1
-    SG1 -->|Private| SG3
+    SG2 -->|To pods| SG1
+    SG1 -->|AWS APIs, when enabled| SG3
+    SG1 -->|S3, DynamoDB| GW
 
-    KMS -.->|Encrypts| SSM_Sec
+    KMS -.->|Encrypts| Trail
 
     classDef iam fill:#DD344C,stroke:#fff,stroke-width:2px,color:#fff
     classDef k8s fill:#326CE5,stroke:#fff,stroke-width:2px,color:#fff
@@ -324,8 +328,8 @@ graph TB
 
     class R1,R2,R3,R4,R5,AE iam
     class Role,RB,CRole,CRB k8s
-    class SG1,SG2,SG3 network
-    class KMS,SSM_Sec encryption
+    class SG1,SG2,SG3,GW network
+    class KMS,EKSKMS,Trail,SSM_Flag encryption
 ```
 
 ---
@@ -360,7 +364,8 @@ graph TB
 - REST API endpoint: `POST /webhook`
 - Request validation: JSON schema enforcement
 - Throttling: 1000 requests/second
-- Authentication: API key (optional) or VPC endpoint
+- Authentication: API key in `X-API-Key`, required by default. `webhook_private` makes it a private API that only answers through an execute-api VPC endpoint, which also shuts out Datadog.
+- TLS: HTTPS only, with API Gateway's default TLS policy. Pinning a TLS 1.2 minimum on the default endpoint needs AWS provider 6, and the EKS module (~> 20) holds the provider below 6.
 - Integration: Lambda proxy integration
 
 **alert_ingest Lambda**
@@ -445,7 +450,7 @@ graph TB
   - `notification_count`, `correlation_id`
   - `payload`: the full normalized alert as JSON, labels included
   - `expires_at`: Number (Unix time), the TTL attribute
-- Encryption: DynamoDB's default AWS owned key for now; a customer managed KMS key is still to come
+- Encryption: the platform's customer managed KMS key (`alias/<name>`)
 - Point-in-time recovery: Enabled
 - TTL: 90 days after the incident's last activity (`incident_retention_days`)
 - Deletion protection: Enabled (`incidents_deletion_protection`). `scripts/destroy.sh` turns it off before `terraform destroy`.
@@ -466,7 +471,7 @@ graph TB
   - `/aws/vendedlogs/states/<name>-runbook` (every state's input and output)
   - `/aws/vendedlogs/states/<name>-incident-recorder` (failed writes only; Express workflows keep no execution history)
   - `/aws/events/<name>` (every event on the bus)
-- Retention: 30 days for the state machine and event logs. The two Lambda log groups are created by Lambda on first run and don't have a retention set yet.
+- Retention: 30 days for all five, encrypted with the platform KMS key. Terraform creates the Lambda log groups too, so Lambda doesn't make unencrypted ones that never expire.
 - Insights queries: Pre-built dashboards for MTTR, alert volume
 - Metric filters: Extract custom metrics (remediation success rate)
 
@@ -619,36 +624,58 @@ graph TB
 
 ## Cost Optimization
 
-### Monthly Cost Estimate (1000 alerts/day)
-- API Gateway: 30M requests × $3.50/M = $105
-- Lambda (alert_ingest): 30M invocations × 100ms × $0.20/M = $6
-- Lambda (runbook_action): 1000 invocations × 5s × $0.20/M = $0.10
-- EventBridge: 30M events × $1.00/M = $30
-- Step Functions: 1000 executions × 5 transitions × $25/M = $0.13
-- DynamoDB: 1000 writes/day × $1.25/M = $0.04
-- SNS: 1000 notifications × $0.50/M = $0.0005
-- **Total: ~$141/month**
+### Monthly Cost Estimate
+
+`us-east-1` on-demand prices, running all month with the default variables, before free tiers. The cluster is nearly all of it; the alert pipeline is small even at 1000 alerts a day.
+
+| Item | Monthly |
+| --- | --- |
+| EKS control plane ($0.10/hour) | $73 |
+| 4 × m6i.large nodes, 2 per node group ($0.096/hour each) | $280 |
+| EBS root volumes, 4 × 20 GB gp3 | $6 |
+| 2 NAT gateways ($0.045/hour each, plus $0.045/GB processed) | $66 plus data |
+| Load balancer for the checkout ingress ($0.0225/hour plus LCUs) | about $16 plus usage |
+| KMS key ($1, plus $0.03 per 10,000 requests) | about $1 |
+| CloudTrail management events (the first trail in an account is free) and its S3 bucket | under $1 |
+| S3 and DynamoDB gateway endpoints | $0 |
+| EKS control plane logs, all five types ($0.50/GB ingested) | a few dollars, depending on cluster activity |
+| Alert pipeline at 1000 alerts/day (below) | about $14 |
+| **Total** | **about $460** |
+| Optional: 6 interface endpoints in 2 AZs (`enable_vpc_endpoints`, $0.01/hour each per AZ, plus $0.01/GB) | add $88 |
+| Optional: the execute-api endpoint for `webhook_private` (2 AZs) | add $15 |
+
+The alert pipeline line assumes 1000 webhook calls a day (30,000 a month), one alert each, half of them firing alerts that each start a runbook run of about 30 state transitions (remediate, then poll for up to 10 minutes):
+
+- API Gateway (REST): 30,000 requests × $3.50/M = $0.11
+- Lambda: alert_ingest (256 MB, about 100 ms) and runbook_action (512 MB, about 2 s per action): about $0.30
+- EventBridge: about 60,000 custom events × $1/M = $0.06, plus a few cents for the archive
+- Step Functions: 15,000 runbook runs × 30 transitions = 450,000 × $25/M = $11.25; the Express incident recorder, 45,000 runs: about $0.05
+- DynamoDB on demand: about 150,000 writes (index included) and 135,000 reads: about $0.12
+- SNS: 45,000 publishes, $0.02; email deliveries, $2 per 100,000 after the first 1,000: about $0.90
+- CloudWatch Logs for the pipeline, about 1 GB at $0.50/GB: $0.50
 
 ### Optimization Techniques
-- Use VPC endpoints to avoid API Gateway costs (NAT Gateway cheaper at high volume)
+- Tear it down when you're not using it; the fixed cluster costs are about 95% of the bill
+- Interface endpoints only pay for themselves once more than about 2.5 TB a month would otherwise go through the NAT gateways
+- Most of the pipeline cost is the runbook polling DynamoDB; a longer `verify_poll_seconds` or a shorter `verify_timeout_seconds` cuts state transitions
+- Set `enable_cloudtrail = false` if an organization trail already covers the account; a second copy of management events is billed
 - Reduce Lambda memory if not needed (alert_ingest can use 128 MB)
-- Use EventBridge input transformers to reduce Step Functions state transitions
-- Archive old DynamoDB incidents to S3 (Glacier for long-term storage)
 
 ---
 
 ## Security Best Practices Implemented
 
 - ✅ Least-privilege IAM policies (no wildcards for application resources)
-- ✅ Encryption at rest (KMS for all data stores)
-- ✅ Encryption in transit (TLS 1.2+ for all endpoints)
+- ✅ Encryption at rest: one customer managed KMS key, rotated yearly, for the incidents table, the SNS topic, the dead-letter queue, the platform's log groups and CloudTrail. Kubernetes secrets use the EKS module's own key, and ECR images AES-256.
+- ✅ Encryption in transit: a TLS 1.2+ policy on the ALB (TLS 1.3 preferred), and SNS, the dead-letter queue and the CloudTrail bucket refuse requests without TLS. The webhook is HTTPS only, but its TLS policy can't be pinned until the move to AWS provider 6.
 - ✅ IRSA and EKS access entries instead of long-lived credentials
-- ✅ Kubernetes RBAC (namespace-scoped roles)
+- ✅ Kubernetes RBAC: workload changes limited to the `apps` namespace, and a ClusterRole only for cordoning nodes and evicting pods
 - ✅ VPC security groups (allow-list only)
-- ✅ CloudTrail logging (API audit trail)
-- ✅ Secrets management (SSM Parameter Store with KMS)
-- ✅ Container image scanning (ECR scan on push)
-- ✅ Network segmentation (private subnets for EKS)
+- ✅ CloudTrail: a multi-region trail of management events with log file validation (`enable_cloudtrail`, on by default)
+- ✅ Secrets: the only secrets are the webhook API keys, kept in a Kubernetes Secret that EKS encrypts. The SSM degraded flag is a plain String and isn't sensitive.
+- ✅ Container images: ECR scan on push and immutable tags, plus Trivy in CI
+- ✅ Network segmentation: private subnets for EKS and the remediation Lambda, S3 and DynamoDB gateway endpoints, optional interface endpoints (`enable_vpc_endpoints`) and an optional private webhook (`webhook_private`)
+- Not built yet: CloudFront and WAF in front of the ALB
 
 ---
 

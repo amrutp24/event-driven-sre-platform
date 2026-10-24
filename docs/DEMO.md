@@ -22,14 +22,20 @@ aws sts get-caller-identity
 kubectl cluster-info
 
 # 3. Terraform outputs available
-cd terraform
-terraform output
+terraform -chdir=terraform output
 
 # 4. Required CLI tools installed
-which kubectl helm aws jq curl
+which kubectl helm aws jq curl docker git
+
+# 5. The checkout app is built and deployed from ECR. build-image.sh pushes
+#    the image tagged with the short git SHA, and deploy.sh deploys that tag.
+bash scripts/build-image.sh
+bash scripts/deploy.sh
+kubectl get deployment checkout -n apps -o jsonpath='{.spec.template.spec.containers[0].image}{"
+"}'
 ```
 
-Expected: All commands succeed without errors.
+Expected: All commands succeed without errors, and the image is `ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/event-driven-sre/checkout:<git sha>`. Tags are immutable, so build again after committing changes to `apps/checkout`; to build uncommitted changes, set the same `IMAGE_TAG` for both scripts.
 
 ---
 
@@ -671,6 +677,7 @@ Print this checklist and verify before each demo:
 
 - [ ] AWS credentials configured and valid
 - [ ] kubectl context set to correct EKS cluster
+- [ ] Checkout image built and pushed with `scripts/build-image.sh`, then deployed with `scripts/deploy.sh`
 - [ ] All pods in `apps` and `monitoring` namespaces are Running
 - [ ] Prometheus targets are UP (check /targets)
 - [ ] Alertmanager webhook URL configured correctly

@@ -3,15 +3,49 @@
 # A REST API rather than an HTTP API because it's the one that supports request
 # body validation against a JSON schema, API keys and usage plans.
 
+# webhook_private makes it reachable only through the VPC's execute-api
+# endpoint. Datadog can't reach it then, so that's for Alertmanager-only setups.
+#
+# A TLS 1.2 minimum on the default endpoint (security_policy) needs AWS
+# provider 6.x, and the EKS module (~> 20) holds the provider below 6.0.
 resource "aws_api_gateway_rest_api" "alerts_api" {
   name        = "${var.name}-alerts-api"
   description = "Alert webhook for Alertmanager and Datadog"
 
   endpoint_configuration {
-    types = ["REGIONAL"]
+    types            = [var.webhook_private ? "PRIVATE" : "REGIONAL"]
+    vpc_endpoint_ids = var.webhook_private ? [local.webhook_vpc_endpoint_id] : null
   }
 
   tags = var.tags
+}
+
+# A private API needs a resource policy before it can be deployed. This one
+# only lets requests in through the VPC endpoint.
+resource "aws_api_gateway_rest_api_policy" "private_only" {
+  count = var.webhook_private ? 1 : 0
+
+  rest_api_id = aws_api_gateway_rest_api.alerts_api.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect    = "Allow"
+        Principal = "*"
+        Action    = "execute-api:Invoke"
+        Resource  = "${aws_api_gateway_rest_api.alerts_api.execution_arn}/*"
+      },
+      {
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "execute-api:Invoke"
+        Resource  = "${aws_api_gateway_rest_api.alerts_api.execution_arn}/*"
+        Condition = {
+          StringNotEquals = { "aws:SourceVpce" = local.webhook_vpc_endpoint_id }
+        }
+      }
+    ]
+  })
 }
 
 resource "aws_api_gateway_resource" "webhook" {
@@ -103,9 +137,12 @@ resource "aws_api_gateway_gateway_response" "errors" {
 resource "aws_api_gateway_deployment" "alerts_api" {
   rest_api_id = aws_api_gateway_rest_api.alerts_api.id
 
-  # Redeploy whenever anything that shapes the API changes
+  # Redeploy whenever anything that shapes the API changes. A resource policy
+  # change only takes effect after a redeploy.
   triggers = {
     redeployment = sha1(jsonencode([
+      aws_api_gateway_rest_api.alerts_api.endpoint_configuration,
+      aws_api_gateway_rest_api_policy.private_only,
       aws_api_gateway_resource.webhook,
       aws_api_gateway_method.webhook_post,
       aws_api_gateway_integration.webhook_lambda,

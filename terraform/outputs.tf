@@ -106,3 +106,18 @@ output "events_archive_arn" {
   description = "Replay source; events are kept 7 days"
   value       = aws_cloudwatch_event_archive.sre.arn
 }
+
+output "kms_key_arn" {
+  description = "Key for the incidents table, SNS topic, DLQ, log groups and CloudTrail"
+  value       = aws_kms_key.platform.arn
+}
+
+output "checkout_image_repository" {
+  description = "ECR repository for the checkout image; scripts/build-image.sh pushes here"
+  value       = aws_ecr_repository.checkout.repository_url
+}
+
+output "cloudtrail_bucket" {
+  description = "S3 bucket holding the CloudTrail logs; empty when enable_cloudtrail is false"
+  value       = try(aws_s3_bucket.cloudtrail[0].bucket, "")
+}

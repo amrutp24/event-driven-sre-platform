@@ -164,3 +164,38 @@ variable "remediation_max_replicas" {
     error_message = "Must be at least 1."
   }
 }
+
+variable "enable_vpc_endpoints" {
+  description = "Interface endpoints for ECR, STS, SSM, EKS and CloudWatch Logs, so that traffic skips the NAT gateways. About $88/month for six endpoints in two AZs. The S3 and DynamoDB gateway endpoints are always on."
+  type        = bool
+  default     = false
+}
+
+variable "webhook_private" {
+  description = "Make the webhook a private API, reachable only through an execute-api VPC endpoint. Datadog can't reach a private API, so only use this when Alertmanager is the only sender."
+  type        = bool
+  default     = false
+}
+
+variable "enable_cloudtrail" {
+  description = "Create a multi-region CloudTrail trail for this account. Turn it off if an organization trail already covers the account; a second copy of management events is billed."
+  type        = bool
+  default     = true
+}
+
+variable "cloudtrail_retention_days" {
+  description = "Days CloudTrail log files are kept in the trail bucket"
+  type        = number
+  default     = 365
+
+  validation {
+    condition     = var.cloudtrail_retention_days >= 1 && floor(var.cloudtrail_retention_days) == var.cloudtrail_retention_days
+    error_message = "Must be a whole number of days, at least 1."
+  }
+}
+
+variable "cloudtrail_force_destroy" {
+  description = "Let terraform destroy delete the trail bucket with its logs in it. scripts/destroy.sh sets this to true before tearing down."
+  type        = bool
+  default     = false
+}

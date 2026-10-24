@@ -33,6 +33,11 @@ resource "aws_dynamodb_table" "incidents" {
     enabled = true
   }
 
+  server_side_encryption {
+    enabled     = true
+    kms_key_arn = aws_kms_key.platform.arn
+  }
+
   # Set by the incident recorder: last activity + incident_retention_days
   ttl {
     attribute_name = "expires_at"
@@ -43,7 +48,9 @@ resource "aws_dynamodb_table" "incidents" {
 }
 
 resource "aws_sns_topic" "alerts" {
-  name = "${var.name}-alerts"
+  name              = "${var.name}-alerts"
+  kms_master_key_id = aws_kms_key.platform.arn
+  tags              = var.tags
 }
 
 resource "aws_cloudwatch_event_bus" "sre" {
@@ -138,6 +145,7 @@ locals {
 resource "aws_cloudwatch_log_group" "runbook" {
   name              = "/aws/vendedlogs/states/${var.name}-runbook"
   retention_in_days = 30
+  kms_key_id        = aws_kms_key.platform.arn
   tags              = var.tags
 }
 
@@ -169,6 +177,22 @@ resource "aws_sfn_state_machine" "runbook" {
   tags = var.tags
 }
 
+# Lambda would create these on first run, unencrypted and kept forever.
+# Existing stacks: import them first (see the README).
+resource "aws_cloudwatch_log_group" "alert_ingest" {
+  name              = "/aws/lambda/${var.name}-alert-ingest"
+  retention_in_days = 30
+  kms_key_id        = aws_kms_key.platform.arn
+  tags              = var.tags
+}
+
+resource "aws_cloudwatch_log_group" "runbook_action" {
+  name              = "/aws/lambda/${var.name}-runbook-action"
+  retention_in_days = 30
+  kms_key_id        = aws_kms_key.platform.arn
+  tags              = var.tags
+}
+
 resource "aws_lambda_function" "alert_ingest" {
   function_name = "${var.name}-alert-ingest"
   role          = aws_iam_role.lambda_role.arn
@@ -186,6 +210,8 @@ resource "aws_lambda_function" "alert_ingest" {
       EVENT_BUS_NAME = aws_cloudwatch_event_bus.sre.name
     }
   }
+
+  depends_on = [aws_cloudwatch_log_group.alert_ingest]
 }
 
 resource "aws_ssm_parameter" "checkout_degraded_mode" {
@@ -277,7 +303,10 @@ resource "aws_lambda_function" "runbook_action" {
     security_group_ids = [aws_security_group.runbook_lambda.id]
   }
 
-  depends_on = [aws_iam_role_policy_attachment.runbook_vpc_access]
+  depends_on = [
+    aws_iam_role_policy_attachment.runbook_vpc_access,
+    aws_cloudwatch_log_group.runbook_action,
+  ]
 
   environment {
     variables = {

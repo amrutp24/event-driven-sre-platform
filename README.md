@@ -47,20 +47,23 @@ The `checkout` app is a small Flask service with `/checkout`, `/metrics`, `/heal
 .
 ├── apps/checkout/            # Flask service, Dockerfile, unit tests
 ├── helm/
-│   ├── checkout/             # chart: Deployment, Service, Ingress, ServiceMonitor, ConfigMap
+│   ├── checkout/             # chart: Deployment, HPA, PodDisruptionBudget, ServiceAccount, Service, Ingress, ServiceMonitor, ConfigMap
 │   ├── observability/        # kube-prometheus-stack and Alertmanager values, alert rules
 │   └── datadog/              # optional Datadog agent values
 ├── terraform/
-│   ├── networking.tf         # VPC, two AZs, a NAT gateway per AZ
+│   ├── networking.tf         # VPC, two AZs, a NAT gateway per AZ, VPC endpoints
 │   ├── eks.tf                # EKS 1.36, "system" and "apps" managed node groups on AL2023, metrics-server
-│   ├── irsa.tf               # IAM roles for the ALB controller, ExternalDNS and cert-manager
-│   ├── webhook_api.tf        # REST API: POST /webhook, schema validation, API keys, throttling
+│   ├── irsa.tf               # IAM roles for the ALB controller, ExternalDNS, cert-manager and the checkout app
+│   ├── kms.tf                # the platform's KMS key
+│   ├── cloudtrail.tf         # multi-region trail and its bucket
+│   ├── ecr.tf                # the checkout image repository
+│   ├── webhook_api.tf        # REST API: POST /webhook, schema validation, API keys, throttling, private option
 │   ├── event_pipeline.tf     # both Lambdas, the runbook state machine, DynamoDB, SNS, the event bus
 │   ├── event_routing.tf      # EventBridge rules and targets, incident recorder, archive, dead-letter queue, audit log
 │   ├── api/                  # JSON schema for the webhook payload
 │   ├── stepfunctions/        # runbook and incident recorder definitions
 │   └── lambda/               # alert_ingest and runbook_action, each with unit tests
-├── scripts/                  # bootstrap.sh, install-addons.sh, deploy.sh, destroy.sh
+├── scripts/                  # bootstrap.sh, install-addons.sh, build-image.sh, deploy.sh, destroy.sh
 ├── tests/integration/        # end-to-end tests against LocalStack
 └── Jenkinsfile
 ```
@@ -69,34 +72,44 @@ Terraform state goes to an S3 backend (`terraform/backend.tf`).
 
 ## Deploy
 
-Requires the AWS CLI, Terraform, kubectl, Helm, Python 3, Docker and `zip`.
+Requires the AWS CLI, Terraform, kubectl, Helm, Python 3, Docker, git and `zip`.
 
 ```bash
 bash scripts/bootstrap.sh       # build the Lambdas, create the VPC, EKS and event pipeline, configure kubectl
 bash scripts/install-addons.sh  # AWS Load Balancer Controller, ExternalDNS, cert-manager
+bash scripts/build-image.sh     # build apps/checkout and push it to the ECR repository, tagged with the short git SHA
 bash scripts/deploy.sh          # Alertmanager's API key, kube-prometheus-stack, the alert rules, the checkout app and the remediation RBAC
 ```
 
+ECR tags are immutable, so every build gets its own tag. `build-image.sh` refuses to build uncommitted changes in `apps/checkout` unless you set `IMAGE_TAG`; if you do, set the same `IMAGE_TAG` for `deploy.sh`, which deploys that tag.
+
 `eks_version` defaults to `1.36`, and both node groups run Amazon Linux 2023. A cluster created from an older version of this repo has to be upgraded one minor version per apply, and changing the AMI type replaces its node groups. The first `deploy.sh` onto an existing checkout release drops `replicas` from the Deployment in favour of the HPA, so it briefly runs 1 pod until the HPA brings it back to 3.
 
-Before `deploy.sh`, set three values in `helm/checkout/values.yaml`:
+Before `deploy.sh`, set two values in `helm/checkout/values.yaml`:
 
-- `image.repository`. The chart has a placeholder, and nothing in this repo builds or pushes the image, so build `apps/checkout` and push it to a registry the cluster can pull from.
 - `ingress.host`
 - `ingress.certificateArn`, an ACM certificate for that host
 
-The ingress creates an internet-facing HTTPS load balancer through the AWS Load Balancer Controller. Set `ingress.enabled=false` if you don't want one.
+The ingress creates an internet-facing HTTPS load balancer through the AWS Load Balancer Controller, with a TLS 1.2 minimum. Set `ingress.enabled=false` if you don't want one.
+
+Security options in `terraform/variables.tf`:
+
+- `enable_vpc_endpoints` (default `false`): interface endpoints for ECR, STS, SSM, EKS and CloudWatch Logs, so that traffic skips the NAT gateways. About $88 a month. The S3 and DynamoDB gateway endpoints are always on.
+- `webhook_private` (default `false`): make the webhook a private API, reachable only through an execute-api endpoint in the VPC. Datadog can't reach it then.
+- `enable_cloudtrail` (default `true`): a multi-region trail for the account. Turn it off if an organization trail already covers it.
+- `cloudtrail_retention_days` (default `365`): how long the trail bucket keeps log files
+- `cloudtrail_force_destroy` (default `false`): let `terraform destroy` delete the trail bucket with its logs in it. `destroy.sh` sets it.
 
 `deploy.sh` also connects Alertmanager to the webhook: it stores `terraform output alertmanager_api_key` in the `alertmanager-webhook-key` secret and fills the URL from `terraform output alert_webhook_url` into `helm/observability/alertmanager-values.yaml`. It passes the checkout service account's IRSA role (`terraform output checkout_role_arn`) and the region to the checkout chart. Run it again after a `terraform apply` that changes any of these.
 
 To send alerts from Datadog, see [docs/API.md](docs/API.md#datadog-webhook-format). Its key is `terraform output -raw datadog_api_key`.
 
-To tear it down, uninstall the Helm releases first. The load balancer the controller created isn't in Terraform state, and it blocks the VPC from being deleted while it exists. `destroy.sh` turns off the incidents table's deletion protection before it runs `terraform destroy`.
+To tear it down, uninstall the Helm releases first. The load balancer the controller created isn't in Terraform state, and it blocks the VPC from being deleted while it exists. `destroy.sh` turns off the incidents table's deletion protection and lets the CloudTrail bucket be deleted with its logs before it runs `terraform destroy`. The ECR repository goes with its images. The KMS key is scheduled for deletion in 30 days rather than deleted right away.
 
 ```bash
 helm uninstall checkout -n apps
 helm uninstall mon -n monitoring
-bash scripts/destroy.sh         # deletion protection off, then terraform destroy
+bash scripts/destroy.sh         # protections off, then terraform destroy
 ```
 
 ## Trying it
@@ -180,19 +193,30 @@ CI (`.github/workflows/integration-tests.yml`) runs Checkov on the Terraform, Tr
   kubectl patch hpa checkout -n apps --type merge -p '{"spec":{"minReplicas":3}}'
   kubectl uncordon NODE_NAME
   ```
+- **The webhook's TLS version isn't pinned.** It's HTTPS only, with API Gateway's default TLS policy. Setting a TLS 1.2 minimum on the REST API needs AWS provider 6, and the EKS module (~> 20) keeps the provider below 6. It comes with the move to EKS module v21.
+- **Existing stacks have to import two log groups.** Terraform now creates the Lambda log groups (encrypted, kept 30 days), but a stack that has already run has them from Lambda, so the apply fails until they're imported. With the default `name`:
+
+  ```bash
+  terraform -chdir=terraform import aws_cloudwatch_log_group.alert_ingest /aws/lambda/event-driven-sre-alert-ingest
+  terraform -chdir=terraform import aws_cloudwatch_log_group.runbook_action /aws/lambda/event-driven-sre-runbook-action
+  ```
+- **A private webhook shuts out Datadog.** With `webhook_private = true` only callers inside the VPC can reach it, which leaves Alertmanager as the only sender.
 
 ## Cost
 
-Running continuously in `us-east-1` at on-demand prices, roughly $435 a month, nearly all of it fixed:
+Running continuously in `us-east-1` at on-demand prices, roughly $460 a month, nearly all of it fixed:
 
 | | Monthly |
 | --- | --- |
 | EKS control plane | $73 |
-| 4 × m6i.large nodes (2 per node group) | $280 |
-| 2 NAT gateways | $66 |
+| 4 × m6i.large nodes (2 per node group) and their root volumes | $286 |
+| 2 NAT gateways | $66 plus data |
 | Load balancer for the checkout ingress | about $16 plus usage |
+| KMS key, CloudTrail (first trail free) and its bucket, EKS control plane logs | a few dollars |
+| The alert pipeline (API Gateway, Lambda, EventBridge, Step Functions, DynamoDB, SNS) at 1000 alerts a day | about $14 |
+| Optional interface endpoints (`enable_vpc_endpoints`) | add $88 |
 
-API Gateway, Lambda, Step Functions, DynamoDB and SNS add very little at the scale of a few thousand alerts a month. Tear it down when you're done.
+The breakdown and what it assumes are in [docs/architecture/README.md](docs/architecture/README.md#monthly-cost-estimate). Tear it down when you're done.
 
 ## License
 

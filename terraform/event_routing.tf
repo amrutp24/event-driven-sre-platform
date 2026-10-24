@@ -280,6 +280,7 @@ resource "aws_iam_role_policy" "incident_recorder" {
 resource "aws_cloudwatch_log_group" "incident_recorder" {
   name              = "/aws/vendedlogs/states/${var.name}-incident-recorder"
   retention_in_days = 30
+  kms_key_id        = aws_kms_key.platform.arn
   tags              = var.tags
 }
 
@@ -339,23 +340,33 @@ resource "aws_sns_topic_policy" "alerts" {
   arn = aws_sns_topic.alerts.arn
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Sid       = "EventBridgePublish"
-      Effect    = "Allow"
-      Principal = { Service = "events.amazonaws.com" }
-      Action    = "sns:Publish"
-      Resource  = aws_sns_topic.alerts.arn
-      Condition = {
-        ArnEquals = {
-          "aws:SourceArn" = [
-            aws_cloudwatch_event_rule.incident_created.arn,
-            aws_cloudwatch_event_rule.incident_resolved.arn,
-            aws_cloudwatch_event_rule.incident_escalated.arn,
-            aws_cloudwatch_event_rule.incident_auto_resolved.arn,
-          ]
+    Statement = [
+      {
+        Sid       = "EventBridgePublish"
+        Effect    = "Allow"
+        Principal = { Service = "events.amazonaws.com" }
+        Action    = "sns:Publish"
+        Resource  = aws_sns_topic.alerts.arn
+        Condition = {
+          ArnEquals = {
+            "aws:SourceArn" = [
+              aws_cloudwatch_event_rule.incident_created.arn,
+              aws_cloudwatch_event_rule.incident_resolved.arn,
+              aws_cloudwatch_event_rule.incident_escalated.arn,
+              aws_cloudwatch_event_rule.incident_auto_resolved.arn,
+            ]
+          }
         }
-      }
-    }]
+      },
+      {
+        Sid       = "DenyWithoutTLS"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "sns:Publish"
+        Resource  = aws_sns_topic.alerts.arn
+        Condition = { Bool = { "aws:SecureTransport" = "false" } }
+      },
+    ]
   })
 }
 
@@ -363,6 +374,7 @@ resource "aws_sns_topic_policy" "alerts" {
 resource "aws_cloudwatch_log_group" "events" {
   name              = "/aws/events/${var.name}"
   retention_in_days = 30
+  kms_key_id        = aws_kms_key.platform.arn
   tags              = var.tags
 }
 
@@ -389,7 +401,7 @@ resource "aws_cloudwatch_event_archive" "sre" {
 resource "aws_sqs_queue" "events_dlq" {
   name                      = "${var.name}-events-dlq"
   message_retention_seconds = 1209600 # 14 days, the maximum
-  sqs_managed_sse_enabled   = true
+  kms_master_key_id         = aws_kms_key.platform.arn
   tags                      = var.tags
 }
 
@@ -397,24 +409,34 @@ resource "aws_sqs_queue_policy" "events_dlq" {
   queue_url = aws_sqs_queue.events_dlq.id
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Sid       = "EventBridgeDeadLetters"
-      Effect    = "Allow"
-      Principal = { Service = "events.amazonaws.com" }
-      Action    = "sqs:SendMessage"
-      Resource  = aws_sqs_queue.events_dlq.arn
-      Condition = {
-        ArnEquals = {
-          "aws:SourceArn" = [
-            aws_cloudwatch_event_rule.incident_created.arn,
-            aws_cloudwatch_event_rule.incident_resolved.arn,
-            aws_cloudwatch_event_rule.action_completed.arn,
-            aws_cloudwatch_event_rule.incident_escalated.arn,
-            aws_cloudwatch_event_rule.incident_auto_resolved.arn,
-            aws_cloudwatch_event_rule.all_events.arn,
-          ]
+    Statement = [
+      {
+        Sid       = "EventBridgeDeadLetters"
+        Effect    = "Allow"
+        Principal = { Service = "events.amazonaws.com" }
+        Action    = "sqs:SendMessage"
+        Resource  = aws_sqs_queue.events_dlq.arn
+        Condition = {
+          ArnEquals = {
+            "aws:SourceArn" = [
+              aws_cloudwatch_event_rule.incident_created.arn,
+              aws_cloudwatch_event_rule.incident_resolved.arn,
+              aws_cloudwatch_event_rule.action_completed.arn,
+              aws_cloudwatch_event_rule.incident_escalated.arn,
+              aws_cloudwatch_event_rule.incident_auto_resolved.arn,
+              aws_cloudwatch_event_rule.all_events.arn,
+            ]
+          }
         }
-      }
-    }]
+      },
+      {
+        Sid       = "DenyWithoutTLS"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "sqs:*"
+        Resource  = aws_sqs_queue.events_dlq.arn
+        Condition = { Bool = { "aws:SecureTransport" = "false" } }
+      },
+    ]
   })
 }

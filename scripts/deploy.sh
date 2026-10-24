@@ -8,6 +8,8 @@ WEBHOOK_URL="$(terraform -chdir=terraform output -raw alert_webhook_url)"
 API_KEY="$(terraform -chdir=terraform output -raw alertmanager_api_key)"
 CHECKOUT_ROLE_ARN="$(terraform -chdir=terraform output -raw checkout_role_arn)"
 REGION="$(terraform -chdir=terraform output -raw aws_region)"
+IMAGE_REPO="$(terraform -chdir=terraform output -raw checkout_image_repository)"
+IMAGE_TAG="${IMAGE_TAG:-$(git rev-parse --short HEAD)}"
 
 echo "[1/5] Store the webhook API key for Alertmanager"
 kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
@@ -29,8 +31,11 @@ kubectl apply -n monitoring -f helm/observability/prom-rules/slo-burnrate.yaml
 kubectl apply -n monitoring -f helm/observability/prom-rules/node-alerts.yaml
 
 echo "[4/5] Deploy app"
-# The service account's IRSA role lets the app read its degraded-mode flag from SSM
+# The service account's IRSA role lets the app read its degraded-mode flag from SSM.
+# The image tag has to be pushed already, by scripts/build-image.sh.
 helm upgrade --install checkout helm/checkout -n apps --create-namespace \
+  --set image.repository="$IMAGE_REPO" \
+  --set image.tag="$IMAGE_TAG" \
   --set serviceAccount.roleArn="$CHECKOUT_ROLE_ARN" \
   --set env.AWS_REGION="$REGION"
 

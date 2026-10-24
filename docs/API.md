@@ -234,15 +234,10 @@ curl -X POST "https://abc123.execute-api.us-west-2.amazonaws.com/prod/webhook" \
   -d @alert.json
 ```
 
-### VPC Endpoint (Recommended for Production)
+### Private Webhook (`webhook_private`)
 
-For maximum security, use a VPC endpoint to restrict access to the API Gateway:
+Set `webhook_private = true` to make the webhook a private REST API. Terraform then creates an execute-api VPC endpoint in the private subnets and a resource policy that refuses any invoke that doesn't come through it:
 
-1. Create VPC endpoint for API Gateway
-2. Configure API Gateway resource policy to allow only VPC endpoint
-3. Alertmanager/Datadog webhooks must originate from within VPC
-
-**Resource Policy Example**:
 ```json
 {
   "Version": "2012-10-17",
@@ -251,9 +246,15 @@ For maximum security, use a VPC endpoint to restrict access to the API Gateway:
       "Effect": "Allow",
       "Principal": "*",
       "Action": "execute-api:Invoke",
+      "Resource": "arn:aws:execute-api:REGION:ACCOUNT_ID:API_ID/*"
+    },
+    {
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "execute-api:Invoke",
       "Resource": "arn:aws:execute-api:REGION:ACCOUNT_ID:API_ID/*",
       "Condition": {
-        "StringEquals": {
+        "StringNotEquals": {
           "aws:SourceVpce": "vpce-1234567890abcdef0"
         }
       }
@@ -261,6 +262,12 @@ For maximum security, use a VPC endpoint to restrict access to the API Gateway:
   ]
 }
 ```
+
+The API key is still required. `alert_webhook_url` doesn't change; the endpoint's private DNS resolves it inside the VPC, so Alertmanager keeps working. Datadog sends from the internet and can't reach a private API, so only turn this on when Alertmanager is the only sender. The endpoint costs about $15 a month in two AZs.
+
+### TLS
+
+The webhook is HTTPS only. It uses API Gateway's default TLS policy: pinning a TLS 1.2 minimum on the REST API needs AWS provider 6, which the EKS module (~> 20) doesn't allow yet.
 
 ---
 
@@ -658,7 +665,7 @@ aws cloudwatch put-metric-alarm \
 5. **Use correlation_id** from response to track alerts through the pipeline
 6. **Test the webhook with `notify_only` or a `warning` alert** before letting critical alerts through, since both stop before the runbook changes anything
 7. **Enable API key authentication** in production
-8. **Use VPC endpoint** for maximum security
+8. **Use `webhook_private`** if Alertmanager is the only sender
 9. **Configure Alertmanager retry** for transient failures
 
 ---
