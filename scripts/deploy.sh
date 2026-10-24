@@ -4,11 +4,11 @@ set -euo pipefail
 helm repo add prometheus-community https://prometheus-community.github.io/helm-charts >/dev/null
 helm repo update >/dev/null
 
-WEBHOOK_URL="$(terraform -chdir=terraform output -raw alert_webhook_url)"
-API_KEY="$(terraform -chdir=terraform output -raw alertmanager_api_key)"
-CHECKOUT_ROLE_ARN="$(terraform -chdir=terraform output -raw checkout_role_arn)"
-REGION="$(terraform -chdir=terraform output -raw aws_region)"
-IMAGE_REPO="$(terraform -chdir=terraform output -raw checkout_image_repository)"
+WEBHOOK_URL="$(terraform -chdir=examples/complete output -raw alert_webhook_url)"
+API_KEY="$(terraform -chdir=examples/complete output -raw alertmanager_api_key)"
+CHECKOUT_ROLE_ARN="$(terraform -chdir=examples/complete output -raw checkout_role_arn)"
+REGION="$(terraform -chdir=examples/complete output -raw aws_region)"
+IMAGE_REPO="$(terraform -chdir=examples/complete output -raw checkout_image_repository)"
 IMAGE_TAG="${IMAGE_TAG:-$(git rev-parse --short HEAD)}"
 
 echo "[1/5] Store the webhook API key for Alertmanager"

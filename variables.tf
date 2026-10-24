@@ -1,0 +1,267 @@
+variable "name" {
+  description = "Prefix for every resource name"
+  type        = string
+  default     = "event-driven-sre"
+}
+
+variable "tags" {
+  description = "Tags for every resource that takes them"
+  type        = map(string)
+  default     = {}
+}
+
+# ------------------------------------------------------------------ cluster and network
+
+variable "cluster_name" {
+  description = "EKS cluster that runbook_action remediates"
+  type        = string
+}
+
+variable "vpc_id" {
+  description = "VPC runbook_action runs in"
+  type        = string
+}
+
+variable "subnet_ids" {
+  description = "Private subnets for runbook_action, and for the execute-api endpoint when webhook_private is true"
+  type        = list(string)
+}
+
+variable "cluster_security_group_id" {
+  description = "The cluster's security group. The module adds an ingress rule for 443 from runbook_action's security group."
+  type        = string
+}
+
+variable "create_access_entry" {
+  description = "Create an EKS access entry for runbook_action's role in kubernetes_group. The cluster needs access entries enabled (authentication mode API or API_AND_CONFIG_MAP)."
+  type        = bool
+  default     = true
+}
+
+variable "kubernetes_group" {
+  description = "Kubernetes group runbook_action's role is mapped to; k8s/rbac/remediation-role.yaml binds it"
+  type        = string
+  default     = "sre-remediation"
+}
+
+# ------------------------------------------------------------------ remediation
+
+variable "remediation_namespaces" {
+  description = "Namespaces runbook_action may act in. The first is the runbook's target when an alert doesn't name one."
+  type        = list(string)
+  default     = ["apps"]
+
+  validation {
+    condition     = length(var.remediation_namespaces) > 0
+    error_message = "Give at least one namespace."
+  }
+}
+
+variable "default_deployment" {
+  description = "Deployment the runbook targets when an alert doesn't name one"
+  type        = string
+  default     = "checkout"
+}
+
+variable "runbook_routes" {
+  description = "Which action the runbook takes for each alertname"
+  type = map(object({
+    action = string
+  }))
+  default = {
+    CheckoutHighErrorRate  = { action = "degrade_or_scale" }
+    CheckoutHighLatencyP95 = { action = "degrade_or_scale" }
+    CheckoutSLOBurnFast    = { action = "degrade_or_scale" }
+    CheckoutDown           = { action = "restart" }
+    NodeUnderPressure      = { action = "drain_node" }
+  }
+
+  validation {
+    condition     = alltrue([for r in values(var.runbook_routes) : contains(["degrade", "restart", "scale", "degrade_or_scale", "drain_node"], r.action)])
+    error_message = "Each action must be degrade, restart, scale, degrade_or_scale or drain_node."
+  }
+}
+
+variable "degraded_mode_deployment" {
+  description = "The only deployment degrade works for; it reads the degraded-mode parameter"
+  type        = string
+  default     = "checkout"
+}
+
+variable "degraded_mode_parameter_name" {
+  description = "SSM parameter degrade sets to \"true\""
+  type        = string
+  default     = "/checkout/degraded_mode"
+}
+
+variable "create_degraded_mode_parameter" {
+  description = "Create the degraded-mode parameter with the value \"false\". Turn it off if it already exists."
+  type        = bool
+  default     = true
+}
+
+variable "drainable_node_label" {
+  description = "drain_node only drains nodes with this label, as key=value"
+  type        = string
+  default     = "nodegroup=apps"
+
+  validation {
+    condition     = can(regex("^[^=]+=.*$", var.drainable_node_label))
+    error_message = "Must be key=value."
+  }
+}
+
+variable "drain_min_schedulable_nodes" {
+  description = "drain_node refuses to drain a node unless at least this many other drainable nodes are Ready and schedulable"
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.drain_min_schedulable_nodes >= 1
+    error_message = "Must be at least 1."
+  }
+}
+
+variable "remediation_max_replicas" {
+  description = "Highest replica count runbook_action will scale a deployment to"
+  type        = number
+  default     = 10
+
+  validation {
+    condition     = var.remediation_max_replicas >= 1
+    error_message = "Must be at least 1."
+  }
+}
+
+variable "runbook_action_reserved_concurrency" {
+  description = "Concurrent executions reserved for runbook_action, which caps how many remediations hit the cluster at once. -1 leaves it unreserved."
+  type        = number
+  default     = 10
+}
+
+variable "alert_ingest_reserved_concurrency" {
+  description = "Concurrent executions reserved for alert_ingest. AWS keeps 100 unreserved per account, so accounts with a low concurrency limit need -1 (no reservation)."
+  type        = number
+  default     = 100
+}
+
+variable "auto_remediate_severities" {
+  description = "Severities the runbook acts on. Others only notify."
+  type        = list(string)
+  default     = ["critical"]
+
+  validation {
+    condition     = alltrue([for s in var.auto_remediate_severities : contains(["critical", "warning", "info"], s)])
+    error_message = "Each severity must be critical, warning or info."
+  }
+}
+
+variable "stabilization_seconds" {
+  description = "How long the runbook waits after an action before it checks whether the alert resolved"
+  type        = number
+  default     = 60
+
+  validation {
+    condition     = var.stabilization_seconds >= 1 && floor(var.stabilization_seconds) == var.stabilization_seconds
+    error_message = "Must be a whole number of seconds, at least 1."
+  }
+}
+
+variable "verify_poll_seconds" {
+  description = "How often the runbook checks for the resolved alert after the stabilization wait"
+  type        = number
+  default     = 30
+
+  validation {
+    condition     = var.verify_poll_seconds >= 5 && floor(var.verify_poll_seconds) == var.verify_poll_seconds
+    error_message = "Must be a whole number of seconds, at least 5."
+  }
+}
+
+variable "verify_timeout_seconds" {
+  description = "How long after the action the alert has to resolve before the incident is escalated. Alertmanager only sends the resolved notification at its group_interval, so leave room for that."
+  type        = number
+  default     = 600
+
+  validation {
+    condition     = var.verify_timeout_seconds >= 60
+    error_message = "Must be at least 60 seconds."
+  }
+}
+
+# ------------------------------------------------------------------ incidents and logs
+
+variable "incident_retention_days" {
+  description = "Days after an incident's last activity before DynamoDB deletes it"
+  type        = number
+  default     = 90
+
+  validation {
+    condition     = var.incident_retention_days >= 1 && floor(var.incident_retention_days) == var.incident_retention_days
+    error_message = "Must be a whole number of days, at least 1."
+  }
+}
+
+variable "incidents_deletion_protection" {
+  description = "Deletion protection on the incidents table. Set it to false before destroying."
+  type        = bool
+  default     = true
+}
+
+variable "log_retention_days" {
+  description = "Days the module's log groups keep logs"
+  type        = number
+  default     = 30
+
+  validation {
+    condition     = contains([1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653], var.log_retention_days)
+    error_message = "Must be a retention period CloudWatch Logs supports, e.g. 7, 30, 90 or 365."
+  }
+}
+
+# ------------------------------------------------------------------ encryption
+
+variable "create_kms_key" {
+  description = "Create a KMS key for the incidents table, SNS topic, DLQ and log groups. Set it to false and pass kms_key_arn to use your own."
+  type        = bool
+  default     = true
+}
+
+# Checked against create_kms_key by a precondition on the incidents table;
+# a validation can't refer to another variable before Terraform 1.9.
+variable "kms_key_arn" {
+  description = "Existing KMS key to use when create_kms_key is false. Its policy has to allow what the module's own key policy allows (see kms.tf)."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.kms_key_arn == null || can(regex("^arn:[^:]+:kms:", var.kms_key_arn))
+    error_message = "Must be a KMS key ARN."
+  }
+}
+
+# ------------------------------------------------------------------ webhook
+
+variable "webhook_require_api_key" {
+  description = "Require an X-API-Key header on POST /webhook. Creates one key for Alertmanager and one for Datadog."
+  type        = bool
+  default     = true
+}
+
+variable "webhook_rate_limit" {
+  description = "Steady-state requests per second allowed on the webhook"
+  type        = number
+  default     = 1000
+}
+
+variable "webhook_burst_limit" {
+  description = "Burst of requests allowed on the webhook"
+  type        = number
+  default     = 2000
+}
+
+variable "webhook_private" {
+  description = "Make the webhook a private API, reachable only through an execute-api VPC endpoint the module creates in vpc_id and subnet_ids. Datadog can't reach a private API, so only use this when Alertmanager is the only sender."
+  type        = bool
+  default     = false
+}

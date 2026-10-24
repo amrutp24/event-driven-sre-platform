@@ -1,15 +1,14 @@
-# event-driven-sre-platform
+# terraform-aws-event-driven-sre
 
-Automated incident response for a service running on EKS. Prometheus alerts for a demo `checkout` service are sent to an endpoint on AWS, recorded, and handed to a Step Functions runbook that changes the deployment in response: it switches the service to degraded mode, restarts it, or scales it up, and drains nodes under pressure. The runbook then checks that the alert clears and hands the incident to a person if it doesn't.
+A Terraform module that adds automated incident response to an EKS cluster. Alertmanager or Datadog alerts are sent to an endpoint on AWS, recorded, and handed to a Step Functions runbook that changes the deployment in response: it switches the service to degraded mode, restarts it, or scales it up, and drains nodes under pressure. The runbook then checks that the alert clears and hands the incident to a person if it doesn't.
 
-The alert path (Alertmanager to API Gateway to Lambda to EventBridge, which routes to DynamoDB, SNS and Step Functions) and remediation are in place and covered by unit tests. See [Known gaps](#known-gaps) for what's still missing.
+The module brings the pipeline (API Gateway, two Lambdas, EventBridge, Step Functions, DynamoDB, SNS, KMS). You bring the cluster. See [Known gaps](#known-gaps) for what's still missing.
 
 ## How it works
 
-1. Prometheus, installed with kube-prometheus-stack, evaluates five alert rules for `checkout` (`CheckoutHighErrorRate`, `CheckoutHighLatencyP95`, `CheckoutDown`, `CheckoutSLOBurnFast` and `CheckoutSLOBurnSlow`) and one for the cluster's nodes, `NodeUnderPressure` (memory, disk or PID pressure for 5 minutes).
-2. Alertmanager posts firing and resolved alerts to `POST /webhook` on an API Gateway REST API, with an `X-API-Key` header. API Gateway checks the body against a JSON schema and rate-limits requests (1000 per second, bursts of 2000). Datadog monitors can send to the same endpoint; see [docs/API.md](docs/API.md).
-3. The `alert-ingest` Lambda validates the payload (anything invalid gets a `400` with an error code), normalizes Alertmanager and Datadog alerts into one format, and adds the account, region and receive time. Each alert gets a stable incident id, so a firing alert and its resolution belong to the same incident. It puts each alert on the EventBridge bus as an `incident.created` or `incident.resolved` event and answers `202 Accepted`. It doesn't call anything else.
-4. EventBridge rules route the events:
+1. Alertmanager posts firing and resolved alerts to `POST /webhook` on an API Gateway REST API, with an `X-API-Key` header. API Gateway checks the body against a JSON schema and rate-limits requests (1000 per second, bursts of 2000). Datadog monitors can send to the same endpoint; see [docs/API.md](docs/API.md).
+2. The `alert-ingest` Lambda validates the payload (anything invalid gets a `400` with an error code), normalizes Alertmanager and Datadog alerts into one format, and gives each alert a stable incident id, so a firing alert and its resolution belong to the same incident. It puts each alert on the EventBridge bus as an `incident.created` or `incident.resolved` event and answers `202 Accepted`.
+3. EventBridge rules route the events:
 
    | Event | Source | Goes to |
    | --- | --- | --- |
@@ -20,206 +19,197 @@ The alert path (Alertmanager to API Gateway to Lambda to EventBridge, which rout
    | any `sre.*` event | | CloudWatch Logs |
 
    EventBridge can't write to DynamoDB, so the incident recorder, a small Express state machine, does those writes.
-5. The runbook state machine only acts on firing `critical` alerts (`auto_remediate_severities`); warnings and info alerts just notify. It claims the incident in DynamoDB first. Only one run can claim it, so an incident is remediated once even if Alertmanager re-sends the alert or EventBridge delivers it twice.
-6. It picks an action from the alert name and invokes the `runbook-action` Lambda with the action and its target, retrying up to three times with backoff. The Lambda applies it through the Kubernetes API, authenticating with an EKS token signed by its own IAM role. The result goes out as an `action.completed` event.
-7. It waits a minute, then checks DynamoDB every 30 seconds for the resolved alert. If the alert resolves within 10 minutes of the action, it records the MTTR and publishes `incident.auto_resolved`. If it doesn't, or the action failed, or there's no runbook for the alert, it marks the incident `escalated` and publishes `incident.escalated`. Both go to SNS.
+4. The runbook state machine only acts on firing `critical` alerts (`auto_remediate_severities`); the rest just notify. It claims the incident in DynamoDB first. Only one run can claim it, so an incident is remediated once even if the alert is re-sent or EventBridge delivers it twice.
+5. It picks an action from the alert name (`runbook_routes`) and invokes the `runbook-action` Lambda, retrying up to three times with backoff. The Lambda runs in your VPC and applies the action through the Kubernetes API, authenticating with an EKS token signed by its own IAM role. The result goes out as an `action.completed` event.
+6. It waits a minute, then checks DynamoDB every 30 seconds for the resolved alert. If the alert resolves within 10 minutes of the action, it records the MTTR and publishes `incident.auto_resolved`. If it doesn't, or the action failed, or there's no runbook for the alert, it marks the incident `escalated` and publishes `incident.escalated`. Both go to SNS.
+
+With the default `runbook_routes`:
 
 | Alert | Action |
 | --- | --- |
-| `CheckoutHighErrorRate`, `CheckoutHighLatencyP95`, `CheckoutSLOBurnFast` | Turn on degraded mode by setting the SSM parameter `/checkout/degraded_mode` to `true` (the pods read it within 15 seconds, no restart), and raise the HPA's minimum to 4 replicas. |
-| `CheckoutDown` | Restart the deployment. |
-| `NodeUnderPressure` | Drain the node: cordon it and evict its pods, respecting PodDisruptionBudgets. Only `apps` nodes, and only if another schedulable `apps` node is left. |
+| `CheckoutHighErrorRate`, `CheckoutHighLatencyP95`, `CheckoutSLOBurnFast` | `degrade_or_scale`: turn on degraded mode by setting the SSM parameter `/checkout/degraded_mode` to `true` (the demo app reads it within 15 seconds, no restart), and raise the HPA's minimum to 4 replicas. |
+| `CheckoutDown` | `restart`: restart the deployment. |
+| `NodeUnderPressure` | `drain_node`: cordon the node and evict its pods, respecting PodDisruptionBudgets. Only nodes labelled `nodegroup=apps`, and only if another schedulable one is left. |
 | Any other critical alert | Escalate. |
 
-An alert can override this with a `runbook_action` annotation (`degrade`, `restart`, `scale`, `degrade_or_scale` or `drain_node`, or `notify_only` to skip the runbook), and set the replica count with `desired_replicas`. The target is the alert's `namespace` and `deployment` labels (or Datadog's `kube_namespace` and `kube_deployment` tags), falling back to its `service` label and then `apps/checkout`, and for a drain its `node` label (or Datadog's `host` tag). The Lambda refuses namespaces other than `apps` and more than 10 replicas (`remediation_max_replicas`).
+An alert can override this with a `runbook_action` annotation (`degrade`, `restart`, `scale`, `degrade_or_scale` or `drain_node`, or `notify_only` to skip the runbook), and set the replica count with `desired_replicas`. The target is the alert's `namespace` and `deployment` labels (or Datadog's `kube_namespace` and `kube_deployment` tags), falling back to its `service` label and then `default_deployment` in the first of `remediation_namespaces`, and for a drain its `node` label (or Datadog's `host` tag). The Lambda refuses namespaces outside `remediation_namespaces` and more than `remediation_max_replicas` replicas.
 
 None of this is undone automatically when the incident resolves; see [Known gaps](#known-gaps).
 
-Each incident's DynamoDB record goes from `open` to `remediating`, then to `resolved` when the alert clears, or `escalated` when the runbook gives up. Every action and its result are appended to `actions_taken`, and a remediated incident gets `remediation_result` and `mttr_seconds`. The table has point-in-time recovery and deletion protection on, and deletes incidents 90 days after their last activity.
+Each incident's DynamoDB record goes from `open` to `remediating`, then to `resolved` or `escalated`, with every action and its result in `actions_taken`. Every EventBridge target retries for up to an hour, then sends the event to an SQS dead-letter queue. Every event on the bus is also written to the `/aws/events/<name>` log group and to an archive (kept 7 days) that can be replayed safely. More detail is in [docs/architecture/README.md](docs/architecture/README.md).
 
-Every EventBridge target retries for up to an hour, then sends the event to an SQS dead-letter queue. Every event on the bus is also written to the `/aws/events/<name>` log group (kept 30 days) and to an archive (kept 7 days) that can be replayed. Replaying is safe: the recorder only updates records, and the runbook won't claim an incident twice. The runbook logs every state's input and output to `/aws/vendedlogs/states/<name>-runbook`.
+## Usage
 
-The `checkout` app is a small Flask service with `/checkout`, `/metrics`, `/healthz` and `/readyz` endpoints, running as 3 to 10 pods behind an HPA, with a PodDisruptionBudget that keeps at least 2 running. Two environment variables let you break it on purpose: `ERROR_RATE` (0.0 to 1.0) returns random errors and `LATENCY_MS` adds delay. Degraded mode turns both off. It starts from `DEGRADED_MODE` and then follows the SSM parameter, which the pods read through an IRSA role that can only read that parameter.
+```hcl
+module "sre" {
+  source  = "amrutp24/event-driven-sre/aws"
+  version = "~> 1.0"
+
+  cluster_name              = "my-cluster"
+  vpc_id                    = "vpc-0123456789abcdef0"
+  subnet_ids                = ["subnet-0123456789abcdef0", "subnet-0fedcba9876543210"]
+  cluster_security_group_id = "sg-0123456789abcdef0"
+}
+```
+
+`subnet_ids` are private subnets that can reach the cluster's API endpoint and AWS APIs (through a NAT gateway or VPC endpoints). The module adds a rule to `cluster_security_group_id` that lets the Lambda in on 443.
+
+The cluster needs access entries enabled (authentication mode `API` or `API_AND_CONFIG_MAP`). The module gives the Lambda's role an access entry in the `sre-remediation` group (`kubernetes_group`) with no access policy, so the one manual step is the RBAC that says what that group may do:
+
+```bash
+kubectl apply -f k8s/rbac/remediation-role.yaml
+```
+
+The manifest's Role is for the `apps` namespace; add a copy for each other namespace in `remediation_namespaces`.
+
+Point Alertmanager's webhook receiver at `alert_webhook_url` and send `alertmanager_api_key` in the `X-API-Key` header. For Datadog, see [docs/API.md](docs/API.md#datadog-webhook-format).
+
+## Examples
+
+- [examples/complete](examples/complete): the full demo. A VPC with flow logs, EKS 1.36, IRSA roles, ECR, CloudTrail, optional VPC endpoints, one KMS key passed to the module, and the `checkout` demo app with Prometheus alerting on top. Deploy it with the scripts, in order:
+
+  ```bash
+  bash scripts/bootstrap.sh       # terraform apply in examples/complete, configure kubectl
+  bash scripts/install-addons.sh  # AWS Load Balancer Controller, ExternalDNS, cert-manager
+  bash scripts/build-image.sh     # build apps/checkout and push it to ECR, tagged with the short git SHA
+  bash scripts/deploy.sh          # Alertmanager's API key, kube-prometheus-stack, the alert rules, the checkout app and the remediation RBAC
+  bash scripts/destroy.sh         # after uninstalling the Helm releases; protections off, then terraform destroy
+  ```
+
+  Running continuously in `us-east-1` it costs roughly $460 a month, nearly all of it the cluster, the nodes and the NAT gateways. The breakdown is in [docs/architecture/README.md](docs/architecture/README.md#monthly-cost-estimate). Tear it down when you're done. [docs/DEMO.md](docs/DEMO.md) walks through breaking the app and watching it get fixed.
+- [examples/existing-cluster](examples/existing-cluster): the minimal call, for a cluster you already have. On its own the module costs about $14 a month at 1000 alerts a day, plus $1 for its KMS key.
 
 ## What's in the repo
 
 ```
 .
-├── apps/checkout/            # Flask service, Dockerfile, unit tests
-├── helm/
-│   ├── checkout/             # chart: Deployment, HPA, PodDisruptionBudget, ServiceAccount, Service, Ingress, ServiceMonitor, ConfigMap
-│   ├── observability/        # kube-prometheus-stack and Alertmanager values, alert rules
-│   └── datadog/              # optional Datadog agent values
-├── terraform/
-│   ├── networking.tf         # VPC, two AZs, a NAT gateway per AZ, VPC endpoints
-│   ├── eks.tf                # EKS 1.36, "system" and "apps" managed node groups on AL2023, metrics-server
-│   ├── irsa.tf               # IAM roles for the ALB controller, ExternalDNS, cert-manager and the checkout app
-│   ├── kms.tf                # the platform's KMS key
-│   ├── cloudtrail.tf         # multi-region trail and its bucket
-│   ├── ecr.tf                # the checkout image repository
-│   ├── webhook_api.tf        # REST API: POST /webhook, schema validation, API keys, throttling, private option
-│   ├── event_pipeline.tf     # both Lambdas, the runbook state machine, DynamoDB, SNS, the event bus
-│   ├── event_routing.tf      # EventBridge rules and targets, incident recorder, archive, dead-letter queue, audit log
-│   ├── api/                  # JSON schema for the webhook payload
-│   ├── stepfunctions/        # runbook and incident recorder definitions
-│   └── lambda/               # alert_ingest and runbook_action, each with unit tests
-├── scripts/                  # bootstrap.sh, install-addons.sh, build-image.sh, deploy.sh, destroy.sh
+├── main.tf, versions.tf      # the module: region, account and partition lookups, provider requirements
+├── variables.tf, outputs.tf
+├── webhook_api.tf            # REST API: POST /webhook, schema validation, API keys, throttling, private option
+├── event_pipeline.tf         # both Lambdas, the runbook state machine, DynamoDB, SNS, the event bus, the EKS access entry
+├── event_routing.tf          # EventBridge rules and targets, incident recorder, archive, dead-letter queue, audit log
+├── kms.tf                    # the module's KMS key (create_kms_key)
+├── api/                      # JSON schema for the webhook payload
+├── stepfunctions/            # runbook and incident recorder definitions, with tests
+├── lambda/                   # alert_ingest and runbook_action, each with unit tests; Terraform zips them
+├── k8s/rbac/                 # the remediation Role and ClusterRole for the sre-remediation group
+├── examples/
+│   ├── complete/             # VPC, EKS, IRSA, ECR, CloudTrail, VPC endpoints, KMS key, and the module
+│   └── existing-cluster/     # the module on a cluster you already have
+├── apps/checkout/            # demo Flask service, Dockerfile, unit tests
+├── helm/                     # checkout chart, kube-prometheus-stack values and alert rules, optional Datadog values
+├── scripts/                  # bootstrap.sh, install-addons.sh, build-image.sh, deploy.sh, destroy.sh (examples/complete)
 ├── tests/integration/        # end-to-end tests against LocalStack
-└── Jenkinsfile
+└── docs/                     # architecture, API, security, demo walkthrough
 ```
 
-Terraform state goes to an S3 backend (`terraform/backend.tf`).
+## Requirements
 
-## Deploy
+| Name | Version |
+| --- | --- |
+| terraform | >= 1.5.0 |
+| aws | >= 5.95, < 7.0 |
+| archive | >= 2.4 |
 
-Requires the AWS CLI, Terraform, kubectl, Helm, Python 3, Docker, git and `zip`.
+The module has no provider blocks. It needs an EKS cluster with access entries enabled, and `kubectl` to apply the RBAC manifest.
 
-```bash
-bash scripts/bootstrap.sh       # build the Lambdas, create the VPC, EKS and event pipeline, configure kubectl
-bash scripts/install-addons.sh  # AWS Load Balancer Controller, ExternalDNS, cert-manager
-bash scripts/build-image.sh     # build apps/checkout and push it to the ECR repository, tagged with the short git SHA
-bash scripts/deploy.sh          # Alertmanager's API key, kube-prometheus-stack, the alert rules, the checkout app and the remediation RBAC
-```
+<!-- BEGIN_TF_TABLES -->
+## Inputs
 
-ECR tags are immutable, so every build gets its own tag. `build-image.sh` refuses to build uncommitted changes in `apps/checkout` unless you set `IMAGE_TAG`; if you do, set the same `IMAGE_TAG` for `deploy.sh`, which deploys that tag.
+| Name | Description | Type | Default | Required |
+| --- | --- | --- | --- | :---: |
+| `name` | Prefix for every resource name | `string` | `"event-driven-sre"` | no |
+| `tags` | Tags for every resource that takes them | `map(string)` | `{}` | no |
+| `cluster_name` | EKS cluster that runbook_action remediates | `string` | n/a | yes |
+| `vpc_id` | VPC runbook_action runs in | `string` | n/a | yes |
+| `subnet_ids` | Private subnets for runbook_action, and for the execute-api endpoint when webhook_private is true | `list(string)` | n/a | yes |
+| `cluster_security_group_id` | The cluster's security group. The module adds an ingress rule for 443 from runbook_action's security group. | `string` | n/a | yes |
+| `create_access_entry` | Create an EKS access entry for runbook_action's role in kubernetes_group. The cluster needs access entries enabled (authentication mode API or API_AND_CONFIG_MAP). | `bool` | `true` | no |
+| `kubernetes_group` | Kubernetes group runbook_action's role is mapped to; k8s/rbac/remediation-role.yaml binds it | `string` | `"sre-remediation"` | no |
+| `remediation_namespaces` | Namespaces runbook_action may act in. The first is the runbook's target when an alert doesn't name one. | `list(string)` | `["apps"]` | no |
+| `default_deployment` | Deployment the runbook targets when an alert doesn't name one | `string` | `"checkout"` | no |
+| `runbook_routes` | Which action the runbook takes for each alertname | `map(object({action = string}))` | `{ CheckoutHighErrorRate = { action = "degrade_or_scale" }, CheckoutHighLatencyP95 = { action = "degrade_or_scale" }, CheckoutSLOBurnFast = { action = "degrade_or_scale" }, CheckoutDown = { action = "restart" }, NodeUnderPressure = { action = "drain_node" } }` | no |
+| `degraded_mode_deployment` | The only deployment degrade works for; it reads the degraded-mode parameter | `string` | `"checkout"` | no |
+| `degraded_mode_parameter_name` | SSM parameter degrade sets to "true" | `string` | `"/checkout/degraded_mode"` | no |
+| `create_degraded_mode_parameter` | Create the degraded-mode parameter with the value "false". Turn it off if it already exists. | `bool` | `true` | no |
+| `drainable_node_label` | drain_node only drains nodes with this label, as key=value | `string` | `"nodegroup=apps"` | no |
+| `drain_min_schedulable_nodes` | drain_node refuses to drain a node unless at least this many other drainable nodes are Ready and schedulable | `number` | `1` | no |
+| `remediation_max_replicas` | Highest replica count runbook_action will scale a deployment to | `number` | `10` | no |
+| `runbook_action_reserved_concurrency` | Concurrent executions reserved for runbook_action, which caps how many remediations hit the cluster at once. -1 leaves it unreserved. | `number` | `10` | no |
+| `alert_ingest_reserved_concurrency` | Concurrent executions reserved for alert_ingest. AWS keeps 100 unreserved per account, so accounts with a low concurrency limit need -1 (no reservation). | `number` | `100` | no |
+| `auto_remediate_severities` | Severities the runbook acts on. Others only notify. | `list(string)` | `["critical"]` | no |
+| `stabilization_seconds` | How long the runbook waits after an action before it checks whether the alert resolved | `number` | `60` | no |
+| `verify_poll_seconds` | How often the runbook checks for the resolved alert after the stabilization wait | `number` | `30` | no |
+| `verify_timeout_seconds` | How long after the action the alert has to resolve before the incident is escalated. Alertmanager only sends the resolved notification at its group_interval, so leave room for that. | `number` | `600` | no |
+| `incident_retention_days` | Days after an incident's last activity before DynamoDB deletes it | `number` | `90` | no |
+| `incidents_deletion_protection` | Deletion protection on the incidents table. Set it to false before destroying. | `bool` | `true` | no |
+| `log_retention_days` | Days the module's log groups keep logs | `number` | `30` | no |
+| `create_kms_key` | Create a KMS key for the incidents table, SNS topic, DLQ and log groups. Set it to false and pass kms_key_arn to use your own. | `bool` | `true` | no |
+| `kms_key_arn` | Existing KMS key to use when create_kms_key is false. Its policy has to allow what the module's own key policy allows (see kms.tf). | `string` | `null` | no |
+| `webhook_require_api_key` | Require an X-API-Key header on POST /webhook. Creates one key for Alertmanager and one for Datadog. | `bool` | `true` | no |
+| `webhook_rate_limit` | Steady-state requests per second allowed on the webhook | `number` | `1000` | no |
+| `webhook_burst_limit` | Burst of requests allowed on the webhook | `number` | `2000` | no |
+| `webhook_private` | Make the webhook a private API, reachable only through an execute-api VPC endpoint the module creates in vpc_id and subnet_ids. Datadog can't reach a private API, so only use this when Alertmanager is the only sender. | `bool` | `false` | no |
 
-`eks_version` defaults to `1.36`, and both node groups run Amazon Linux 2023. A cluster created from an older version of this repo has to be upgraded one minor version per apply, and changing the AMI type replaces its node groups. The first `deploy.sh` onto an existing checkout release drops `replicas` from the Deployment in favour of the HPA, so it briefly runs 1 pod until the HPA brings it back to 3.
+## Outputs
 
-Before `deploy.sh`, set two values in `helm/checkout/values.yaml`:
-
-- `ingress.host`
-- `ingress.certificateArn`, an ACM certificate for that host
-
-The ingress creates an internet-facing HTTPS load balancer through the AWS Load Balancer Controller, with a TLS 1.2 minimum. Set `ingress.enabled=false` if you don't want one.
-
-Security options in `terraform/variables.tf`:
-
-- `eks_public_access_cidrs` (default `["0.0.0.0/0"]`): who can reach the EKS public API endpoint. Set it to your own address.
-- `runbook_action_reserved_concurrency` (default `10`): the most remediations that run against the cluster at once
-- `enable_vpc_endpoints` (default `false`): interface endpoints for ECR, STS, SSM, EKS and CloudWatch Logs, so that traffic skips the NAT gateways. About $88 a month. The S3 and DynamoDB gateway endpoints are always on.
-- `webhook_private` (default `false`): make the webhook a private API, reachable only through an execute-api endpoint in the VPC. Datadog can't reach it then.
-- `enable_cloudtrail` (default `true`): a multi-region trail for the account. Turn it off if an organization trail already covers it.
-- `cloudtrail_retention_days` (default `365`): how long the trail bucket keeps log files
-- `cloudtrail_force_destroy` (default `false`): let `terraform destroy` delete the trail bucket with its logs in it. `destroy.sh` sets it.
-
-`deploy.sh` also connects Alertmanager to the webhook: it stores `terraform output alertmanager_api_key` in the `alertmanager-webhook-key` secret and fills the URL from `terraform output alert_webhook_url` into `helm/observability/alertmanager-values.yaml`. It passes the checkout service account's IRSA role (`terraform output checkout_role_arn`) and the region to the checkout chart. Run it again after a `terraform apply` that changes any of these.
-
-To send alerts from Datadog, see [docs/API.md](docs/API.md#datadog-webhook-format). Its key is `terraform output -raw datadog_api_key`.
-
-To tear it down, uninstall the Helm releases first. The load balancer the controller created isn't in Terraform state, and it blocks the VPC from being deleted while it exists. `destroy.sh` turns off the incidents table's deletion protection and lets the CloudTrail bucket be deleted with its logs before it runs `terraform destroy`. The ECR repository goes with its images. The KMS key is scheduled for deletion in 30 days rather than deleted right away.
-
-```bash
-helm uninstall checkout -n apps
-helm uninstall mon -n monitoring
-bash scripts/destroy.sh         # protections off, then terraform destroy
-```
-
-## Trying it
-
-Make the service fail 10% of requests:
-
-```bash
-kubectl set env deployment/checkout -n apps ERROR_RATE=0.10
-```
-
-Watch for `CheckoutHighErrorRate` in Alertmanager:
-
-```bash
-kubectl port-forward -n monitoring svc/alertmanager-operated 9093:9093
-# then open http://localhost:9093
-```
-
-Once it fires, check that it reached AWS:
-
-```bash
-aws logs tail /aws/events/event-driven-sre --follow                 # every event on the bus
-aws dynamodb scan --table-name event-driven-sre-incidents --max-items 5
-aws stepfunctions list-executions --max-results 5 \
-  --state-machine-arn "$(terraform -chdir=terraform output -raw step_functions_arn)"
-aws logs tail /aws/vendedlogs/states/event-driven-sre-runbook --follow  # each runbook step
-aws logs tail /aws/lambda/event-driven-sre-runbook-action --follow
-```
-
-A few minutes after the runbook acts, the incident should read `resolved` with `remediation_result` `auto_resolved`. Escalated incidents, newest first:
-
-```bash
-aws dynamodb query --table-name event-driven-sre-incidents --index-name by-status \
-  --key-condition-expression "#s = :s" --no-scan-index-forward \
-  --expression-attribute-names '{"#s": "status"}' \
-  --expression-attribute-values '{":s": {"S": "escalated"}}'
-```
-
-Nothing should be in the dead-letter queue:
-
-```bash
-aws sqs get-queue-attributes --attribute-names ApproximateNumberOfMessages \
-  --queue-url "$(terraform -chdir=terraform output -raw events_dlq_url)"
-```
-
-To replay the last hour of events through the rules:
-
-```bash
-aws events start-replay --replay-name "replay-$(date +%s)" \
-  --event-source-arn "$(terraform -chdir=terraform output -raw events_archive_arn)" \
-  --destination "Arn=$(aws events describe-event-bus --name event-driven-sre-bus --query Arn --output text)" \
-  --event-start-time "$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)" \
-  --event-end-time "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-```
-
-The names above assume the default `name` variable, `event-driven-sre`.
+| Name | Description |
+| --- | --- |
+| `alert_webhook_url` | POST alerts here |
+| `alertmanager_api_key` | X-API-Key for Alertmanager; empty when webhook_require_api_key is false (sensitive) |
+| `datadog_api_key` | X-API-Key for the Datadog webhook; empty when webhook_require_api_key is false (sensitive) |
+| `event_bus_name` | Custom EventBridge bus every sre.* event goes through |
+| `event_bus_arn` | ARN of the event bus, for rules or targets of your own |
+| `runbook_state_machine_arn` | Runbook state machine, started by the incident.created rule |
+| `incident_recorder_arn` | Express state machine that writes incident events to DynamoDB |
+| `incidents_table_name` | DynamoDB table with one item per incident; query the by-status index for open or escalated ones |
+| `incidents_table_arn` | ARN of the incidents table |
+| `sns_topic_arn` | Incident notifications; subscribe on-call here |
+| `events_dlq_url` | Events EventBridge couldn't deliver after retries |
+| `events_log_group` | Every event on the bus |
+| `events_archive_arn` | Replay source; events are kept 7 days |
+| `runbook_log_group` | Runbook execution logs, including state input and output |
+| `incident_recorder_log_group` | Incident recorder failures. Express workflows have no execution history, so this is where they show up. |
+| `kms_key_arn` | Key for the incidents table, SNS topic, DLQ and log groups: the module's own, or kms_key_arn |
+| `runbook_action_function_arn` | Lambda that carries out remediation actions against the cluster |
+| `runbook_action_role_arn` | IAM role runbook_action calls the Kubernetes API as |
+| `runbook_action_security_group_id` | Security group of runbook_action; the module already allows it to the cluster API on 443 |
+| `kubernetes_group` | Group runbook_action's role is in; bind it with k8s/rbac/remediation-role.yaml |
+| `degraded_mode_parameter_name` | SSM parameter the degrade action sets to true; the app reads it |
+| `degraded_mode_parameter_arn` | Grant the degraded-mode deployment ssm:GetParameter on this |
+<!-- END_TF_TABLES -->
 
 ## Tests
 
 ```bash
-# checkout app
-cd apps/checkout && pip install -r requirements-dev.txt && pytest tests/ --cov
-
 # Lambdas, with AWS calls mocked by moto
-cd terraform/lambda/alert_ingest && pip install -r requirements-dev.txt && AWS_DEFAULT_REGION=us-east-1 pytest tests/ --cov
-cd terraform/lambda/runbook_action && pip install -r requirements-dev.txt && AWS_DEFAULT_REGION=us-east-1 pytest tests/ --cov
+cd lambda/alert_ingest && pip install -r requirements-dev.txt && AWS_DEFAULT_REGION=us-east-1 pytest tests/ --cov
+cd lambda/runbook_action && pip install -r requirements-dev.txt && AWS_DEFAULT_REGION=us-east-1 pytest tests/ --cov
 
 # Both state machines, run through a local JSONata simulator with the Lambdas on either side
-cd terraform/stepfunctions && pip install -r tests/requirements.txt && pytest tests/
+cd stepfunctions && pip install -r tests/requirements.txt && pytest tests/
+
+# The demo app
+cd apps/checkout && pip install -r requirements-dev.txt && pytest tests/ --cov
 ```
 
 `tests/integration/` runs the alert path end to end against LocalStack (`setup.sh`, then pytest, then `cleanup.sh`). It isn't part of CI.
 
-CI (`.github/workflows/integration-tests.yml`) runs Checkov on the Terraform (settings and skipped checks, with reasons, in `.checkov.yaml`), Trivy on the container image, the app, Lambda and state machine tests, and `terraform fmt`, `validate` and `tflint`.
+CI (`.github/workflows/integration-tests.yml`) runs Checkov on the module and on `examples/complete` (settings and skipped checks, with reasons, in `.checkov.yaml`), Trivy on the container image, the app, Lambda and state machine tests, `terraform fmt`, `terraform validate` on the module and both examples, and `tflint` on the module and `examples/complete`.
 
 ## Known gaps
 
-- **The EKS public endpoint is open to the internet by default.** `deploy.sh` reaches the cluster through it from your machine. Set `eks_public_access_cidrs` to your own address.
-- **Remediation isn't reverted automatically.** After an incident resolves, degraded mode stays on, the HPA minimum stays raised, and a drained node stays cordoned. Put them back by hand (re-running `deploy.sh` also resets the HPA minimum, since `helm upgrade` applies the chart's 3):
+- **The complete example's EKS public endpoint is open to the internet by default.** `deploy.sh` reaches the cluster through it from your machine. Set `eks_public_access_cidrs` in `examples/complete` to your own address.
+- **Remediation isn't reverted automatically.** After an incident resolves, degraded mode stays on, the HPA minimum stays raised, and a drained node stays cordoned. Put them back by hand (in the complete example, re-running `deploy.sh` also resets the HPA minimum, since `helm upgrade` applies the chart's 3):
 
   ```bash
   aws ssm put-parameter --name /checkout/degraded_mode --value false --overwrite
   kubectl patch hpa checkout -n apps --type merge -p '{"spec":{"minReplicas":3}}'
   kubectl uncordon NODE_NAME
   ```
-- **The webhook's TLS version isn't pinned.** It's HTTPS only, with API Gateway's default TLS policy. Setting a TLS 1.2 minimum on the REST API needs AWS provider 6, and the EKS module (~> 20) keeps the provider below 6. It comes with the move to EKS module v21.
-- **Existing stacks have to import two log groups.** Terraform now creates the Lambda log groups (encrypted, kept 30 days), but a stack that has already run has them from Lambda, so the apply fails until they're imported. With the default `name`:
-
-  ```bash
-  terraform -chdir=terraform import aws_cloudwatch_log_group.alert_ingest /aws/lambda/event-driven-sre-alert-ingest
-  terraform -chdir=terraform import aws_cloudwatch_log_group.runbook_action /aws/lambda/event-driven-sre-runbook-action
-  ```
+- **The webhook's TLS version isn't pinned.** It's HTTPS only, with API Gateway's default TLS policy. Setting a TLS 1.2 minimum on the REST API needs AWS provider 6, and the module still supports provider 5 (the complete example's EKS module, ~> 20, keeps it below 6).
+- **`degrade` only works for one deployment.** It flips the SSM parameter `degraded_mode_parameter_name`, which only `degraded_mode_deployment` reads.
 - **A private webhook shuts out Datadog.** With `webhook_private = true` only callers inside the VPC can reach it, which leaves Alertmanager as the only sender.
-
-## Cost
-
-Running continuously in `us-east-1` at on-demand prices, roughly $460 a month, nearly all of it fixed:
-
-| | Monthly |
-| --- | --- |
-| EKS control plane | $73 |
-| 4 × m6i.large nodes (2 per node group) and their root volumes | $286 |
-| 2 NAT gateways | $66 plus data |
-| Load balancer for the checkout ingress | about $16 plus usage |
-| KMS key, CloudTrail (first trail free) and its bucket, EKS control plane logs | a few dollars |
-| The alert pipeline (API Gateway, Lambda, EventBridge, Step Functions, DynamoDB, SNS) at 1000 alerts a day | about $14 |
-| Optional interface endpoints (`enable_vpc_endpoints`) | add $88 |
-
-The breakdown and what it assumes are in [docs/architecture/README.md](docs/architecture/README.md#monthly-cost-estimate). Tear it down when you're done.
 
 ## License
 

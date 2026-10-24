@@ -114,7 +114,7 @@ Prometheus Alertmanager sends alerts in the following format:
 | `alerts[].generatorURL` | string | Link to Prometheus query |
 | `alerts[].fingerprint` | string | Unique identifier for this alert |
 
-API Gateway checks the body's structure against a JSON schema (`terraform/api/alert_payload.schema.json`). `alert_ingest` then checks the values above, so a missing `alertname` or an unknown severity comes back with its own error code.
+API Gateway checks the body's structure against a JSON schema (`api/alert_payload.schema.json`). `alert_ingest` then checks the values above, so a missing `alertname` or an unknown severity comes back with its own error code.
 
 The incident id is derived from `fingerprint` and `startsAt`, which Alertmanager keeps the same while an alert fires and when it resolves. A resolved notification therefore updates the incident its firing alert created. Alerts without both fields get a new incident id each time.
 
@@ -218,8 +218,8 @@ A Datadog payload is recognized by its `alert_transition` field, and it's publis
 On by default (`webhook_require_api_key = true`). Terraform creates one key for Alertmanager and one for Datadog, so either can be rotated or revoked on its own:
 
 ```bash
-terraform -chdir=terraform output -raw alertmanager_api_key
-terraform -chdir=terraform output -raw datadog_api_key
+terraform -chdir=examples/complete output -raw alertmanager_api_key
+terraform -chdir=examples/complete output -raw datadog_api_key
 ```
 
 `scripts/deploy.sh` gives Alertmanager its key. Set `webhook_require_api_key = false` to accept requests without one.
@@ -309,8 +309,8 @@ The webhook is HTTPS only. It uses API Gateway's default TLS policy: pinning a T
 The examples read the URL and key from Terraform:
 
 ```bash
-WEBHOOK_URL=$(terraform -chdir=terraform output -raw alert_webhook_url)
-API_KEY=$(terraform -chdir=terraform output -raw alertmanager_api_key)
+WEBHOOK_URL=$(terraform -chdir=examples/complete output -raw alert_webhook_url)
+API_KEY=$(terraform -chdir=examples/complete output -raw alertmanager_api_key)
 ```
 
 ### Example 1: Test Alert (cURL)
@@ -556,7 +556,7 @@ Every event on the bus is logged, and events EventBridge couldn't deliver end up
 ```bash
 aws logs tail /aws/events/PLATFORM_NAME --follow
 aws sqs get-queue-attributes --attribute-names ApproximateNumberOfMessages \
-  --queue-url "$(terraform -chdir=terraform output -raw events_dlq_url)"
+  --queue-url "$(terraform -chdir=examples/complete output -raw events_dlq_url)"
 ```
 
 ### Check DynamoDB Incident Records

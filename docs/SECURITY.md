@@ -34,7 +34,7 @@ This platform implements defense-in-depth security principles across multiple la
 
 ### Principle: Least Privilege
 
-All IAM roles and policies follow the principle of least privilege—granting only the minimum permissions required to perform their function.
+All IAM roles and policies follow the principle of least privilege, granting only the minimum permissions required to perform their function.
 
 ### Lambda Execution Roles
 
@@ -214,7 +214,7 @@ IRSA allows Kubernetes pods to assume IAM roles via the EKS OIDC provider, elimi
 
 ### The checkout app's role
 
-The checkout pods read the degraded-mode flag from SSM. The chart's `checkout` service account carries the role from `terraform output checkout_role_arn` (`terraform/irsa.tf`, passed in by `scripts/deploy.sh`), and the role trusts only `apps:checkout`. Its one permission:
+The checkout pods read the degraded-mode flag from SSM. The chart's `checkout` service account carries the role from `terraform output checkout_role_arn` (`examples/complete/irsa.tf`, passed in by `scripts/deploy.sh`), and the role trusts only `apps:checkout`. Its one permission:
 
 ```json
 {
@@ -230,27 +230,27 @@ The container runs from `python:3.13-slim` as a non-root user (UID 10001).
 
 ### How the runbook_action Lambda authenticates
 
-IRSA only works for pods, and the Lambda isn't a pod. Instead it calls the Kubernetes API as its own IAM role, and the cluster maps that role to a Kubernetes group with an EKS access entry (`terraform/eks.tf`):
+IRSA only works for pods, and the Lambda isn't a pod. Instead it calls the Kubernetes API as its own IAM role, and the cluster maps that role to a Kubernetes group with an EKS access entry the module creates (`event_pipeline.tf`, `create_access_entry`, group from `kubernetes_group`):
 
 ```hcl
-access_entries = {
-  runbook_action = {
-    principal_arn     = aws_iam_role.runbook_lambda_role.arn
-    kubernetes_groups = ["checkout-remediation"]
-  }
+resource "aws_eks_access_entry" "runbook_action" {
+  cluster_name      = var.cluster_name
+  principal_arn     = aws_iam_role.runbook_lambda_role.arn
+  kubernetes_groups = [var.kubernetes_group] # "sre-remediation"
+  type              = "STANDARD"
 }
 ```
 
 1. The Lambda calls `eks:DescribeCluster` for the API endpoint and CA certificate.
 2. It presigns an STS `GetCallerIdentity` request with its role's temporary credentials and sends it as a bearer token.
-3. EKS verifies the token with STS, finds the access entry for the role, and treats the caller as a member of `checkout-remediation`.
+3. EKS verifies the token with STS, finds the access entry for the role, and treats the caller as a member of `sre-remediation`.
 4. Kubernetes RBAC decides what that group may do (next section).
 
 The Lambda runs in the private subnets and reaches the cluster's private API endpoint. The cluster security group allows HTTPS from the Lambda's security group only.
 
 **Security Properties**:
 - ✅ No kubeconfig, static token or long-lived key is stored anywhere
-- ✅ Only this IAM role is mapped to the `checkout-remediation` group
+- ✅ Only this IAM role is mapped to the `sre-remediation` group
 - ✅ Outside the `apps` namespace, the group can only look at and cordon nodes, list pods and evict them (for `drain_node`)
 
 ---
@@ -267,7 +267,7 @@ The runbook_action Lambda (through its access entry) can change workloads only i
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: checkout-remediation
+  name: sre-remediation
   namespace: apps
 rules:
   # Read, scale and restart deployments
@@ -297,7 +297,7 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: checkout-remediation-nodes
+  name: sre-remediation-nodes
 rules:
   # Check the node's labels and readiness, then cordon it
   - apiGroups: [""]
@@ -314,7 +314,7 @@ rules:
     verbs: ["create"]
 ```
 
-It's bound to the same `checkout-remediation` group with a ClusterRoleBinding of the same name. Eviction goes through the Eviction API, which respects PodDisruptionBudgets; there's no permission to delete pods outright. The Lambda also limits which nodes it will drain (see the input checks above), but RBAC can't express "only `apps` nodes", so the cluster-wide grant is the backstop, not the limit.
+It's bound to the same `sre-remediation` group with a ClusterRoleBinding of the same name. Eviction goes through the Eviction API, which respects PodDisruptionBudgets; there's no permission to delete pods outright. The Lambda also limits which nodes it will drain (see the input checks above), but RBAC can't express "only `apps` nodes", so the cluster-wide grant is the backstop, not the limit.
 
 ### RoleBinding
 
@@ -322,15 +322,15 @@ It's bound to the same `checkout-remediation` group with a ClusterRoleBinding of
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: checkout-remediation
+  name: sre-remediation
   namespace: apps
 subjects:
   - kind: Group
-    name: checkout-remediation
+    name: sre-remediation
     apiGroup: rbac.authorization.k8s.io
 roleRef:
   kind: Role
-  name: checkout-remediation
+  name: sre-remediation
   apiGroup: rbac.authorization.k8s.io
 ```
 
@@ -349,23 +349,23 @@ roleRef:
 **Test RBAC Permissions**:
 ```bash
 # Verify the remediation group can patch deployments
-kubectl auth can-i patch deployments -n apps --as=runbook-action --as-group=checkout-remediation
+kubectl auth can-i patch deployments -n apps --as=runbook-action --as-group=sre-remediation
 # Expected: yes
 
 # Verify it CANNOT delete deployments
-kubectl auth can-i delete deployments -n apps --as=runbook-action --as-group=checkout-remediation
+kubectl auth can-i delete deployments -n apps --as=runbook-action --as-group=sre-remediation
 # Expected: no
 
 # Verify it CANNOT change workloads in other namespaces
-kubectl auth can-i patch deployments -n kube-system --as=runbook-action --as-group=checkout-remediation
+kubectl auth can-i patch deployments -n kube-system --as=runbook-action --as-group=sre-remediation
 # Expected: no
 
 # drain_node: it can cordon nodes and evict pods anywhere, but not delete them
-kubectl auth can-i patch nodes --as=runbook-action --as-group=checkout-remediation
+kubectl auth can-i patch nodes --as=runbook-action --as-group=sre-remediation
 # Expected: yes
-kubectl auth can-i create pods/eviction -n kube-system --as=runbook-action --as-group=checkout-remediation
+kubectl auth can-i create pods/eviction -n kube-system --as=runbook-action --as-group=sre-remediation
 # Expected: yes
-kubectl auth can-i delete pods -n apps --as=runbook-action --as-group=checkout-remediation
+kubectl auth can-i delete pods -n apps --as=runbook-action --as-group=sre-remediation
 # Expected: no
 ```
 
@@ -439,7 +439,7 @@ Created when any interface endpoint is.
 
 ### Encryption at Rest
 
-The platform has one customer managed key, `alias/PLATFORM_NAME` (`terraform/kms.tf`, output `kms_key_arn`), with yearly rotation on and a 30 day deletion window.
+The platform has one customer managed key, `alias/PLATFORM_NAME` (output `kms_key_arn`), with yearly rotation on and a 30 day deletion window. In the complete example it's `examples/complete/kms.tf`, passed to the module with `create_kms_key = false`. Used on its own, the module creates its own key (`kms.tf`), or takes yours through `kms_key_arn`.
 
 | Data | Encryption | Key |
 |------|------------|-----|
@@ -460,12 +460,14 @@ EKS secrets stay on the module's key because a cluster can't be moved to a diffe
 - EventBridge, to publish to the encrypted topic and dead-letter to the encrypted queue
 - CloudTrail, only for this platform's trail (`aws:SourceArn`)
 
+The CloudTrail statements are only in the complete example's key. The module's own key has no CloudTrail statements, since the module doesn't create a trail; if you pass your own key, its policy needs the other statements above.
+
 ```hcl
 resource "aws_dynamodb_table" "incidents" {
   # ...
   server_side_encryption {
     enabled     = true
-    kms_key_arn = aws_kms_key.platform.arn
+    kms_key_arn = local.kms_key_arn # the module's key, or kms_key_arn
   }
 
   point_in_time_recovery {
@@ -498,18 +500,18 @@ The only secrets are the two webhook API keys.
 | **TLS certificate** | AWS Certificate Manager | The ALB fetches it |
 | **Image pulls** | No secret | Nodes pull from ECR with their node role |
 
-Both API key values are also in the Terraform state, as sensitive outputs, so keep the state bucket encrypted and access to it limited.
+Both API key values are also in the Terraform state, as sensitive outputs, so keep the state encrypted and access to it limited.
 
 ### Secret Rotation
 
 **Webhook API keys**: replace one and redeploy:
 
 ```bash
-terraform -chdir=terraform apply -replace='aws_api_gateway_api_key.webhook["alertmanager"]'
+terraform -chdir=examples/complete apply -replace='module.sre.aws_api_gateway_api_key.webhook["alertmanager"]'
 bash scripts/deploy.sh   # writes the new key to Alertmanager's secret
 ```
 
-For Datadog, replace `aws_api_gateway_api_key.webhook["datadog"]` and paste the new value into the Datadog integration.
+For Datadog, replace `module.sre.aws_api_gateway_api_key.webhook["datadog"]` and paste the new value into the Datadog integration.
 
 **Degraded-mode flag**: doesn't need rotation; it isn't sensitive.
 
@@ -530,7 +532,7 @@ For Datadog, replace `aws_api_gateway_api_key.webhook["datadog"]` and paste the 
 
 ### CloudTrail
 
-`terraform/cloudtrail.tf` creates a multi-region trail, `PLATFORM_NAME-trail`, unless `enable_cloudtrail = false` (for accounts an organization trail already covers).
+`examples/complete/cloudtrail.tf` creates a multi-region trail, `PLATFORM_NAME-trail`, unless `enable_cloudtrail = false` (for accounts an organization trail already covers).
 
 **What Is Logged**:
 - Management events in every region: IAM, Lambda configuration and code updates, EKS, KMS, SSM writes and so on, plus global services

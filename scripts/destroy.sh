@@ -5,9 +5,9 @@ set -euo pipefail
 # refuses to be deleted with logs in it, so turn both off first
 TEARDOWN_VARS=(-var incidents_deletion_protection=false -var cloudtrail_force_destroy=true)
 
-terraform -chdir=terraform apply -auto-approve \
-  -target=aws_dynamodb_table.incidents \
+terraform -chdir=examples/complete apply -auto-approve \
+  -target=module.sre.aws_dynamodb_table.incidents \
   -target=aws_s3_bucket.cloudtrail \
   "${TEARDOWN_VARS[@]}"
 
-terraform -chdir=terraform destroy -auto-approve "${TEARDOWN_VARS[@]}"
+terraform -chdir=examples/complete destroy -auto-approve "${TEARDOWN_VARS[@]}"

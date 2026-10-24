@@ -1,0 +1,4 @@
+pytest==9.1.1
+jsonata-python==0.7.1
+# The contract tests import both Lambda handlers
+boto3==1.43.118

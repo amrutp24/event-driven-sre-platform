@@ -11,3 +11,6 @@
 
 # test coverage data
 .coverage
+
+# Lambda zips built by the module at plan time
+/build/
