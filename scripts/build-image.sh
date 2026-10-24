@@ -19,7 +19,9 @@ echo "[1/3] Log in to $REGISTRY"
 aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "$REGISTRY"
 
 echo "[2/3] Build $REPO:$TAG"
-docker build --platform linux/amd64 -t "$REPO:$TAG" apps/checkout
+# No provenance or SBOM attestations: Docker Desktop would push those under the
+# same tag first, and the repo's immutable tags then refuse the image itself
+docker build --platform linux/amd64 --provenance=false --sbom=false -t "$REPO:$TAG" apps/checkout
 
 echo "[3/3] Push"
 docker push "$REPO:$TAG"

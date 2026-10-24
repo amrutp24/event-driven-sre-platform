@@ -134,15 +134,15 @@ variable "remediation_max_replicas" {
 }
 
 variable "runbook_action_reserved_concurrency" {
-  description = "Concurrent executions reserved for runbook_action, which caps how many remediations hit the cluster at once. -1 leaves it unreserved."
+  description = "Concurrent executions reserved for runbook_action, which caps how many remediations hit the cluster at once (10 is a good cap). -1 leaves it unreserved, the default, because AWS keeps at least 50 to 100 executions unreserved per account and new accounts often have a limit of 50."
   type        = number
-  default     = 10
+  default     = -1
 }
 
 variable "alert_ingest_reserved_concurrency" {
-  description = "Concurrent executions reserved for alert_ingest. AWS keeps 100 unreserved per account, so accounts with a low concurrency limit need -1 (no reservation)."
+  description = "Concurrent executions reserved for alert_ingest. -1 leaves it unreserved, the default, because AWS keeps at least 50 to 100 executions unreserved per account and new accounts often have a limit of 50."
   type        = number
-  default     = 100
+  default     = -1
 }
 
 variable "auto_remediate_severities" {

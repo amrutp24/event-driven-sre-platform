@@ -124,8 +124,8 @@ run "defaults" {
   }
 
   assert {
-    condition     = aws_lambda_function.runbook_action.reserved_concurrent_executions == 10 && aws_lambda_function.runbook_action.vpc_config[0].security_group_ids == toset([aws_security_group.runbook_lambda.id])
-    error_message = "runbook_action should be capped at 10 and run in its own security group."
+    condition     = aws_lambda_function.runbook_action.reserved_concurrent_executions == -1 && aws_lambda_function.runbook_action.vpc_config[0].security_group_ids == toset([aws_security_group.runbook_lambda.id])
+    error_message = "runbook_action should be unreserved by default and run in its own security group."
   }
 
   assert {

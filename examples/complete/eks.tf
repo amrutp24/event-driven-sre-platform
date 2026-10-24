@@ -40,12 +40,15 @@ module "eks" {
   # Linux 2 AMIs after Kubernetes 1.32, so both groups run AL2023.
   eks_managed_node_groups = {
     system = {
-      name           = "${var.eks_cluster_name}-system"
-      ami_type       = "AL2023_x86_64_STANDARD"
-      instance_types = [var.node_instance_type_system]
-      min_size       = 2
-      max_size       = 6
-      desired_size   = 2
+      name     = "${var.eks_cluster_name}-system"
+      ami_type = "AL2023_x86_64_STANDARD"
+      # The module's default role name prefix runs past IAM's 38 character limit
+      iam_role_name            = "${var.eks_cluster_name}-system-node"
+      iam_role_use_name_prefix = false
+      instance_types           = [var.node_instance_type_system]
+      min_size                 = 2
+      max_size                 = 6
+      desired_size             = 2
 
       labels = {
         "nodegroup" = "system"
@@ -61,12 +64,15 @@ module "eks" {
     }
 
     apps = {
-      name           = "${var.eks_cluster_name}-apps"
-      ami_type       = "AL2023_x86_64_STANDARD"
-      instance_types = [var.node_instance_type_apps]
-      min_size       = 2
-      max_size       = 10
-      desired_size   = 2
+      name     = "${var.eks_cluster_name}-apps"
+      ami_type = "AL2023_x86_64_STANDARD"
+      # The module's default role name prefix runs past IAM's 38 character limit
+      iam_role_name            = "${var.eks_cluster_name}-apps-node"
+      iam_role_use_name_prefix = false
+      instance_types           = [var.node_instance_type_apps]
+      min_size                 = 2
+      max_size                 = 10
+      desired_size             = 2
 
       labels = {
         "nodegroup" = "apps"

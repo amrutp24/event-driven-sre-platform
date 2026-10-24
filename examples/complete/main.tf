@@ -21,8 +21,9 @@ module "sre" {
   webhook_private         = var.webhook_private
   webhook_require_api_key = var.webhook_require_api_key
 
-  auto_remediate_severities         = var.auto_remediate_severities
-  verify_timeout_seconds            = var.verify_timeout_seconds
-  incidents_deletion_protection     = var.incidents_deletion_protection
-  alert_ingest_reserved_concurrency = var.alert_ingest_reserved_concurrency
+  auto_remediate_severities           = var.auto_remediate_severities
+  verify_timeout_seconds              = var.verify_timeout_seconds
+  incidents_deletion_protection       = var.incidents_deletion_protection
+  alert_ingest_reserved_concurrency   = var.alert_ingest_reserved_concurrency
+  runbook_action_reserved_concurrency = var.runbook_action_reserved_concurrency
 }

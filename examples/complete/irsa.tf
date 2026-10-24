@@ -21,8 +21,10 @@ module "external_dns_irsa" {
   source  = "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts-eks"
   version = "~> 5.0"
 
+  # Only with hosted zones to manage: a policy with no zones is invalid
+  create_role                   = length(var.route53_zone_arns) > 0
   role_name                     = "${var.name}-external-dns"
-  attach_external_dns_policy    = true
+  attach_external_dns_policy    = length(var.route53_zone_arns) > 0
   external_dns_hosted_zone_arns = var.route53_zone_arns
 
   oidc_providers = {

@@ -12,6 +12,10 @@ skip-check:
   - CKV_AWS_116
   # alert_ingest only calls EventBridge, so it doesn't need to be in the VPC
   - CKV_AWS_117
+  # Reserved concurrency is off by default (runbook_action_reserved_concurrency
+  # and alert_ingest_reserved_concurrency), because AWS keeps 50 to 100
+  # executions unreserved and new accounts often have a limit of 50
+  - CKV_AWS_115
   # The Lambda env vars are names and ARNs, nothing secret
   - CKV_AWS_173
   # No code signing; the Lambda zips are built from this repo

@@ -188,17 +188,21 @@ resource "aws_api_gateway_deployment" "alerts_api" {
   rest_api_id = aws_api_gateway_rest_api.alerts_api.id
 
   # Redeploy whenever anything that shapes the API changes. A resource policy
-  # change only takes effect after a redeploy.
+  # change only takes effect after a redeploy. Only settings go in the hash:
+  # whole resources carry attributes AWS fills in later, which would redeploy
+  # on every apply.
   triggers = {
     redeployment = sha1(jsonencode([
-      aws_api_gateway_rest_api.alerts_api.endpoint_configuration,
-      aws_api_gateway_rest_api_policy.private_only,
-      aws_api_gateway_resource.webhook,
-      aws_api_gateway_method.webhook_post,
-      aws_api_gateway_integration.webhook_lambda,
-      aws_api_gateway_model.alert_payload,
-      aws_api_gateway_request_validator.body,
-      aws_api_gateway_gateway_response.errors,
+      var.webhook_private,
+      local.webhook_vpc_endpoint_id,
+      aws_api_gateway_rest_api_policy.private_only[*].policy,
+      aws_api_gateway_resource.webhook.path_part,
+      aws_api_gateway_method.webhook_post.api_key_required,
+      aws_api_gateway_method.webhook_post.request_models,
+      aws_api_gateway_integration.webhook_lambda.uri,
+      aws_api_gateway_model.alert_payload.schema,
+      aws_api_gateway_request_validator.body.validate_request_body,
+      { for k, r in aws_api_gateway_gateway_response.errors : k => [r.status_code, r.response_templates] },
     ]))
   }
 
