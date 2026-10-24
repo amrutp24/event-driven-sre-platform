@@ -8,6 +8,7 @@ CLUSTER="$(terraform -chdir=terraform output -raw eks_cluster_name)"
 REGION="$(terraform -chdir=terraform output -raw aws_region)"
 ALB_ROLE_ARN="$(terraform -chdir=terraform output -raw alb_controller_role_arn)"
 DNS_ROLE_ARN="$(terraform -chdir=terraform output -raw external_dns_role_arn)"
+VPC_ID="$(terraform -chdir=terraform output -raw vpc_id)"
 
 echo "Cluster: $CLUSTER  Region: $REGION"
 
@@ -19,7 +20,9 @@ helm repo update >/dev/null
 echo "[1/3] AWS Load Balancer Controller"
 kubectl -n kube-system create serviceaccount aws-load-balancer-controller --dry-run=client -o yaml | kubectl apply -f -
 kubectl -n kube-system annotate serviceaccount aws-load-balancer-controller eks.amazonaws.com/role-arn="$ALB_ROLE_ARN" --overwrite
-helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller   -n kube-system   --set clusterName="$CLUSTER"   --set serviceAccount.create=false   --set serviceAccount.name=aws-load-balancer-controller
+# Region and VPC are passed in because pods can't read them from instance
+# metadata (the nodes' hop limit is 1)
+helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller   -n kube-system   --set clusterName="$CLUSTER"   --set region="$REGION"   --set vpcId="$VPC_ID"   --set serviceAccount.create=false   --set serviceAccount.name=aws-load-balancer-controller
 
 echo "[2/3] ExternalDNS (Route53)"
 kubectl -n kube-system create serviceaccount external-dns --dry-run=client -o yaml | kubectl apply -f -

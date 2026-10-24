@@ -8,6 +8,11 @@ locals {
 }
 
 resource "aws_s3_bucket" "cloudtrail" {
+  # Public access block, lifecycle and KMS encryption are the separate
+  # resources below; Checkov doesn't link them through count
+  #checkov:skip=CKV2_AWS_6:public access block is aws_s3_bucket_public_access_block.cloudtrail
+  #checkov:skip=CKV2_AWS_61:lifecycle is aws_s3_bucket_lifecycle_configuration.cloudtrail
+  #checkov:skip=CKV_AWS_145:SSE-KMS is aws_s3_bucket_server_side_encryption_configuration.cloudtrail
   count  = var.enable_cloudtrail ? 1 : 0
   bucket = "${var.name}-cloudtrail-${data.aws_caller_identity.current.account_id}"
 

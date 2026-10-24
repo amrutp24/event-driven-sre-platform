@@ -1,0 +1,47 @@
+# Checkov settings used by CI. Each skipped check is a decision for this repo,
+# with the reason next to it. False positives on a single resource are skipped
+# inline on that resource instead.
+compact: true
+soft-fail: true
+skip-download: true
+download-external-modules: true
+
+skip-check:
+  # The Lambdas are invoked synchronously (API Gateway, Step Functions), and a
+  # Lambda DLQ only applies to async invokes
+  - CKV_AWS_116
+  # alert_ingest only calls EventBridge, so it doesn't need to be in the VPC
+  - CKV_AWS_117
+  # The Lambda env vars are names and ARNs, nothing secret
+  - CKV_AWS_173
+  # No code signing; the Lambda zips are built from this repo
+  - CKV_AWS_272
+  # The webhook only takes POSTs, so there's nothing to cache
+  - CKV_AWS_120
+  - CKV_AWS_225
+  - CKV_AWS_308
+  # Callers authenticate with API keys rather than client certificates
+  - CKV2_AWS_51
+  # Replacing the REST API changes its URL either way
+  - CKV_AWS_237
+  # Registry modules are pinned by version
+  - CKV_TF_1
+  # The degraded-mode flag isn't a secret, so it's a plain String parameter
+  - CKV2_AWS_34
+  - CKV_AWS_337
+  # ECR uses AES256; the images aren't sensitive
+  - CKV_AWS_136
+  # CloudTrail goes to S3 only. CloudWatch Logs delivery and per-file SNS
+  # notifications cost extra and nothing here reads them.
+  - CKV2_AWS_10
+  - CKV_AWS_252
+  # No access logs, replication or event notifications on the trail bucket
+  - CKV_AWS_18
+  - CKV_AWS_144
+  - CKV2_AWS_62
+  # False positives in the EKS and VPC modules: all five control plane log
+  # types are on, 1.36 is a supported version, and the VPC module empties the
+  # default security group
+  - CKV_AWS_37
+  - CKV_AWS_339
+  - CKV2_AWS_12

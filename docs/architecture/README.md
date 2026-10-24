@@ -675,7 +675,9 @@ The alert pipeline line assumes 1000 webhook calls a day (30,000 a month), one a
 - ✅ Secrets: the only secrets are the webhook API keys, kept in a Kubernetes Secret that EKS encrypts. The SSM degraded flag is a plain String and isn't sensitive.
 - ✅ Container images: ECR scan on push and immutable tags, plus Trivy in CI
 - ✅ Network segmentation: private subnets for EKS and the remediation Lambda, S3 and DynamoDB gateway endpoints, optional interface endpoints (`enable_vpc_endpoints`) and an optional private webhook (`webhook_private`)
-- Not built yet: CloudFront and WAF in front of the ALB
+- ✅ VPC flow logs, encrypted and kept 30 days
+- ✅ Nodes require IMDSv2 with a hop limit of 1, so pods can't borrow the node's IAM role
+- Not built yet: CloudFront and WAF in front of the ALB. The EKS public endpoint is open to the internet unless `eks_public_access_cidrs` is set.
 
 ---
 
