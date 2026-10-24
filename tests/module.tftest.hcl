@@ -301,3 +301,55 @@ run "rejects_bad_inputs" {
     var.auto_remediate_severities,
   ]
 }
+
+run "no_notifications_by_default" {
+  command = plan
+
+  assert {
+    condition     = length(aws_sns_topic_subscription.email) == 0 && length(aws_sns_topic.chat) == 0 && length(aws_cloudwatch_event_target.to_chat) == 0
+    error_message = "Nothing should subscribe or publish to chat unless asked."
+  }
+}
+
+run "notifications" {
+  command = apply
+
+  variables {
+    notification_emails = ["oncall@example.com", "sre@example.com"]
+    chat_notifications  = true
+  }
+
+  assert {
+    condition     = length(aws_sns_topic_subscription.email) == 2 && aws_sns_topic_subscription.email["oncall@example.com"].protocol == "email"
+    error_message = "Each email should subscribe to the alerts topic."
+  }
+
+  assert {
+    condition     = length(aws_sns_topic.chat) == 1 && aws_sns_topic.chat[0].kms_master_key_id == aws_kms_key.platform[0].arn && output.chat_topic_arn == aws_sns_topic.chat[0].arn
+    error_message = "chat_notifications should create an encrypted chat topic and output it."
+  }
+
+  assert {
+    condition     = toset(keys(aws_cloudwatch_event_target.to_chat)) == toset(["created", "resolved", "escalated", "auto_resolved"])
+    error_message = "All four incident rules should feed the chat topic."
+  }
+
+  assert {
+    condition = (
+      jsondecode(aws_cloudwatch_event_target.to_chat["escalated"].input_transformer[0].input_template).source == "custom"
+      && strcontains(jsondecode(aws_cloudwatch_event_target.to_chat["escalated"].input_transformer[0].input_template).content.title, "<alertname>")
+      && strcontains(jsondecode(aws_cloudwatch_event_target.to_chat["escalated"].input_transformer[0].input_template).content.description, "<reason>")
+    )
+    error_message = "Chat messages should be custom notifications with plain <placeholders> for EventBridge."
+  }
+}
+
+run "rejects_bad_email" {
+  command = plan
+
+  variables {
+    notification_emails = ["not-an-email"]
+  }
+
+  expect_failures = [var.notification_emails]
+}

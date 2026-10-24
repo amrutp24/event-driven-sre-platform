@@ -137,3 +137,27 @@ variable "runbook_action_reserved_concurrency" {
   type        = number
   default     = -1
 }
+
+variable "notification_emails" {
+  description = "Email addresses for incident notifications; each gets an SNS confirmation email first"
+  type        = list(string)
+  default     = []
+}
+
+variable "slack_workspace_id" {
+  description = "Slack workspace (team) ID, the T... part of the channel URL in a browser. Set with slack_channel_id to get incidents in Slack."
+  type        = string
+  default     = null
+}
+
+variable "slack_channel_id" {
+  description = "Slack channel ID, the C... part of the channel URL in a browser"
+  type        = string
+  default     = null
+}
+
+variable "chatbot_region" {
+  description = "A region where Amazon Q Developer in chat applications has its API"
+  type        = string
+  default     = "us-east-2"
+}

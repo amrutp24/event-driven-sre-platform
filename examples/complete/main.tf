@@ -26,4 +26,8 @@ module "sre" {
   incidents_deletion_protection       = var.incidents_deletion_protection
   alert_ingest_reserved_concurrency   = var.alert_ingest_reserved_concurrency
   runbook_action_reserved_concurrency = var.runbook_action_reserved_concurrency
+
+  # Email straight from SNS; Slack through chatbot.tf
+  notification_emails = var.notification_emails
+  chat_notifications  = var.slack_workspace_id != null && var.slack_channel_id != null
 }

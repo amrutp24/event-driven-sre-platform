@@ -265,3 +265,20 @@ variable "webhook_private" {
   type        = bool
   default     = false
 }
+
+variable "notification_emails" {
+  description = "Email addresses subscribed to the alerts topic. Each one gets a confirmation email from SNS to accept first."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for e in var.notification_emails : can(regex("^[^@ ]+@[^@ ]+[.][^@ ]+$", e))])
+    error_message = "Each notification email must be an email address."
+  }
+}
+
+variable "chat_notifications" {
+  description = "Also publish incidents to a second topic in the format Amazon Q Developer in chat applications (AWS Chatbot) renders, for a Slack or Teams channel to subscribe to. See examples/complete/chatbot.tf."
+  type        = bool
+  default     = false
+}
