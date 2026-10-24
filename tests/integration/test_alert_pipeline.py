@@ -305,7 +305,7 @@ class TestCompleteAlertFlow:
         import io
         
         # Read actual handler
-        handler_path = '../../terraform/lambda/alert_ingest/handler.py'
+        handler_path = '../../lambda/alert_ingest/handler.py'
         with open(handler_path, 'r') as f:
             handler_code = f.read()
         

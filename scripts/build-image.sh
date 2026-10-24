@@ -5,8 +5,8 @@ set -euo pipefail
 # Tags are immutable, so each build is tagged with the short git SHA, or
 # $IMAGE_TAG if set. deploy.sh deploys the same tag.
 
-REPO="$(terraform -chdir=terraform output -raw checkout_image_repository)"
-REGION="$(terraform -chdir=terraform output -raw aws_region)"
+REPO="$(terraform -chdir=examples/complete output -raw checkout_image_repository)"
+REGION="$(terraform -chdir=examples/complete output -raw aws_region)"
 REGISTRY="${REPO%%/*}"
 
 if [ -z "${IMAGE_TAG:-}" ] && ! git diff --quiet HEAD -- apps/checkout; then

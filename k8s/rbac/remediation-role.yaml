@@ -1,12 +1,14 @@
 # What the runbook-action Lambda may do in the cluster.
 #
-# The Lambda calls the Kubernetes API as its IAM role. terraform/eks.tf gives
-# that role an EKS access entry in the "checkout-remediation" group, and these
-# bindings are the only things that group is granted. Applied by scripts/deploy.sh.
+# The Lambda calls the Kubernetes API as its IAM role. The module gives that
+# role an EKS access entry in the "sre-remediation" group (kubernetes_group),
+# and these bindings are the only things that group is granted. The Role and
+# RoleBinding are for the apps namespace; add a copy for each other namespace
+# in remediation_namespaces. Applied by scripts/deploy.sh.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: checkout-remediation
+  name: sre-remediation
   namespace: apps
 rules:
   # Read, scale and restart deployments
@@ -29,15 +31,15 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: checkout-remediation
+  name: sre-remediation
   namespace: apps
 subjects:
   - kind: Group
-    name: checkout-remediation
+    name: sre-remediation
     apiGroup: rbac.authorization.k8s.io
 roleRef:
   kind: Role
-  name: checkout-remediation
+  name: sre-remediation
   apiGroup: rbac.authorization.k8s.io
 ---
 # drain_node. Nodes are cluster-scoped and a node runs pods from every
@@ -47,7 +49,7 @@ roleRef:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: checkout-remediation-nodes
+  name: sre-remediation-nodes
 rules:
   # Check the node's labels and readiness, then cordon it
   - apiGroups: [""]
@@ -64,12 +66,12 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: checkout-remediation-nodes
+  name: sre-remediation-nodes
 subjects:
   - kind: Group
-    name: checkout-remediation
+    name: sre-remediation
     apiGroup: rbac.authorization.k8s.io
 roleRef:
   kind: ClusterRole
-  name: checkout-remediation-nodes
+  name: sre-remediation-nodes
   apiGroup: rbac.authorization.k8s.io

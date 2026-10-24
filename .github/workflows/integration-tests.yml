@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 env:
-  TF_VAR_FILE: terraform/ci.tfvars
+  TF_VAR_FILE: examples/complete/ci.tfvars
 
 jobs:
   terraform-security-scan:
@@ -24,11 +24,13 @@ jobs:
       # Settings and skipped checks (with reasons) are in .checkov.yaml.
       # soft-fail keeps failed checks from failing the job, but a Checkov
       # error still does. pipefail (shell: bash) keeps tee from hiding it.
+      # The module is the repo root; the example is scanned on its own.
       - name: Run Checkov locally
         shell: bash
         run: |
           mkdir -p reports
-          checkov --config-file .checkov.yaml -d terraform/ --var-file ${{ env.TF_VAR_FILE }} | tee reports/checkov-results.txt
+          checkov --config-file .checkov.yaml -d . --framework terraform --skip-path examples | tee reports/checkov-module.txt
+          checkov --config-file .checkov.yaml -d examples/complete --var-file ${{ env.TF_VAR_FILE }} | tee reports/checkov-complete.txt
 
       - name: Upload Checkov results
         uses: actions/upload-artifact@v4
@@ -81,7 +83,7 @@ jobs:
 
       - name: Install test dependencies
         run: |
-          cd terraform/lambda/${{ matrix.lambda }}
+          cd lambda/${{ matrix.lambda }}
           pip install -r requirements-dev.txt
 
       - name: Run unit tests with moto mocks
@@ -93,7 +95,7 @@ jobs:
           MAX_REPLICAS: "10"
           DEGRADED_PARAM: /checkout/degraded_mode
         run: |
-          cd terraform/lambda/${{ matrix.lambda }}
+          cd lambda/${{ matrix.lambda }}
           pytest tests/ -v --cov --cov-report=xml --cov-report=html --junitxml=test-results.xml
 
       - name: Upload coverage reports
@@ -102,9 +104,9 @@ jobs:
         with:
           name: ${{ matrix.lambda }}-coverage
           path: |
-            terraform/lambda/${{ matrix.lambda }}/coverage.xml
-            terraform/lambda/${{ matrix.lambda }}/htmlcov/
-            terraform/lambda/${{ matrix.lambda }}/test-results.xml
+            lambda/${{ matrix.lambda }}/coverage.xml
+            lambda/${{ matrix.lambda }}/htmlcov/
+            lambda/${{ matrix.lambda }}/test-results.xml
           retention-days: 30
 
   # Runs both state machine templates through a local simulator, with the
@@ -122,11 +124,11 @@ jobs:
 
       - name: Install test dependencies
         run: |
-          pip install -r terraform/stepfunctions/tests/requirements.txt
+          pip install -r stepfunctions/tests/requirements.txt
 
       - name: Run state machine tests
         run: |
-          cd terraform/stepfunctions
+          cd stepfunctions
           pytest tests/ -v --junitxml=test-results.xml
 
       - name: Upload test results
@@ -134,7 +136,7 @@ jobs:
         if: always()
         with:
           name: stepfunctions-test-results
-          path: terraform/stepfunctions/test-results.xml
+          path: stepfunctions/test-results.xml
           retention-days: 30
 
   infrastructure-tests:
@@ -148,28 +150,20 @@ jobs:
         with:
           terraform_version: "1.5.7"
 
-      - name: Disable production backend
-        run: |
-          cd terraform
-          # Rename production backend to disable it for CI
-          mv backend.tf backend.tf.backup 2>/dev/null || true
-          
-      - name: Terraform init (local backend)
-        run: |
-          cd terraform
-          terraform init -input=false -backend=false
-
       - name: Terraform fmt check
         run: |
-          cd terraform
-          terraform fmt -check -diff
+          terraform fmt -check -recursive -diff
 
-      - name: Terraform validate (local backend)
-        env:
-          TF_VAR_file: terraform/ci.tfvars
+      # The module is the repo root; each example calls it with source = "../.."
+      - name: Terraform validate (module and examples)
+        shell: bash
         run: |
-          cd terraform
-          terraform validate -no-color
+          for dir in . examples/complete examples/existing-cluster; do
+            echo "::group::$dir"
+            terraform -chdir="$dir" init -input=false -backend=false
+            terraform -chdir="$dir" validate -no-color
+            echo "::endgroup::"
+          done
 
       - name: Install tflint
         run: |
@@ -177,12 +171,11 @@ jobs:
           unzip tflint.zip
           sudo mv tflint /usr/local/bin/
 
+      # --force reports issues without failing the job; a tflint error still fails it
       - name: Run tflint
-        env:
-          TF_VAR_file: terraform/ci.tfvars
         run: |
-          cp .tflint.hcl terraform/
-          tflint --var-file=terraform/ci.tfvars terraform/ || true
+          tflint --chdir=. --config="$PWD/.tflint.hcl" --force
+          tflint --chdir=examples/complete --config="$PWD/.tflint.hcl" --var-file=ci.tfvars --force
 
   application-tests:
     runs-on: ubuntu-latest

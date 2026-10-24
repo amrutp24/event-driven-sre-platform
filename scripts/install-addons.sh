@@ -4,11 +4,11 @@ set -euo pipefail
 # Installs AWS Load Balancer Controller, ExternalDNS, and cert-manager.
 # Uses IRSA roles created by Terraform (annotates service accounts).
 
-CLUSTER="$(terraform -chdir=terraform output -raw eks_cluster_name)"
-REGION="$(terraform -chdir=terraform output -raw aws_region)"
-ALB_ROLE_ARN="$(terraform -chdir=terraform output -raw alb_controller_role_arn)"
-DNS_ROLE_ARN="$(terraform -chdir=terraform output -raw external_dns_role_arn)"
-VPC_ID="$(terraform -chdir=terraform output -raw vpc_id)"
+CLUSTER="$(terraform -chdir=examples/complete output -raw eks_cluster_name)"
+REGION="$(terraform -chdir=examples/complete output -raw aws_region)"
+ALB_ROLE_ARN="$(terraform -chdir=examples/complete output -raw alb_controller_role_arn)"
+DNS_ROLE_ARN="$(terraform -chdir=examples/complete output -raw external_dns_role_arn)"
+VPC_ID="$(terraform -chdir=examples/complete output -raw vpc_id)"
 
 echo "Cluster: $CLUSTER  Region: $REGION"
 

@@ -4,6 +4,8 @@
 
 This document provides a comprehensive view of the event-driven SRE platform architecture, showing how alerts flow through the system from detection to automated remediation.
 
+The alert pipeline (webhook, Lambdas, EventBridge, Step Functions, DynamoDB, SNS, KMS) is the Terraform module at the repo root. The VPC, EKS cluster, IRSA roles, ECR, CloudTrail and VPC endpoints come from `examples/complete`, which calls the module.
+
 ## Table of Contents
 
 1. [High-Level Architecture](#high-level-architecture)
@@ -231,7 +233,7 @@ sequenceDiagram
     SF->>DDB: UpdateItem: claim the incident<br/>status=remediating, only if not claimed yet
     SF->>SF: Choose action from the alert name<br/>CheckoutHighErrorRate is degrade_or_scale
     SF->>L2: Invoke: {action: degrade_or_scale, namespace: apps,<br/>deployment: checkout, replicas: 4}
-    L2->>K8s: Authenticate with an EKS token<br/>Access entry: checkout-remediation group
+    L2->>K8s: Authenticate with an EKS token<br/>Access entry: sre-remediation group
     L2->>SSM: PutParameter: /checkout/degraded_mode=true
     SSM-->>L2: Success
     L2->>K8s: Get HPA apps/checkout
@@ -281,14 +283,14 @@ graph TB
     end
 
     subgraph "EKS Access Entry"
-        AE[Access entry<br/>Principal: runbook_action Lambda Role<br/>Kubernetes group: checkout-remediation]
+        AE[Access entry<br/>Principal: runbook_action Lambda Role<br/>Kubernetes group: sre-remediation]
     end
 
     subgraph "Kubernetes RBAC"
-        Role[Role: checkout-remediation<br/>Namespace: apps<br/>Permissions:<br/>- get/list/patch deployments<br/>- get/patch horizontalpodautoscalers<br/>- get/list pods]
-        RB[RoleBinding<br/>Group checkout-remediation -> Role]
-        CRole[ClusterRole: checkout-remediation-nodes<br/>Permissions:<br/>- get/list/patch nodes<br/>- list pods<br/>- create pods/eviction]
-        CRB[ClusterRoleBinding<br/>Group checkout-remediation -> ClusterRole]
+        Role[Role: sre-remediation<br/>Namespace: apps<br/>Permissions:<br/>- get/list/patch deployments<br/>- get/patch horizontalpodautoscalers<br/>- get/list pods]
+        RB[RoleBinding<br/>Group sre-remediation -> Role]
+        CRole[ClusterRole: sre-remediation-nodes<br/>Permissions:<br/>- get/list/patch nodes<br/>- list pods<br/>- create pods/eviction]
+        CRB[ClusterRoleBinding<br/>Group sre-remediation -> ClusterRole]
     end
 
     subgraph "Network Security"
@@ -299,7 +301,7 @@ graph TB
     end
 
     subgraph "Data Security"
-        KMS[Platform KMS key, rotated yearly<br/>Encrypts:<br/>- incidents table<br/>- SNS topic and the DLQ<br/>- platform log groups<br/>- CloudTrail bucket and trail]
+        KMS[Platform KMS key, rotated yearly<br/>Encrypts:<br/>- incidents table<br/>- SNS topic and the DLQ<br/>- platform log groups<br/>- CloudTrail bucket and trail,<br/>complete example only]
         EKSKMS[EKS module KMS key<br/>Encrypts Kubernetes secrets,<br/>the webhook API key included]
         Trail[CloudTrail<br/>Multi-region, management events<br/>Log file validation]
         SSM_Flag[SSM /checkout/degraded_mode<br/>String parameter, not a secret]
@@ -432,7 +434,7 @@ graph TB
   kubectl patch hpa checkout -n apps --type merge -p '{"spec":{"minReplicas":3}}'
   kubectl uncordon NODE_NAME   # after a drain, once the node is healthy
   ```
-- Kubernetes access: an EKS access entry maps its IAM role to the `checkout-remediation` group (IRSA only applies to pods)
+- Kubernetes access: an EKS access entry maps its IAM role to the `sre-remediation` group (IRSA only applies to pods)
 - RBAC: a Role in `apps` for deployments and HPAs, and a ClusterRole for nodes, listing pods and creating evictions. Nodes are cluster-scoped and a node runs pods from every namespace, so draining can't be done with a namespaced Role. There's no permission to delete pods.
 
 ### 5. Storage & Notification Layer
@@ -625,6 +627,8 @@ graph TB
 ## Cost Optimization
 
 ### Monthly Cost Estimate
+
+This is for `examples/complete`. The module on its own is the alert pipeline and KMS key lines.
 
 `us-east-1` on-demand prices, running all month with the default variables, before free tiers. The cluster is nearly all of it; the alert pipeline is small even at 1000 alerts a day.
 

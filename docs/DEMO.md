@@ -22,7 +22,7 @@ aws sts get-caller-identity
 kubectl cluster-info
 
 # 3. Terraform outputs available
-terraform -chdir=terraform output
+terraform -chdir=examples/complete output
 
 # 4. Required CLI tools installed
 which kubectl helm aws jq curl docker git
@@ -31,8 +31,7 @@ which kubectl helm aws jq curl docker git
 #    the image tagged with the short git SHA, and deploy.sh deploys that tag.
 bash scripts/build-image.sh
 bash scripts/deploy.sh
-kubectl get deployment checkout -n apps -o jsonpath='{.spec.template.spec.containers[0].image}{"
-"}'
+kubectl get deployment checkout -n apps -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
 ```
 
 Expected: All commands succeed without errors, and the image is `ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/event-driven-sre/checkout:<git sha>`. Tags are immutable, so build again after committing changes to `apps/checkout`; to build uncommitted changes, set the same `IMAGE_TAG` for both scripts.
@@ -52,7 +51,7 @@ Expected: All commands succeed without errors, and the image is `ACCOUNT_ID.dkr.
 ### Step 2: Get Important URLs
 
 ```bash
-cd terraform
+cd examples/complete
 
 # Get API Gateway webhook URL
 terraform output -raw alert_webhook_url
@@ -187,7 +186,7 @@ aws logs tail /aws/events/event-driven-sre --since 10m
 
 # The runbook execution
 aws stepfunctions list-executions \
-  --state-machine-arn "$(terraform -chdir=terraform output -raw step_functions_arn)" \
+  --state-machine-arn "$(terraform -chdir=examples/complete output -raw step_functions_arn)" \
   --max-results 1 \
   --query 'executions[0].[name,status,startDate]' \
   --output table
@@ -320,7 +319,7 @@ Swap `resolved` for `open`, `remediating` or `escalated` to list those instead.
 
 # Check Step Functions execution completed
 aws stepfunctions list-executions \
-  --state-machine-arn "$(terraform -chdir=terraform output -raw step_functions_arn)" \
+  --state-machine-arn "$(terraform -chdir=examples/complete output -raw step_functions_arn)" \
   --max-results 1 \
   --query 'executions[0].status' \
   --output text
@@ -330,7 +329,7 @@ aws stepfunctions list-executions \
 # Check SNS notification sent (subscribe an email before the demo with
 # aws sns subscribe --protocol email --notification-endpoint you@example.com --topic-arn ...)
 aws sns list-subscriptions-by-topic \
-  --topic-arn "$(terraform -chdir=terraform output -raw sns_topic_arn)" \
+  --topic-arn "$(terraform -chdir=examples/complete output -raw sns_topic_arn)" \
   --query 'Subscriptions[0].Endpoint'
 ```
 
@@ -457,8 +456,8 @@ kubectl get secret -n monitoring alertmanager-mon-kube-prometheus-stack-alertman
 # Verify: webhook_configs contains correct URL
 
 # Test webhook manually. A warning only notifies, so nothing in the cluster changes.
-WEBHOOK_URL=$(terraform -chdir=terraform output -raw alert_webhook_url)
-API_KEY=$(terraform -chdir=terraform output -raw alertmanager_api_key)
+WEBHOOK_URL=$(terraform -chdir=examples/complete output -raw alert_webhook_url)
+API_KEY=$(terraform -chdir=examples/complete output -raw alertmanager_api_key)
 
 curl -X POST "$WEBHOOK_URL" \
   -H "X-API-Key: $API_KEY" \
@@ -497,15 +496,15 @@ aws logs tail /aws/events/event-driven-sre --since 30m
 
 # Events EventBridge couldn't deliver end up here
 aws sqs get-queue-attributes --attribute-names ApproximateNumberOfMessages \
-  --queue-url "$(terraform -chdir=terraform output -raw events_dlq_url)"
+  --queue-url "$(terraform -chdir=examples/complete output -raw events_dlq_url)"
 ```
 
 An execution that starts and stops at `NotAutoRemediated` means the alert wasn't critical or was annotated `runbook_action: notify_only`. One that stops at `AlreadyHandled` means another run already claimed the incident, or it had already resolved.
 
 **Fix**: If IAM error, check EventBridge execution role:
 ```bash
-cd terraform
-terraform plan -target=aws_iam_role.events_invoke
+cd examples/complete
+terraform plan -target=module.sre.aws_iam_role.events_invoke
 # Verify: Role has states:StartExecution permission
 ```
 
@@ -542,9 +541,9 @@ aws lambda invoke \
 
 **Fix**: If RBAC error, verify the access entry, Role and RoleBinding:
 ```bash
-aws eks list-access-entries --cluster-name "$(terraform -chdir=terraform output -raw eks_cluster_name)"
-kubectl get role,rolebinding -n apps checkout-remediation
-kubectl auth can-i patch deployments -n apps --as=runbook-action --as-group=checkout-remediation
+aws eks list-access-entries --cluster-name "$(terraform -chdir=examples/complete output -raw eks_cluster_name)"
+kubectl get role,rolebinding -n apps sre-remediation
+kubectl auth can-i patch deployments -n apps --as=runbook-action --as-group=sre-remediation
 ```
 
 ---
@@ -569,7 +568,7 @@ kubectl get sa checkout -n apps -o jsonpath='{.metadata.annotations.eks\.amazona
 kubectl describe pod -n apps -l app=checkout | grep -i "AWS_ROLE_ARN"
 ```
 
-**Fix**: The role ARN should match `terraform -chdir=terraform output -raw checkout_role_arn`. If it's missing or different, re-run `scripts/deploy.sh`, which passes it to the chart, then restart the pods so they get the new credentials:
+**Fix**: The role ARN should match `terraform -chdir=examples/complete output -raw checkout_role_arn`. If it's missing or different, re-run `scripts/deploy.sh`, which passes it to the chart, then restart the pods so they get the new credentials:
 ```bash
 kubectl rollout restart deployment/checkout -n apps
 ```
@@ -595,8 +594,8 @@ kubectl set env deployment/checkout -n apps \
 A critical alert with no runbook is escalated right after it's logged:
 
 ```bash
-WEBHOOK_URL=$(terraform -chdir=terraform output -raw alert_webhook_url)
-API_KEY=$(terraform -chdir=terraform output -raw alertmanager_api_key)
+WEBHOOK_URL=$(terraform -chdir=examples/complete output -raw alert_webhook_url)
+API_KEY=$(terraform -chdir=examples/complete output -raw alertmanager_api_key)
 
 curl -X POST "$WEBHOOK_URL" -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
   -d '{"alerts": [{"status": "firing",
@@ -729,7 +728,7 @@ kubectl port-forward -n apps svc/checkout 8080:80
 
 **Terraform Outputs**:
 ```bash
-cd terraform
+cd examples/complete
 terraform output alert_webhook_url
 terraform output sns_topic_arn
 terraform output step_functions_arn
