@@ -117,6 +117,8 @@ All IAM roles and policies follow the principle of least privilege—granting on
 
 **Note**: The actual Kubernetes access is controlled by RBAC (see below), not IAM. The role also has the AWS-managed `AWSLambdaVPCAccessExecutionRole` policy so the Lambda can run in the private subnets.
 
+**Input checks**: the Lambda only runs what the state machine sends it, and checks that first. It raises `InvalidRequest` for an action other than `degrade`, `restart`, `scale` or `degrade_or_scale`, a namespace that isn't in `ALLOWED_NAMESPACES` (`apps`), a deployment name that isn't a valid Kubernetes name, or replicas outside 1 to `MAX_REPLICAS` (`remediation_max_replicas`, default 10). The state machine doesn't retry `InvalidRequest`; it escalates the incident instead. So an alert can't point the Lambda at another namespace or scale a deployment without limit, even though the target comes from the alert's labels.
+
 ### Step Functions Execution Role
 
 **Purpose**: Orchestrate runbook workflow and invoke Lambda functions
@@ -147,7 +149,7 @@ All IAM roles and policies follow the principle of least privilege—granting on
     },
     {
       "Effect": "Allow",
-      "Action": ["dynamodb:UpdateItem"],
+      "Action": ["dynamodb:UpdateItem", "dynamodb:GetItem"],
       "Resource": "arn:aws:dynamodb:REGION:ACCOUNT_ID:table/PLATFORM_NAME-incidents"
     },
     {
@@ -162,14 +164,14 @@ All IAM roles and policies follow the principle of least privilege—granting on
 **Why This Is Secure**:
 - ✅ CloudWatch Logs permissions required for Step Functions logging (cannot be scoped further)
 - ✅ Only invoke specific Lambda function (not all functions)
-- ✅ `UpdateItem` on the incidents table only, used to claim an incident before remediating it
-- ✅ `PutEvents` on the platform's bus only, for `action.completed`
+- ✅ `UpdateItem` and `GetItem` on the incidents table only: to claim an incident, check whether it resolved, and mark it resolved or escalated. No scans, queries or deletes.
+- ✅ `PutEvents` on the platform's bus only, for `action.completed`, `incident.auto_resolved` and `incident.escalated`
 
 ### Incident Recorder Role
 
 **Purpose**: The `incident-recorder` Express state machine writes incident events to DynamoDB.
 
-**Permissions**: `dynamodb:UpdateItem` on `PLATFORM_NAME-incidents`, nothing else. It can't read or delete records.
+**Permissions**: `dynamodb:UpdateItem` on `PLATFORM_NAME-incidents`, plus the same log delivery permissions as the runbook role so it can log failed writes. It can't read or delete records.
 
 ### EventBridge Target Role
 
@@ -181,8 +183,8 @@ The other targets grant EventBridge access through resource policies, each limit
 
 | Resource | Allows `events.amazonaws.com` to | Limited to |
 | --- | --- | --- |
-| SNS topic `PLATFORM_NAME-alerts` | `sns:Publish` | the `incident-created` and `incident-resolved` rules |
-| SQS queue `PLATFORM_NAME-events-dlq` | `sqs:SendMessage` | the platform's four rules |
+| SNS topic `PLATFORM_NAME-alerts` | `sns:Publish` | the `incident-created`, `incident-resolved`, `incident-escalated` and `incident-auto-resolved` rules |
+| SQS queue `PLATFORM_NAME-events-dlq` | `sqs:SendMessage` | the platform's six rules |
 | Log group `/aws/events/PLATFORM_NAME` | `logs:CreateLogStream`, `logs:PutLogEvents` | that log group |
 
 ---
@@ -381,6 +383,8 @@ All data stores are encrypted using AWS KMS:
 | **EKS Secrets** | Enabled | Customer managed key (recommended) |
 | **SSM Parameter Store** | Enabled (SecureString) | AWS managed key or customer managed key |
 
+Today the incidents table uses DynamoDB's default AWS owned key, with point-in-time recovery and deletion protection on. The customer managed key below is still to come.
+
 **Configuration Example (Terraform)**:
 ```hcl
 resource "aws_kms_key" "sre_platform" {
@@ -473,10 +477,14 @@ All network traffic is encrypted:
 **Log Groups**:
 - `/aws/lambda/PLATFORM_NAME-alert-ingest`
 - `/aws/lambda/PLATFORM_NAME-runbook-action`
-- `/aws/states/PLATFORM_NAME-runbook` (Step Functions execution logs)
+- `/aws/vendedlogs/states/PLATFORM_NAME-runbook` (every runbook state's input and output)
+- `/aws/vendedlogs/states/PLATFORM_NAME-incident-recorder` (failed incident writes)
+- `/aws/events/PLATFORM_NAME` (every event on the bus)
 - `/aws/eks/CLUSTER_NAME/cluster` (EKS control plane logs)
 
-**Retention**: 30 days (configurable, consider cost vs compliance requirements)
+**Retention**: 30 days for the state machine and event logs (configurable, consider cost vs compliance requirements)
+
+Both state machines log execution data, so these log groups hold alert payloads: labels, annotations, and the action results. Alerts carry no secrets, and the webhook API keys never reach the state machines, but treat the log groups like the incident table when granting read access.
 
 **Metric Filters**:
 - Extract custom metrics (e.g., remediation success rate, alert volume)
@@ -485,16 +493,17 @@ All network traffic is encrypted:
 ### DynamoDB Incident History
 
 Every incident is logged with:
-- **incident_id**: Unique identifier (UUID)
-- **timestamp**: When alert fired (ISO 8601)
-- **alert_name**: Name of the alert (e.g., `CheckoutHighErrorRate`)
+- **incident_id**: Unique identifier (UUID, derived from the alert so a firing alert and its resolution share it)
+- **first_seen_at**, **last_seen_at**: When the platform first and last received the alert (ISO 8601)
+- **alertname**: Name of the alert (e.g., `CheckoutHighErrorRate`)
 - **severity**: `critical`, `warning`, `info`
 - **status**: `open`, `remediating`, `resolved`, `escalated`
-- **labels**: Prometheus labels (service, namespace, etc.)
-- **actions_taken**: List of remediation actions executed
-- **resolved_at**: Timestamp when alert resolved (Unix epoch)
+- **payload**: The full normalized alert as JSON, Prometheus labels included (service, namespace, etc.)
+- **actions_taken**: List of remediation actions executed, with their result and the execution that ran them
+- **resolved_at**: When the alert resolved (ISO 8601)
+- **remediation_result**, **mttr_seconds**, **escalation_reason**: How the runbook ended
 
-**Retention**: 90 days (TTL enabled), then auto-deleted
+**Retention**: 90 days after the incident's last activity (TTL on `expires_at`), then auto-deleted. Point-in-time recovery is on, and deletion protection stops the table being deleted by accident, `terraform destroy` included.
 
 **Use Cases**:
 - **Analytics**: MTTR trends, incident frequency by service
@@ -612,7 +621,8 @@ Use this checklist before deploying to production:
 - ✅ API Gateway validates JSON schema (reject malformed requests)
 - ✅ alert_ingest Lambda validates alert structure and source
 - ✅ RBAC limits Lambda to patch deployments only (cannot delete)
-- ✅ Step Functions workflow includes human approval for risky actions (optional)
+- ✅ The state machine only runs four known actions, and the Lambda rejects other namespaces, invalid deployment names and replica counts over `MAX_REPLICAS`
+- ✅ An incident is remediated once, however many times the alert is sent
 - ✅ API Gateway throttling prevents alert flood
 
 **Residual Risk**: Low (requires bypassing multiple validation layers)
@@ -668,7 +678,7 @@ Use this checklist before deploying to production:
 **Impact**: Exposure of incident details, alert patterns, service topology
 
 **Mitigations**:
-- ✅ IAM policies prevent read access (only alert_ingest Lambda can write)
+- ✅ IAM policies prevent read access (only the incident recorder and the runbook state machine can write, and the runbook can only read single items)
 - ✅ DynamoDB encrypted at rest
 - ✅ VPC endpoint for DynamoDB (traffic stays on AWS network)
 - ✅ CloudTrail logs all DynamoDB API calls

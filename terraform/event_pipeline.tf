@@ -1,11 +1,45 @@
+# One item per incident. incident_id is deterministic (see alert_ingest), so it
+# already identifies a single occurrence and needs no sort key.
 resource "aws_dynamodb_table" "incidents" {
   name         = "${var.name}-incidents"
   billing_mode = "PAY_PER_REQUEST"
   hash_key     = "incident_id"
+
+  # scripts/destroy.sh turns this off before tearing down
+  deletion_protection_enabled = var.incidents_deletion_protection
+
   attribute {
     name = "incident_id"
     type = "S"
   }
+  attribute {
+    name = "status"
+    type = "S"
+  }
+  attribute {
+    name = "first_seen_at"
+    type = "S"
+  }
+
+  # Open or escalated incidents, newest first
+  global_secondary_index {
+    name            = "by-status"
+    hash_key        = "status"
+    range_key       = "first_seen_at"
+    projection_type = "ALL"
+  }
+
+  point_in_time_recovery {
+    enabled = true
+  }
+
+  # Set by the incident recorder: last activity + incident_retention_days
+  ttl {
+    attribute_name = "expires_at"
+    enabled        = true
+  }
+
+  tags = var.tags
 }
 
 resource "aws_sns_topic" "alerts" {
@@ -76,13 +110,13 @@ resource "aws_iam_role_policy" "sfn_policy" {
         Resource = "*"
       },
       {
-        # ClaimIncident: one remediation run per incident
+        # LogIncident, MarkResolved and Escalate write; VerifyResolution reads
         Effect   = "Allow",
-        Action   = ["dynamodb:UpdateItem"],
+        Action   = ["dynamodb:UpdateItem", "dynamodb:GetItem"],
         Resource = aws_dynamodb_table.incidents.arn
       },
       {
-        # ReportCompleted / ReportFailed: action.completed events
+        # action.completed, incident.auto_resolved, incident.escalated
         Effect   = "Allow",
         Action   = ["events:PutEvents"],
         Resource = aws_cloudwatch_event_bus.sre.arn
@@ -91,14 +125,48 @@ resource "aws_iam_role_policy" "sfn_policy" {
   })
 }
 
+locals {
+  # What the runbook targets when the alert doesn't name a namespace or deployment
+  remediation_namespace  = "apps"
+  remediation_deployment = "checkout"
+
+  # Checks after the stabilization wait, one every verify_poll_seconds, until
+  # verify_timeout_seconds after the action
+  verify_attempts = floor(max(var.verify_timeout_seconds - var.stabilization_seconds, 0) / var.verify_poll_seconds) + 1
+}
+
+resource "aws_cloudwatch_log_group" "runbook" {
+  name              = "/aws/vendedlogs/states/${var.name}-runbook"
+  retention_in_days = 30
+  tags              = var.tags
+}
+
 resource "aws_sfn_state_machine" "runbook" {
   name     = "${var.name}-runbook"
   role_arn = aws_iam_role.sfn_role.arn
   definition = templatefile("${path.module}/stepfunctions/runbook.asl.json", {
-    table_name         = aws_dynamodb_table.incidents.name
-    runbook_action_arn = aws_lambda_function.runbook_action.arn
-    event_bus_name     = aws_cloudwatch_event_bus.sre.name
+    table_name                = aws_dynamodb_table.incidents.name
+    runbook_action_arn        = aws_lambda_function.runbook_action.arn
+    event_bus_name            = aws_cloudwatch_event_bus.sre.name
+    auto_remediate_severities = join(", ", formatlist("'%s'", var.auto_remediate_severities))
+    default_namespace         = local.remediation_namespace
+    default_deployment        = local.remediation_deployment
+    default_replicas          = 4
+    stabilization_seconds     = var.stabilization_seconds
+    verify_poll_seconds       = var.verify_poll_seconds
+    verify_attempts           = local.verify_attempts
   })
+
+  logging_configuration {
+    log_destination        = "${aws_cloudwatch_log_group.runbook.arn}:*"
+    include_execution_data = true
+    level                  = "ALL"
+  }
+
+  # The role needs its log delivery permissions before logging can be set up
+  depends_on = [aws_iam_role_policy.sfn_policy]
+
+  tags = var.tags
 }
 
 resource "aws_lambda_function" "alert_ingest" {
@@ -213,11 +281,11 @@ resource "aws_lambda_function" "runbook_action" {
 
   environment {
     variables = {
-      REGION            = var.aws_region
-      CLUSTER_NAME      = var.eks_cluster_name
-      TARGET_NAMESPACE  = "apps"
-      TARGET_DEPLOYMENT = "checkout"
-      DEGRADED_PARAM    = aws_ssm_parameter.checkout_degraded_mode.name
+      REGION             = var.aws_region
+      CLUSTER_NAME       = var.eks_cluster_name
+      ALLOWED_NAMESPACES = local.remediation_namespace
+      MAX_REPLICAS       = var.remediation_max_replicas
+      DEGRADED_PARAM     = aws_ssm_parameter.checkout_degraded_mode.name
     }
   }
 }

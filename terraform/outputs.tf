@@ -69,6 +69,16 @@ output "incident_recorder_arn" {
   value       = aws_sfn_state_machine.incident_recorder.arn
 }
 
+output "runbook_log_group" {
+  description = "Runbook execution logs, including state input and output"
+  value       = aws_cloudwatch_log_group.runbook.name
+}
+
+output "incident_recorder_log_group" {
+  description = "Incident recorder failures. Express workflows have no execution history, so this is where they show up."
+  value       = aws_cloudwatch_log_group.incident_recorder.name
+}
+
 output "incidents_table" {
   value = aws_dynamodb_table.incidents.name
 }

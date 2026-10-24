@@ -32,12 +32,16 @@ spec:
         summary: "Checkout p95 latency > 1s (5m)"
         runbook: "stepfunctions:RunbookCheckoutDegradeOrScale"
 
+    # Only checkout's own targets. absent() covers every pod being gone,
+    # when there's no up series left to be 0.
     - alert: CheckoutDown
-      expr: up == 0
+      expr: |
+        sum(up{namespace="apps", job="checkout"}) == 0
+        or absent(up{namespace="apps", job="checkout"})
       for: 2m
       labels:
         severity: critical
         service: checkout
       annotations:
-        summary: "Prometheus target down"
+        summary: "Prometheus can't scrape any checkout pod"
         runbook: "stepfunctions:RunbookCheckoutRestart"

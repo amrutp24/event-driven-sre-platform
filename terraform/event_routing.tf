@@ -1,10 +1,12 @@
 # EventBridge as the central bus. alert_ingest only puts events on the bus;
 # these rules decide where each one goes.
 #
-#   incident.created   -> incident recorder (DynamoDB), SNS, runbook
-#   incident.resolved  -> incident recorder (DynamoDB), SNS
-#   action.completed   -> incident recorder (DynamoDB)
-#   every sre.* event  -> CloudWatch Logs
+#   incident.created        -> incident recorder (DynamoDB), SNS, runbook
+#   incident.resolved       -> incident recorder (DynamoDB), SNS
+#   action.completed        -> incident recorder (DynamoDB)
+#   incident.escalated      -> SNS
+#   incident.auto_resolved  -> SNS
+#   every sre.* event       -> CloudWatch Logs
 #
 # DynamoDB isn't an EventBridge target, so an Express state machine (the
 # incident recorder) does the writes.
@@ -50,6 +52,28 @@ resource "aws_cloudwatch_event_rule" "action_completed" {
   event_pattern = jsonencode({
     source        = ["sre.runbook"]
     "detail-type" = ["action.completed"]
+  })
+  tags = var.tags
+}
+
+resource "aws_cloudwatch_event_rule" "incident_escalated" {
+  name           = "${var.name}-incident-escalated"
+  description    = "The runbook handed the incident to a person"
+  event_bus_name = aws_cloudwatch_event_bus.sre.name
+  event_pattern = jsonencode({
+    source        = ["sre.runbook"]
+    "detail-type" = ["incident.escalated"]
+  })
+  tags = var.tags
+}
+
+resource "aws_cloudwatch_event_rule" "incident_auto_resolved" {
+  name           = "${var.name}-incident-auto-resolved"
+  description    = "The alert resolved after the runbook's action"
+  event_bus_name = aws_cloudwatch_event_bus.sre.name
+  event_pattern = jsonencode({
+    source        = ["sre.runbook"]
+    "detail-type" = ["incident.auto_resolved"]
   })
   tags = var.tags
 }
@@ -131,6 +155,43 @@ resource "aws_cloudwatch_event_target" "to_sns" {
   }
 }
 
+resource "aws_cloudwatch_event_target" "runbook_outcome_to_sns" {
+  for_each = {
+    escalated = {
+      rule     = aws_cloudwatch_event_rule.incident_escalated.name
+      template = "\"[ESCALATED] <service> - <alertname> needs a person: <reason> (incident <incident>)\""
+      paths    = { reason = "$.detail.reason" }
+    }
+    auto_resolved = {
+      rule     = aws_cloudwatch_event_rule.incident_auto_resolved.name
+      template = "\"[AUTO-RESOLVED] <service> - <alertname> recovered after <action>, <mttr>s after it was first seen (incident <incident>)\""
+      paths    = { action = "$.detail.action", mttr = "$.detail.mttr_seconds" }
+    }
+  }
+
+  rule           = each.value.rule
+  event_bus_name = aws_cloudwatch_event_bus.sre.name
+  target_id      = "sns"
+  arn            = aws_sns_topic.alerts.arn
+
+  input_transformer {
+    input_paths = merge({
+      service   = "$.detail.service"
+      alertname = "$.detail.alertname"
+      incident  = "$.detail.incident_id"
+    }, each.value.paths)
+    input_template = each.value.template
+  }
+
+  retry_policy {
+    maximum_event_age_in_seconds = local.target_retry.maximum_event_age_in_seconds
+    maximum_retry_attempts       = local.target_retry.maximum_retry_attempts
+  }
+  dead_letter_config {
+    arn = aws_sqs_queue.events_dlq.arn
+  }
+}
+
 resource "aws_cloudwatch_event_target" "resolved_to_recorder" {
   rule           = aws_cloudwatch_event_rule.incident_resolved.name
   event_bus_name = aws_cloudwatch_event_bus.sre.name
@@ -197,12 +258,29 @@ resource "aws_iam_role_policy" "incident_recorder" {
   role = aws_iam_role.incident_recorder.id
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Effect   = "Allow"
-      Action   = ["dynamodb:UpdateItem"]
-      Resource = aws_dynamodb_table.incidents.arn
-    }]
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["dynamodb:UpdateItem"]
+        Resource = aws_dynamodb_table.incidents.arn
+      },
+      {
+        # Log delivery setup; these actions don't take resource-level permissions
+        Effect = "Allow"
+        Action = ["logs:CreateLogDelivery", "logs:GetLogDelivery", "logs:UpdateLogDelivery",
+          "logs:DeleteLogDelivery", "logs:ListLogDeliveries", "logs:PutResourcePolicy",
+        "logs:DescribeResourcePolicies", "logs:DescribeLogGroups"]
+        Resource = "*"
+      }
+    ]
   })
+}
+
+# Express workflows keep no execution history, so failed writes only show up here
+resource "aws_cloudwatch_log_group" "incident_recorder" {
+  name              = "/aws/vendedlogs/states/${var.name}-incident-recorder"
+  retention_in_days = 30
+  tags              = var.tags
 }
 
 resource "aws_sfn_state_machine" "incident_recorder" {
@@ -210,8 +288,18 @@ resource "aws_sfn_state_machine" "incident_recorder" {
   type     = "EXPRESS"
   role_arn = aws_iam_role.incident_recorder.arn
   definition = templatefile("${path.module}/stepfunctions/incident_recorder.asl.json", {
-    table_name = aws_dynamodb_table.incidents.name
+    table_name  = aws_dynamodb_table.incidents.name
+    ttl_seconds = var.incident_retention_days * 86400
   })
+
+  logging_configuration {
+    log_destination        = "${aws_cloudwatch_log_group.incident_recorder.arn}:*"
+    include_execution_data = true
+    level                  = "ERROR"
+  }
+
+  depends_on = [aws_iam_role_policy.incident_recorder]
+
   tags = var.tags
 }
 
@@ -262,6 +350,8 @@ resource "aws_sns_topic_policy" "alerts" {
           "aws:SourceArn" = [
             aws_cloudwatch_event_rule.incident_created.arn,
             aws_cloudwatch_event_rule.incident_resolved.arn,
+            aws_cloudwatch_event_rule.incident_escalated.arn,
+            aws_cloudwatch_event_rule.incident_auto_resolved.arn,
           ]
         }
       }
@@ -319,6 +409,8 @@ resource "aws_sqs_queue_policy" "events_dlq" {
             aws_cloudwatch_event_rule.incident_created.arn,
             aws_cloudwatch_event_rule.incident_resolved.arn,
             aws_cloudwatch_event_rule.action_completed.arn,
+            aws_cloudwatch_event_rule.incident_escalated.arn,
+            aws_cloudwatch_event_rule.incident_auto_resolved.arn,
             aws_cloudwatch_event_rule.all_events.arn,
           ]
         }

@@ -80,25 +80,13 @@ jobs:
           cd terraform/lambda/${{ matrix.lambda }}
           pip install -r requirements-dev.txt
 
-      - name: Create CI environment variables
-        run: |
-          cat > .ci-env <<EOF
-          export AWS_DEFAULT_REGION=us-east-1
-          export REGION=us-east-1
-          export CLUSTER_NAME=event-driven-sre-ci-eks
-          export TARGET_NAMESPACE=apps
-          export TARGET_DEPLOYMENT=checkout
-          export DEGRADED_PARAM=/checkout/degraded_mode
-          EOF
-          source .ci-env
-
       - name: Run unit tests with moto mocks
         env:
           AWS_DEFAULT_REGION: us-east-1
           REGION: us-east-1
           CLUSTER_NAME: event-driven-sre-ci-eks
-          TARGET_NAMESPACE: apps
-          TARGET_DEPLOYMENT: checkout
+          ALLOWED_NAMESPACES: apps
+          MAX_REPLICAS: "10"
           DEGRADED_PARAM: /checkout/degraded_mode
         run: |
           cd terraform/lambda/${{ matrix.lambda }}
@@ -113,6 +101,36 @@ jobs:
             terraform/lambda/${{ matrix.lambda }}/coverage.xml
             terraform/lambda/${{ matrix.lambda }}/htmlcov/
             terraform/lambda/${{ matrix.lambda }}/test-results.xml
+          retention-days: 30
+
+  # Runs both state machine templates through a local simulator, with the
+  # Lambda handlers on either side of the runbook
+  stepfunctions-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.13'
+
+      - name: Install test dependencies
+        run: |
+          pip install -r terraform/stepfunctions/tests/requirements.txt
+
+      - name: Run state machine tests
+        run: |
+          cd terraform/stepfunctions
+          pytest tests/ -v --junitxml=test-results.xml
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stepfunctions-test-results
+          path: terraform/stepfunctions/test-results.xml
           retention-days: 30
 
   infrastructure-tests:
