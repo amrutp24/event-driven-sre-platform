@@ -182,6 +182,9 @@ The module has no provider blocks. It needs an EKS cluster with access entries e
 ## Tests
 
 ```bash
+# The module, with terraform test against a mocked AWS provider (Terraform 1.7+)
+terraform init -backend=false && terraform test
+
 # Lambdas, with AWS calls mocked by moto
 cd lambda/alert_ingest && pip install -r requirements-dev.txt && AWS_DEFAULT_REGION=us-east-1 pytest tests/ --cov
 cd lambda/runbook_action && pip install -r requirements-dev.txt && AWS_DEFAULT_REGION=us-east-1 pytest tests/ --cov
@@ -195,7 +198,7 @@ cd apps/checkout && pip install -r requirements-dev.txt && pytest tests/ --cov
 
 `tests/integration/` runs the alert path end to end against LocalStack (`setup.sh`, then pytest, then `cleanup.sh`). It isn't part of CI.
 
-CI (`.github/workflows/integration-tests.yml`) runs Checkov on the module and on `examples/complete` (settings and skipped checks, with reasons, in `.checkov.yaml`), Trivy on the container image, the app, Lambda and state machine tests, `terraform fmt`, `terraform validate` on the module and both examples, and `tflint` on the module and `examples/complete`.
+CI (`.github/workflows/integration-tests.yml`) runs Checkov on the module and on `examples/complete` (settings and skipped checks, with reasons, in `.checkov.yaml`), Trivy on the container image, the module tests, the app, Lambda and state machine tests, `terraform fmt`, `terraform validate` on the module and both examples, and `tflint` on the module and `examples/complete`.
 
 ## Known gaps
 

@@ -686,7 +686,7 @@ aws cloudwatch put-metric-alarm \
 
 For API issues or questions:
 - Check CloudWatch Logs: `/aws/lambda/PLATFORM_NAME-alert-ingest`
-- Open an issue: https://github.com/amrutp24/event-driven-sre-platform/issues
+- Open an issue: https://github.com/amrutp24/terraform-aws-event-driven-sre/issues
 
 ---
 
