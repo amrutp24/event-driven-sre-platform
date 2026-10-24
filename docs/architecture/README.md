@@ -52,13 +52,15 @@ graph TB
 
         subgraph "Storage & Notifications"
             DDB[(DynamoDB<br/>Incident Records)]
-            SNS[SNS<br/>Notifications]
+            SNS[SNS alerts topic<br/>Email subscriptions]
+            CHAT[SNS chat topic<br/>optional, chat_notifications]
             CW[CloudWatch Logs<br/>Audit Trail]
         end
     end
 
     subgraph "External Monitoring"
         DD[Datadog<br/>Logs + APM + SLOs]
+        SLACK[Slack channel<br/>Amazon Q Developer<br/>in chat applications]
     end
 
     %% Traffic Flow
@@ -84,6 +86,8 @@ graph TB
     EB -->|Route: incident.created,<br/>incident.resolved, action.completed| REC[incident-recorder<br/>Express state machine]
     REC -->|UpdateItem| DDB
     EB -->|Route: incident.created, incident.resolved,<br/>incident.escalated, incident.auto_resolved| SNS
+    EB -->|Same four events,<br/>chat message format| CHAT
+    CHAT -->|Channel configuration,<br/>complete example| SLACK
     EB -->|Route: incident.created| SF
     EB -->|Log All Events| CW
 
@@ -101,10 +105,10 @@ graph TB
     classDef storage fill:#3F8624,stroke:#fff,stroke-width:2px,color:#fff
     classDef external fill:#632CA6,stroke:#fff,stroke-width:2px,color:#fff
 
-    class APIGW,L1,L2,EB,SF,REC,ALB,R53,CF,SNS,CW aws
+    class APIGW,L1,L2,EB,SF,REC,ALB,R53,CF,SNS,CHAT,CW aws
     class APP,PROM,AM,GRAF,SM k8s
     class DDB,SSM storage
-    class DD external
+    class DD,SLACK external
 ```
 
 ---
@@ -301,7 +305,7 @@ graph TB
     end
 
     subgraph "Data Security"
-        KMS[Platform KMS key, rotated yearly<br/>Encrypts:<br/>- incidents table<br/>- SNS topic and the DLQ<br/>- platform log groups<br/>- CloudTrail bucket and trail,<br/>complete example only]
+        KMS[Platform KMS key, rotated yearly<br/>Encrypts:<br/>- incidents table<br/>- SNS topics and the DLQ<br/>- platform log groups<br/>- CloudTrail bucket and trail,<br/>complete example only]
         EKSKMS[EKS module KMS key<br/>Encrypts Kubernetes secrets,<br/>the webhook API key included]
         Trail[CloudTrail<br/>Multi-region, management events<br/>Log file validation]
         SSM_Flag[SSM /checkout/degraded_mode<br/>String parameter, not a secret]
@@ -343,6 +347,7 @@ graph TB
 **Prometheus Operator**
 - Scrapes metrics from `/metrics` endpoint every 15 seconds
 - Evaluates PromQL alert rules every 30 seconds
+- Doesn't scrape the scheduler, controller manager or etcd. EKS runs them, Prometheus can't reach them, and the chart's rules would report them down for good (`KubeSchedulerDown`, `KubeControllerManagerDown`), which the runbook escalates every time.
 - Alert rules defined in PrometheusRule CRD
 - TSDB retention: 15 days
 - High availability: 2 replicas with remote write to external storage
@@ -350,6 +355,7 @@ graph TB
 **Alertmanager**
 - Groups related alerts (reduces noise)
 - Routes alerts based on severity labels
+- Sends the chart's always-firing `Watchdog` and `InfoInhibitor` alerts to a `null` receiver, so they don't become incidents
 - Deduplicates alerts (5-minute window)
 - Webhook integration with API Gateway
 - Retry logic: 3 attempts with exponential backoff
@@ -374,7 +380,7 @@ graph TB
 - Runtime: Python 3.13
 - Memory: 256 MB
 - Timeout: 30 seconds
-- Concurrency: 100 reserved concurrent executions
+- Concurrency: unreserved by default (`alert_ingest_reserved_concurrency = -1`). AWS keeps at least 50 to 100 executions unreserved per account and new accounts often have a limit of 50, so any reservation fails there. Set a number to cap it.
 - Functions:
   - Validate alert payload schema
   - Enrich with AWS metadata (account, region, timestamp)
@@ -393,6 +399,7 @@ graph TB
   - `action.completed` -> DynamoDB
   - `incident.escalated` -> SNS
   - `incident.auto_resolved` -> SNS
+  - with `chat_notifications`, the four SNS rules also send to the chat topic
   - every `sre.*` event -> CloudWatch Logs, `/aws/events/<name>`, kept 30 days
 - DynamoDB writes go through the `incident-recorder` Express state machine, since DynamoDB isn't an EventBridge target
 - Archive: 7-day event replay capability
@@ -457,14 +464,15 @@ graph TB
 - TTL: 90 days after the incident's last activity (`incident_retention_days`)
 - Deletion protection: Enabled (`incidents_deletion_protection`). `scripts/destroy.sh` turns it off before `terraform destroy`.
 
-**SNS Topic**
-- Topic: `sre-incident-notifications`
+**SNS Topics**
+- Alerts topic: `<name>-alerts` (output `sns_topic_arn`). EventBridge publishes a one-line text message per event, like `[critical] checkout - CheckoutHighErrorRate is firing. ... (incident <id>)`.
+- Chat topic: `<name>-chat` (output `chat_topic_arn`), only with `chat_notifications = true`. The same four rules publish to it in the custom notification format of Amazon Q Developer in chat applications (AWS Chatbot), which only renders its own format. Titles look like `critical: CheckoutHighErrorRate is firing on checkout`, `Escalated: X on Y needs a person`, `Resolved: X on Y` and `Auto-resolved: X on Y`, with the incident ID in the text.
+- Both are encrypted with the platform key and refuse publishes without TLS.
 - Subscriptions:
-  - Email: On-call engineer
-  - Slack webhook: Incident channel
-  - PagerDuty: Critical alerts only (filtered)
-- Message filtering: Severity-based routing
-- Delivery retry: 3 attempts over 10 minutes
+  - Email: one per address in `notification_emails`, on the alerts topic. SNS sends each address a confirmation email, and nothing arrives until the link in it is clicked.
+  - Slack: `examples/complete/chatbot.tf` subscribes a Slack channel configuration to the chat topic (see [examples/complete](../../examples/complete/README.md#slack-and-email)). It's in the example, not the module, because the Chatbot API isn't in every region (not in `us-east-1`).
+  - PagerDuty: not built. A PagerDuty SNS integration would subscribe to the alerts topic.
+- No message filtering: every subscriber gets all four event types
 
 **CloudWatch Logs**
 - Log groups:
@@ -482,7 +490,7 @@ graph TB
 **Checkout Service**
 - Framework: Flask on Gunicorn, 1 worker with 8 threads. prometheus_client keeps its metrics per process, so with several workers each scrape would only see one worker's counters; it scales with replicas instead.
 - Image: `python:3.13-slim`, running as a non-root user (UID 10001)
-- Replicas: 3 to 10, set by a HorizontalPodAutoscaler at 70% CPU. metrics-server runs as an EKS add-on for it. The chart's `replicaCount` (3) only applies with autoscaling turned off.
+- Replicas: 3 to 10, set by a HorizontalPodAutoscaler at 70% CPU. metrics-server runs as an EKS add-on for it; the complete example opens its port, 10251, from the control plane to the nodes, or the HPA never gets CPU metrics. The chart's `replicaCount` (3) only applies with autoscaling turned off.
 - PodDisruptionBudget: at least 2 pods available, so a drain evicts them a few at a time
 - Spread: pods are spread across nodes (`topologySpreadConstraints` on the hostname, best effort)
 - Resources:
@@ -516,7 +524,7 @@ graph TB
 - Built-in retry and error handling
 
 **Trade-offs**:
-- Cold start latency (mitigated with reserved concurrency)
+- Cold start latency on the first alert after a quiet spell
 - Vendor lock-in to AWS
 - Debugging across distributed services
 
@@ -612,7 +620,7 @@ graph TB
 
 ### Current Limits
 - Alert ingestion: 1000 alerts/second (API Gateway throttle)
-- Concurrent remediations: 100 (Lambda reserved concurrency)
+- Concurrent remediations: the account's unreserved Lambda concurrency by default; `runbook_action_reserved_concurrency` caps it (10 is a good cap) if the account limit has room
 - Event throughput: 10,000 events/second (EventBridge soft limit)
 - Incident storage: Unlimited (DynamoDB auto-scaling)
 
@@ -655,7 +663,7 @@ The alert pipeline line assumes 1000 webhook calls a day (30,000 a month), one a
 - EventBridge: about 60,000 custom events × $1/M = $0.06, plus a few cents for the archive
 - Step Functions: 15,000 runbook runs × 30 transitions = 450,000 × $25/M = $11.25; the Express incident recorder, 45,000 runs: about $0.05
 - DynamoDB on demand: about 150,000 writes (index included) and 135,000 reads: about $0.12
-- SNS: 45,000 publishes, $0.02; email deliveries, $2 per 100,000 after the first 1,000: about $0.90
+- SNS: 45,000 publishes, $0.02; email deliveries, $2 per 100,000 after the first 1,000: about $0.90. The chat topic doubles the publishes; Amazon Q Developer in chat applications itself is free.
 - CloudWatch Logs for the pipeline, about 1 GB at $0.50/GB: $0.50
 
 ### Optimization Techniques
@@ -670,8 +678,8 @@ The alert pipeline line assumes 1000 webhook calls a day (30,000 a month), one a
 ## Security Best Practices Implemented
 
 - ✅ Least-privilege IAM policies (no wildcards for application resources)
-- ✅ Encryption at rest: one customer managed KMS key, rotated yearly, for the incidents table, the SNS topic, the dead-letter queue, the platform's log groups and CloudTrail. Kubernetes secrets use the EKS module's own key, and ECR images AES-256.
-- ✅ Encryption in transit: a TLS 1.2+ policy on the ALB (TLS 1.3 preferred), and SNS, the dead-letter queue and the CloudTrail bucket refuse requests without TLS. The webhook is HTTPS only, but its TLS policy can't be pinned until the move to AWS provider 6.
+- ✅ Encryption at rest: one customer managed KMS key, rotated yearly, for the incidents table, the SNS topics, the dead-letter queue, the platform's log groups and CloudTrail. Kubernetes secrets use the EKS module's own key, and ECR images AES-256.
+- ✅ Encryption in transit: a TLS 1.2+ policy on the ALB (TLS 1.3 preferred), and the SNS topics, the dead-letter queue and the CloudTrail bucket refuse requests without TLS. The webhook is HTTPS only, but its TLS policy can't be pinned until the move to AWS provider 6.
 - ✅ IRSA and EKS access entries instead of long-lived credentials
 - ✅ Kubernetes RBAC: workload changes limited to the `apps` namespace, and a ClusterRole only for cordoning nodes and evicting pods
 - ✅ VPC security groups (allow-list only)

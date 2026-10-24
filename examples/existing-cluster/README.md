@@ -35,3 +35,12 @@ terraform output -raw alertmanager_api_key
 
 Point Alertmanager's webhook receiver at the URL and send the key in the
 `X-API-Key` header.
+
+## Notifications
+
+This example doesn't subscribe anyone. Add `notification_emails` to the
+module call for email; each address has to click the link in a confirmation
+email from SNS before anything arrives. For Slack or Teams, set
+`chat_notifications = true` and subscribe an Amazon Q Developer in chat
+applications channel configuration to the module's `chat_topic_arn`.
+`examples/complete/chatbot.tf` shows the Slack one.

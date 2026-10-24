@@ -36,6 +36,10 @@ kubectl get deployment checkout -n apps -o jsonpath='{.spec.template.spec.contai
 
 Expected: All commands succeed without errors, and the image is `ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/event-driven-sre/checkout:<git sha>`. Tags are immutable, so build again after committing changes to `apps/checkout`; to build uncommitted changes, set the same `IMAGE_TAG` for both scripts.
 
+To see the notifications, set `notification_emails` in `examples/complete` and click the link in the confirmation email SNS sends each address, and for Slack set `slack_workspace_id` and `slack_channel_id` (setup in [examples/complete](../examples/complete/README.md#slack-and-email)).
+
+On Windows Git Bash, prefix the `aws ssm` commands below with `MSYS_NO_PATHCONV=1`, or Git Bash turns `/checkout/degraded_mode` into a Windows path.
+
 ---
 
 ## Demo Setup (Pre-Demo, 2 minutes)
@@ -326,11 +330,11 @@ aws stepfunctions list-executions \
 
 # Expected: SUCCEEDED, ending in AutoResolved (an escalation ends as FAILED, error Escalated)
 
-# Check SNS notification sent (subscribe an email before the demo with
-# aws sns subscribe --protocol email --notification-endpoint you@example.com --topic-arn ...)
+# Check the email subscription is confirmed (notification_emails); an
+# unconfirmed one shows PendingConfirmation instead of an ARN
 aws sns list-subscriptions-by-topic \
   --topic-arn "$(terraform -chdir=examples/complete output -raw sns_topic_arn)" \
-  --query 'Subscriptions[0].Endpoint'
+  --query 'Subscriptions[].[Endpoint,SubscriptionArn]' --output text
 ```
 
 **Expected emails**, in order:
@@ -339,6 +343,8 @@ aws sns list-subscriptions-by-topic \
 - `[AUTO-RESOLVED] checkout - CheckoutHighErrorRate recovered after degrade_or_scale, 330s after it was first seen ...` from the runbook
 
 If the alert hadn't cleared in time, the last one would be `[ESCALATED] checkout - CheckoutHighErrorRate needs a person: ...` with the reason.
+
+**In Slack**, if it's set up, the same three come in as `critical: CheckoutHighErrorRate is firing on checkout`, `Resolved: CheckoutHighErrorRate on checkout` and `Auto-resolved: CheckoutHighErrorRate on checkout`, each with the incident ID in the text. An escalation is `Escalated: CheckoutHighErrorRate on checkout needs a person`.
 
 **Talking point**: "The system is back to a healthy state. On-call got the notifications, but nobody had to do anything."
 
@@ -356,7 +362,7 @@ If the alert hadn't cleared in time, the last one would be `[ESCALATED] checkout
 echo "Estimated cost per incident: $0.001 (Lambda + EventBridge + DynamoDB)"
 
 # Show scalability
-echo "System capacity: 1000 alerts/second, 100 concurrent remediations"
+echo "System capacity: 1000 alerts/second; remediations limited by the account's Lambda concurrency"
 ```
 
 ### Architecture Summary
@@ -368,7 +374,7 @@ echo "System capacity: 1000 alerts/second, 100 concurrent remediations"
 **Highlight**:
 1. **Detection**: Prometheus scrapes metrics every 15s, evaluates rules every 30s
 2. **Ingestion**: API Gateway → Lambda validates and enriches alerts
-3. **Routing**: EventBridge fans out to 4 targets (DynamoDB, SNS, Step Functions, CloudWatch)
+3. **Routing**: EventBridge fans out to 4 targets (DynamoDB, SNS, Step Functions, CloudWatch), plus the chat topic for Slack when it's on
 4. **Orchestration**: Step Functions executes runbook workflow
 5. **Remediation**: Lambda calls the Kubernetes API with its own IAM role, mapped to an RBAC group by an EKS access entry
 6. **Verification**: the state machine checks DynamoDB for the resolved alert, and escalates if it hasn't resolved 10 minutes after the action
@@ -573,6 +579,23 @@ kubectl describe pod -n apps -l app=checkout | grep -i "AWS_ROLE_ARN"
 kubectl rollout restart deployment/checkout -n apps
 ```
 
+### Issue 6: No Email or Slack Messages
+
+**Symptoms**: Incidents show up in DynamoDB, but nobody hears about them
+
+**Debug steps**:
+```bash
+# Email: each address has to confirm first; PendingConfirmation means the link wasn't clicked
+aws sns list-subscriptions-by-topic \
+  --topic-arn "$(terraform -chdir=examples/complete output -raw sns_topic_arn)" \
+  --query 'Subscriptions[].[Endpoint,SubscriptionArn]' --output text
+
+# Slack: the channel configuration lives in chatbot_region (us-east-2 by default)
+aws chatbot describe-slack-channel-configurations --region us-east-2
+```
+
+**Fix**: For email, find the confirmation email (check spam) or re-apply after removing and re-adding the address. For Slack, the workspace has to be allowed in the console (Amazon Q Developer in chat applications > Configure new client > Slack) before the apply, and `@Amazon Q` has to be invited to the channel (`/invite @Amazon Q`). Without the invite the configuration exists but nothing posts.
+
 ---
 
 ## Advanced Demo Variations
@@ -606,6 +629,7 @@ curl -X POST "$WEBHOOK_URL" -H "X-API-Key: $API_KEY" -H "Content-Type: applicati
 # The execution goes LogIncident → ChooseAction → RunbookAvailable → Escalate and ends FAILED
 # The record has status escalated and escalation_reason "no runbook for CheckoutQueueBacklog"
 # SNS sends "[ESCALATED] checkout - CheckoutQueueBacklog needs a person: no runbook for CheckoutQueueBacklog ..."
+# and Slack gets "Escalated: CheckoutQueueBacklog on checkout needs a person"
 ```
 
 To stop a run that's already going, `aws stepfunctions stop-execution --execution-arn EXECUTION_ARN`. The incident stays `remediating` until the alert resolves.
@@ -682,6 +706,7 @@ Print this checklist and verify before each demo:
 - [ ] Alertmanager webhook URL configured correctly
 - [ ] Grafana dashboard accessible (port-forward if needed)
 - [ ] Terraform outputs available (alert_webhook_url, sns_topic_arn, step_functions_arn)
+- [ ] Notification email confirmed, and `@Amazon Q` invited to the Slack channel if Slack is set up
 - [ ] Error rate currently at 0% (healthy state)
 - [ ] Degraded mode currently false
 - [ ] CloudWatch Logs Insights dashboards bookmarked
