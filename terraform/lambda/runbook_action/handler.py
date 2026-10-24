@@ -1,15 +1,27 @@
 import base64
 import datetime
-import json
 import os
-import urllib.parse
+import re
 
 import boto3
-import botocore
+import botocore.session
+import botocore.signers
 import requests
 
 EKS = boto3.client("eks")
 SSM = boto3.client("ssm")
+
+ACTIONS = ("degrade", "restart", "scale", "degrade_or_scale")
+SCALING_ACTIONS = ("scale", "degrade_or_scale")
+
+# Kubernetes DNS-1123 label: lowercase alphanumerics and '-', 63 chars max
+DNS_1123_LABEL = re.compile(r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$")
+
+
+class InvalidRequest(Exception):
+    """Bad input from the state machine. Step Functions sees the class name as
+    the error, and the runbook doesn't retry it."""
+
 
 # Env defaults
 def get_env(name, default=None):
@@ -20,7 +32,7 @@ def _eks_bearer_token(cluster_name: str, region: str) -> str:
     session = botocore.session.get_session()
     sts = session.create_client("sts", region_name=region)
     request_signer = botocore.signers.RequestSigner(
-        sts.meta.service_model.service_name,
+        sts.meta.service_model.service_id,
         region,
         "sts",
         "v4",
@@ -65,7 +77,8 @@ def _k8s_request(method, url, token, ca_bytes, json_body=None, headers=None):
     return {}
 
 def _patch_deployment_env(endpoint, token, ca, namespace, deployment, env_name, env_value):
-    # Strategic merge patch to set env var (updates container env)
+    # Strategic merge patch to set env var (updates container env).
+    # Assumes the container is named after the deployment, as in the checkout chart.
     url = f"{endpoint}/apis/apps/v1/namespaces/{namespace}/deployments/{deployment}"
     patch = {
         "spec": {
@@ -87,7 +100,8 @@ def _patch_deployment_env(endpoint, token, ca, namespace, deployment, env_name, 
 
 def _restart_deployment(endpoint, token, ca, namespace, deployment):
     url = f"{endpoint}/apis/apps/v1/namespaces/{namespace}/deployments/{deployment}"
-    restarted_at = datetime.datetime.utcnow().isoformat() + "Z"
+    # Changing this annotation is what makes Kubernetes roll the pods, like kubectl rollout restart
+    restarted_at = datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
     patch = {
         "spec": {
             "template": {
@@ -108,67 +122,80 @@ def _scale_deployment(endpoint, token, ca, namespace, deployment, replicas):
     headers = {"Content-Type": "application/merge-patch+json"}
     return _k8s_request("PATCH", url, token, ca, json_body=patch, headers=headers)
 
+def _replicas(raw):
+    """replicas arrives as a number, or as a string when it comes from an alert annotation."""
+    max_replicas = int(get_env("MAX_REPLICAS", "10"))
+    count = None
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        count = raw
+    elif isinstance(raw, float) and raw.is_integer():
+        count = int(raw)
+    elif isinstance(raw, str) and raw.strip().isascii() and raw.strip().isdigit():
+        count = int(raw.strip())
+    if count is None or not 1 <= count <= max_replicas:
+        raise InvalidRequest(f"replicas must be a whole number from 1 to {max_replicas}, got {raw!r}")
+    return count
+
+def _validate(event):
+    """Checks the request before anything touches AWS or the cluster."""
+    action = event.get("action")
+    if action not in ACTIONS:
+        raise InvalidRequest(f"Unknown action {action!r}; expected one of {', '.join(ACTIONS)}")
+
+    namespace = event.get("namespace")
+    deployment = event.get("deployment")
+    if not namespace or not deployment:
+        raise InvalidRequest("namespace and deployment are required")
+
+    allowed = [n.strip() for n in get_env("ALLOWED_NAMESPACES", "apps").split(",") if n.strip()]
+    if namespace not in allowed:
+        raise InvalidRequest(f"Namespace {namespace!r} isn't in ALLOWED_NAMESPACES ({', '.join(allowed)})")
+
+    if not isinstance(deployment, str) or not DNS_1123_LABEL.match(deployment):
+        raise InvalidRequest(f"Deployment {deployment!r} isn't a valid Kubernetes name")
+
+    replicas = _replicas(event.get("replicas")) if action in SCALING_ACTIONS else None
+    return action, namespace, deployment, replicas
+
 def lambda_handler(event, context):
     """
-    Input is normalized alert from alert_ingest (incident_id, alertname, severity, annotations, labels).
-    Actions are derived from alertname + severity by default; can be overridden with annotations.runbook_action.
+    Input comes from the runbook state machine's ExecuteAction step:
+    {incident_id, alertname, severity, action, namespace, deployment, replicas}.
+    The state machine picks the action and the target; this carries it out.
     """
     # Read environment variables
     region = get_env("REGION") or get_env("AWS_REGION") or "us-east-1"
     cluster = get_env("CLUSTER_NAME")
     if not cluster:
         raise RuntimeError("CLUSTER_NAME env var is required")
-    target_namespace = get_env("TARGET_NAMESPACE", "apps")
-    target_deployment = get_env("TARGET_DEPLOYMENT", "checkout")
     degraded_param = get_env("DEGRADED_PARAM", "/checkout/degraded_mode")
 
-    alertname = event.get("alertname", "UnknownAlert")
-    severity = event.get("severity", "ticket")
-    annotations = event.get("annotations", {}) or {}
-    explicit = annotations.get("runbook_action")
+    action, namespace, deployment, replicas = _validate(event)
 
-    # default routing
-    action = explicit or (
-        "degrade_or_scale" if alertname in ("CheckoutHighLatencyP95", "CheckoutHighErrorRate", "CheckoutSLOBurnFast") else
-        "restart" if alertname in ("CheckoutDown",) else
-        "notify_only"
-    )
+    result = {
+        "incident_id": event.get("incident_id"),
+        "action": action,
+        "alertname": event.get("alertname"),
+        "severity": event.get("severity"),
+        "namespace": namespace,
+        "deployment": deployment,
+    }
 
-    result = {"action": action, "alertname": alertname, "severity": severity}
-
-    if action == "notify_only":
-        return result
-
-    # Only connect to cluster if we need to perform actions
     endpoint, ca = _cluster_conn(cluster)
     token = _eks_bearer_token(cluster, region)
 
-    if action == "degrade":
-        # also store state in SSM for audit/visibility
+    if action in ("degrade", "degrade_or_scale"):
+        # degrade first for customer relief; SSM also keeps the state for audit/visibility
         SSM.put_parameter(Name=degraded_param, Value="true", Type="String", Overwrite=True)
-        _patch_deployment_env(endpoint, token, ca, target_namespace, target_deployment, "DEGRADED_MODE", "true")
-        _restart_deployment(endpoint, token, ca, target_namespace, target_deployment)
+        _patch_deployment_env(endpoint, token, ca, namespace, deployment, "DEGRADED_MODE", "true")
+        _restart_deployment(endpoint, token, ca, namespace, deployment)
         result["degraded"] = True
-        return result
 
     if action == "restart":
-        _restart_deployment(endpoint, token, ca, target_namespace, target_deployment)
-        return result
+        _restart_deployment(endpoint, token, ca, namespace, deployment)
 
-    if action == "scale":
-        # scale to 4 by default, or derive from labels/annotations
-        replicas = int(annotations.get("desired_replicas", "4"))
-        _scale_deployment(endpoint, token, ca, target_namespace, target_deployment, replicas)
-        return result
+    if action in SCALING_ACTIONS:
+        _scale_deployment(endpoint, token, ca, namespace, deployment, replicas)
+        result["scaled_to"] = replicas
 
-    if action == "degrade_or_scale":
-        # degrade first for customer relief, then scale up
-        SSM.put_parameter(Name=degraded_param, Value="true", Type="String", Overwrite=True)
-        _patch_deployment_env(endpoint, token, ca, target_namespace, target_deployment, "DEGRADED_MODE", "true")
-        _restart_deployment(endpoint, token, ca, target_namespace, target_deployment)
-        _scale_deployment(endpoint, token, ca, target_namespace, target_deployment, int(annotations.get("desired_replicas", "4")))
-        result["degraded"] = True
-        result["scaled_to"] = int(annotations.get("desired_replicas", "4"))
-        return result
-
-    raise RuntimeError(f"Unknown action: {action}")
+    return result

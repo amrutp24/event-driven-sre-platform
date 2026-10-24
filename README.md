@@ -1,6 +1,6 @@
 # event-driven-sre-platform
 
-Automated incident response for a service running on EKS. Prometheus alerts for a demo `checkout` service are sent to an endpoint on AWS, recorded, and passed to a Lambda function that changes the deployment in response: it switches the service to degraded mode, restarts it, or scales it up.
+Automated incident response for a service running on EKS. Prometheus alerts for a demo `checkout` service are sent to an endpoint on AWS, recorded, and handed to a Step Functions runbook that changes the deployment in response: it switches the service to degraded mode, restarts it, or scales it up. The runbook then checks that the alert clears and hands the incident to a person if it doesn't.
 
 The alert path (Alertmanager to API Gateway to Lambda to EventBridge, which routes to DynamoDB, SNS and Step Functions) and remediation are in place and covered by unit tests. See [Known gaps](#known-gaps) for what's still missing.
 
@@ -16,23 +16,25 @@ The alert path (Alertmanager to API Gateway to Lambda to EventBridge, which rout
    | `incident.created` | `sre.alertmanager`, `sre.datadog` | incident recorder (DynamoDB), SNS, runbook state machine |
    | `incident.resolved` | `sre.alertmanager`, `sre.datadog` | incident recorder (DynamoDB), SNS |
    | `action.completed` | `sre.runbook` | incident recorder (DynamoDB) |
+   | `incident.escalated`, `incident.auto_resolved` | `sre.runbook` | SNS |
    | any `sre.*` event | | CloudWatch Logs |
 
    EventBridge can't write to DynamoDB, so the incident recorder, a small Express state machine, does those writes.
-5. The runbook state machine first claims the incident in DynamoDB. Only one run can claim it, so an incident is remediated once even if Alertmanager re-sends the alert or EventBridge delivers it twice. It then invokes the `runbook-action` Lambda, retrying up to three times with backoff, and publishes an `action.completed` event with the result.
-6. `runbook-action` picks an action from the alert name and applies it through the Kubernetes API. It authenticates with an EKS token signed by its own IAM role.
+5. The runbook state machine only acts on firing `critical` alerts (`auto_remediate_severities`); warnings and info alerts just notify. It claims the incident in DynamoDB first. Only one run can claim it, so an incident is remediated once even if Alertmanager re-sends the alert or EventBridge delivers it twice.
+6. It picks an action from the alert name and invokes the `runbook-action` Lambda with the action and its target, retrying up to three times with backoff. The Lambda applies it through the Kubernetes API, authenticating with an EKS token signed by its own IAM role. The result goes out as an `action.completed` event.
+7. It waits a minute, then checks DynamoDB every 30 seconds for the resolved alert. If the alert resolves within 10 minutes of the action, it records the MTTR and publishes `incident.auto_resolved`. If it doesn't, or the action failed, or there's no runbook for the alert, it marks the incident `escalated` and publishes `incident.escalated`. Both go to SNS.
 
 | Alert | Action |
 | --- | --- |
 | `CheckoutHighErrorRate`, `CheckoutHighLatencyP95`, `CheckoutSLOBurnFast` | Set `DEGRADED_MODE=true` on the deployment, restart it, and scale it to 4 replicas. Also sets the SSM parameter `/checkout/degraded_mode` to `true` as a record. |
 | `CheckoutDown` | Restart the deployment. |
-| Anything else | Notification only. |
+| Any other critical alert | Escalate. |
 
-An alert can override this with a `runbook_action` annotation (`degrade`, `restart`, `scale`, `degrade_or_scale` or `notify_only`), and set the replica count with `desired_replicas`.
+An alert can override this with a `runbook_action` annotation (`degrade`, `restart`, `scale` or `degrade_or_scale`, or `notify_only` to skip the runbook), and set the replica count with `desired_replicas`. The target is the alert's `namespace` and `deployment` labels (or Datadog's `kube_namespace` and `kube_deployment` tags), falling back to its `service` label and then `apps/checkout`. The Lambda refuses namespaces other than `apps` and more than 10 replicas (`remediation_max_replicas`).
 
-Each incident's DynamoDB record goes from `open` to `remediating`, then to `resolved` when the alert clears, or `escalated` if remediation fails after its retries. Every action and its result are appended to `actions_taken`.
+Each incident's DynamoDB record goes from `open` to `remediating`, then to `resolved` when the alert clears, or `escalated` when the runbook gives up. Every action and its result are appended to `actions_taken`, and a remediated incident gets `remediation_result` and `mttr_seconds`. The table has point-in-time recovery and deletion protection on, and deletes incidents 90 days after their last activity.
 
-Every EventBridge target retries for up to an hour, then sends the event to an SQS dead-letter queue. Every event on the bus is also written to the `/aws/events/<name>` log group (kept 30 days) and to an archive (kept 7 days) that can be replayed. Replaying is safe: the recorder only updates records, and the runbook won't claim an incident twice.
+Every EventBridge target retries for up to an hour, then sends the event to an SQS dead-letter queue. Every event on the bus is also written to the `/aws/events/<name>` log group (kept 30 days) and to an archive (kept 7 days) that can be replayed. Replaying is safe: the recorder only updates records, and the runbook won't claim an incident twice. The runbook logs every state's input and output to `/aws/vendedlogs/states/<name>-runbook`.
 
 The `checkout` app is a small Flask service with `/checkout`, `/metrics`, `/healthz` and `/readyz` endpoints. Three environment variables let you break it on purpose: `ERROR_RATE` (0.0 to 1.0) returns random errors, `LATENCY_MS` adds delay, and `DEGRADED_MODE=true` turns both off.
 
@@ -84,12 +86,12 @@ The ingress creates an internet-facing HTTPS load balancer through the AWS Load 
 
 To send alerts from Datadog, see [docs/API.md](docs/API.md#datadog-webhook-format). Its key is `terraform output -raw datadog_api_key`.
 
-To tear it down, uninstall the Helm releases first. The load balancer the controller created isn't in Terraform state, and it blocks the VPC from being deleted while it exists.
+To tear it down, uninstall the Helm releases first. The load balancer the controller created isn't in Terraform state, and it blocks the VPC from being deleted while it exists. `destroy.sh` turns off the incidents table's deletion protection before it runs `terraform destroy`.
 
 ```bash
 helm uninstall checkout -n apps
 helm uninstall mon -n monitoring
-bash scripts/destroy.sh         # terraform destroy
+bash scripts/destroy.sh         # deletion protection off, then terraform destroy
 ```
 
 ## Trying it
@@ -114,7 +116,17 @@ aws logs tail /aws/events/event-driven-sre --follow                 # every even
 aws dynamodb scan --table-name event-driven-sre-incidents --max-items 5
 aws stepfunctions list-executions --max-results 5 \
   --state-machine-arn "$(terraform -chdir=terraform output -raw step_functions_arn)"
+aws logs tail /aws/vendedlogs/states/event-driven-sre-runbook --follow  # each runbook step
 aws logs tail /aws/lambda/event-driven-sre-runbook-action --follow
+```
+
+A few minutes after the runbook acts, the incident should read `resolved` with `remediation_result` `auto_resolved`. Escalated incidents, newest first:
+
+```bash
+aws dynamodb query --table-name event-driven-sre-incidents --index-name by-status \
+  --key-condition-expression "#s = :s" --no-scan-index-forward \
+  --expression-attribute-names '{"#s": "status"}' \
+  --expression-attribute-values '{":s": {"S": "escalated"}}'
 ```
 
 Nothing should be in the dead-letter queue:
@@ -145,15 +157,17 @@ cd apps/checkout && pip install -r requirements-dev.txt && pytest tests/ --cov
 # Lambdas, with AWS calls mocked by moto
 cd terraform/lambda/alert_ingest && pip install -r requirements-dev.txt && AWS_DEFAULT_REGION=us-east-1 pytest tests/ --cov
 cd terraform/lambda/runbook_action && pip install -r requirements-dev.txt && AWS_DEFAULT_REGION=us-east-1 pytest tests/ --cov
+
+# Both state machines, run through a local JSONata simulator with the Lambdas on either side
+cd terraform/stepfunctions && pip install -r tests/requirements.txt && pytest tests/
 ```
 
 `tests/integration/` runs the alert path end to end against LocalStack (`setup.sh`, then pytest, then `cleanup.sh`). It isn't part of CI.
 
-CI (`.github/workflows/integration-tests.yml`) runs Checkov on the Terraform, Trivy on the container image, the app and Lambda unit tests, and `terraform fmt`, `validate` and `tflint`.
+CI (`.github/workflows/integration-tests.yml`) runs Checkov on the Terraform, Trivy on the container image, the app, Lambda and state machine tests, and `terraform fmt`, `validate` and `tflint`.
 
 ## Known gaps
 
-- **Remediation always targets one deployment**, set by `TARGET_DEPLOYMENT` (`checkout`), not the alert's `service` label.
 - **The default Kubernetes version is retired.** `eks_version` defaults to `1.29`, which reached the end of EKS extended support in March 2026, so a new cluster needs a newer version.
 
 ## Cost

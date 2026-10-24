@@ -105,7 +105,9 @@ Prometheus Alertmanager sends alerts in the following format:
 | Field | Type | Description |
 |-------|------|-------------|
 | `alerts[].annotations` | object | Human-readable metadata (summary, description, runbook_url) |
-| `alerts[].annotations.runbook_action` | string | Override default action: `degrade`, `scale`, `restart`, `degrade_or_scale`, `notify_only` |
+| `alerts[].annotations.runbook_action` | string | Override the default action: `degrade`, `scale`, `restart` or `degrade_or_scale`. `notify_only` skips the runbook: the alert is recorded and sent to SNS, nothing more. Any other value escalates a critical alert. |
+| `alerts[].annotations.desired_replicas` | string | Replica count for `scale` and `degrade_or_scale` (default 4, at most `remediation_max_replicas`) |
+| `alerts[].labels.namespace`, `alerts[].labels.deployment` | string | What the runbook acts on. Without them it uses the `service` label as the deployment, then `apps/checkout`. Namespaces other than `apps` are refused. |
 | `alerts[].startsAt` | string (ISO 8601) | When the alert started firing |
 | `alerts[].endsAt` | string (ISO 8601) | When the alert resolved (0001-01-01 means still firing) |
 | `alerts[].generatorURL` | string | Link to Prometheus query |
@@ -146,7 +148,7 @@ What it becomes:
 | --- | --- |
 | `alert_transition` | `Recovered` is `resolved`; `Triggered`, `Re-Triggered`, `Warn`, `No Data` and `Renotify` are `firing` |
 | `alert_cycle_key` | the incident id, so the trigger and its recovery are one incident. Required for that to work. |
-| `tags` (`"a:b,c:d"` or a JSON array) | labels. An `alertname:` tag sets the alert name, otherwise `title` is used. `service:` sets the service. |
+| `tags` (`"a:b,c:d"` or a JSON array) | labels. An `alertname:` tag sets the alert name, otherwise `title` is used. `service:` sets the service. The runbook takes its target from `kube_namespace:` and `kube_deployment:` tags when there are no `namespace`/`deployment` tags. |
 | `severity:` tag | the severity (`critical`, `warning` or `info`); otherwise `priority` P1 and P2 are `critical`, P3 is `warning`, P4 and P5 are `info`, and anything else is `warning` |
 | `date_happened` | epoch seconds or milliseconds |
 
@@ -343,7 +345,7 @@ curl -X POST "$WEBHOOK_URL" \
 }
 ```
 
-`TestAlert` has `runbook_action: notify_only`, so the runbook runs but changes nothing in the cluster.
+`TestAlert` has `runbook_action: notify_only`, so the runbook execution ends at its first step (`NotAutoRemediated`): it doesn't claim the incident, call the Lambda or escalate. The alert is still recorded in DynamoDB and sent to SNS.
 
 ### Example 2: High Error Rate Alert (Python)
 
@@ -561,6 +563,20 @@ aws dynamodb scan \
   --output table
 ```
 
+Escalated incidents, newest first, from the `by-status` index (or `open`, `remediating`, `resolved`):
+
+```bash
+aws dynamodb query \
+  --table-name PLATFORM_NAME-incidents \
+  --index-name by-status \
+  --key-condition-expression "#s = :s" \
+  --expression-attribute-names '{"#s": "status"}' \
+  --expression-attribute-values '{":s": {"S": "escalated"}}' \
+  --no-scan-index-forward \
+  --query 'Items[*].[incident_id.S, alertname.S, first_seen_at.S, escalation_reason.S]' \
+  --output table
+```
+
 ### Check Step Functions Executions
 
 Verify runbook workflows are starting:
@@ -572,6 +588,8 @@ aws stepfunctions list-executions \
   --query 'executions[*].[name, status, startDate]' \
   --output table
 ```
+
+`SUCCEEDED` covers alerts that resolved after remediation, alerts the runbook skipped (not critical, or `notify_only`) and duplicates. `FAILED` with error `Escalated` means the incident was handed to a person; the execution's cause is the reason. Every state's input and output is in `/aws/vendedlogs/states/PLATFORM_NAME-runbook`.
 
 ---
 
@@ -637,7 +655,7 @@ aws cloudwatch put-metric-alarm \
 3. **Include `runbook_url` annotation** for human escalation scenarios
 4. **Monitor alert ingestion error rate** to detect misconfigurations
 5. **Use correlation_id** from response to track alerts through the pipeline
-6. **Test webhook with `notify_only` action** before enabling auto-remediation
+6. **Test the webhook with `notify_only` or a `warning` alert** before letting critical alerts through, since both stop before the runbook changes anything
 7. **Enable API key authentication** in production
 8. **Use VPC endpoint** for maximum security
 9. **Configure Alertmanager retry** for transient failures
@@ -649,6 +667,7 @@ aws cloudwatch put-metric-alarm \
 | Version | Date | Changes |
 |---------|------|---------|
 | 1.0 | 2026-02-02 | Initial API documentation |
+| 1.3 | 2026-10-23 | The runbook state machine picks the action; `runbook_action: notify_only` skips the runbook and other unknown values escalate. `namespace`/`deployment` labels and `desired_replicas` set the target. |
 | 1.2 | 2026-10-23 | `alert_ingest` publishes to EventBridge only; rules route to DynamoDB, SNS and Step Functions. `remediation_started` removed from the response. |
 | 1.1 | 2026-10-23 | `POST /webhook` on a REST API with schema validation, API keys and throttling; Datadog payloads; `202` and `400` responses as documented |
 
@@ -663,4 +682,4 @@ For API issues or questions:
 ---
 
 **Last Updated**: 2026-10-23
-**API Version**: 1.2
+**API Version**: 1.3

@@ -81,11 +81,13 @@ graph TB
     %% Event Routing
     EB -->|Route: incident.created,<br/>incident.resolved, action.completed| REC[incident-recorder<br/>Express state machine]
     REC -->|UpdateItem| DDB
-    EB -->|Route: incident.created| SNS
+    EB -->|Route: incident.created, incident.resolved,<br/>incident.escalated, incident.auto_resolved| SNS
     EB -->|Route: incident.created| SF
     EB -->|Log All Events| CW
 
     %% Remediation Flow
+    SF -->|Claim, verify, update status| DDB
+    SF -->|action.completed, incident.escalated,<br/>incident.auto_resolved| EB
     SF -->|Execute Action| L2
     L2 -->|Access entry + RBAC| APP
     L2 -->|Update SSM| SSM[SSM Parameter Store<br/>Feature Flags]
@@ -133,34 +135,38 @@ flowchart TD
     Multi --> Target3[8c. CloudWatch Logs<br/>Audit trail]
     Multi --> Target4[8d. Step Functions StartExecution<br/>Begin runbook automation]
 
-    Target4 --> Step10[9. Step Functions orchestrates remediation<br/>Evaluates alert severity + labels]
+    Target4 --> Step10{9. Step Functions evaluates the alert<br/>Firing and severity=critical?}
 
-    Step10 --> Decision{Runbook Available?}
-    Decision -->|No| Manual[Escalate to human<br/>Log to incident channel]
+    Step10 -->|No, or notify_only| NotAuto([Not auto-remediated<br/>SNS already notified on-call])
+    Step10 -->|Yes| Claim[10. Claim the incident in DynamoDB<br/>status=remediating, once per incident]
+
+    Claim -->|Already claimed or resolved| Dup([Stop: nothing to do])
+    Claim --> Decision{Runbook for this alert?}
+    Decision -->|No| Escalate
     Decision -->|Yes| Step11
 
-    Step11[10. Invoke runbook_action Lambda<br/>Pass: namespace, deployment, action] --> Step12
-    Step12[11. Lambda authenticates to EKS<br/>IAM role + EKS access entry] --> Step13
-    Step13[12. Execute remediation action] --> ActionType{Action Type}
+    Step11[11. Invoke runbook_action Lambda<br/>Pass: action, namespace, deployment, replicas] --> Step12
+    Step12[12. Lambda authenticates to EKS<br/>IAM role + EKS access entry] --> ActionType{Action Type}
 
-    ActionType -->|Scale| Scale[kubectl scale deployment<br/>Increase replicas]
-    ActionType -->|Restart| Restart[kubectl rollout restart<br/>Rolling restart pods]
-    ActionType -->|Degrade| Degrade[Update SSM parameter<br/>Enable degraded mode]
-    ActionType -->|Drain| Drain[kubectl drain node<br/>Evict pods safely]
+    ActionType -->|Scale| Scale[Patch replicas<br/>Up to MAX_REPLICAS]
+    ActionType -->|Restart| Restart[Restart annotation<br/>Rolling restart pods]
+    ActionType -->|Degrade| Degrade[DEGRADED_MODE=true + restart<br/>Flag recorded in SSM]
+    ActionType -.->|Drain, not built yet| Drain[kubectl drain node<br/>Evict pods safely]
+    ActionType -->|Failed after 3 retries| Escalate
 
-    Scale --> Step14
-    Restart --> Step14
-    Degrade --> Step14
-    Drain --> Step14
+    Scale --> Step13
+    Restart --> Step13
+    Degrade --> Step13
 
-    Step14[13. Update incident status<br/>DynamoDB: status=remediated] --> Step15
-    Step15[14. Verify alert resolves<br/>Wait for RESOLVED state] --> Step16
+    Step13[13. Publish action.completed<br/>Wait 60s for metrics to settle] --> Step14
+    Step14[14. Read the incident every 30s<br/>until the recorder marks it resolved] --> Step15
 
-    Step16{Alert Resolved?} -->|Yes| Success([MTTR: seconds<br/>Incident closed])
-    Step16 -->|No after 5min| Escalate([Escalate to on-call<br/>Manual intervention needed])
+    Step15{Resolved within 10 min<br/>of the action?} -->|Yes| Success([incident.auto_resolved with MTTR<br/>SNS notifies on-call])
+    Step15 -->|No| Escalate([incident.escalated, status=escalated<br/>SNS notifies on-call])
 
     Reject --> End([End: Alert dropped])
-    Manual --> End
+    NotAuto --> End
+    Dup --> End
     Success --> End
     Escalate --> End
 
@@ -171,8 +177,8 @@ flowchart TD
 
     class Step1,Step2,Step3 detect
     class Step4,Step5,Step6,Step7,Step8,Step9,Multi,Target1,Target2,Target3,Target4 process
-    class Step10,Step11,Step12,Step13,Step14,ActionType,Scale,Restart,Degrade,Drain remediate
-    class Step15,Step16,Success,Escalate result
+    class Step10,Claim,Decision,Step11,Step12,ActionType,Scale,Restart,Degrade,Drain,Step13 remediate
+    class Step14,Step15,NotAuto,Dup,Success,Escalate result
 ```
 
 ---
@@ -220,33 +226,40 @@ sequenceDiagram
     end
 
     Note over SF,K8s: Remediation Phase
-    SF->>SF: Evaluate runbook logic<br/>IF severity=critical THEN auto-remediate
-    SF->>L2: Invoke with task input<br/>{action: enable_degraded_mode}
+    SF->>SF: Evaluate the alert<br/>firing and severity=critical
+    SF->>DDB: UpdateItem: claim the incident<br/>status=remediating, only if not claimed yet
+    SF->>SF: Choose action from the alert name<br/>CheckoutHighErrorRate is degrade_or_scale
+    SF->>L2: Invoke: {action: degrade_or_scale, namespace: apps,<br/>deployment: checkout, replicas: 4}
     L2->>K8s: Authenticate with an EKS token<br/>Access entry: checkout-remediation group
     L2->>SSM: PutParameter: /checkout/degraded_mode=true
     SSM-->>L2: Success
-    L2->>K8s: Get Deployment: apps/checkout
-    K8s-->>L2: Deployment manifest
-    L2->>K8s: Patch Deployment: restart annotation
+    L2->>K8s: Patch Deployment apps/checkout<br/>DEGRADED_MODE=true, restart annotation
+    L2->>K8s: Patch Deployment apps/checkout<br/>replicas=4
     K8s-->>L2: Success: rollout triggered
-    L2-->>SF: Return: {status: success, action: completed}
+    L2-->>SF: Return: {action, degraded: true, scaled_to: 4}
+    SF->>EB: PutEvents: action.completed
+    EB->>DDB: incident-recorder appends to actions_taken
 
     Note over SF,DDB: Verification Phase
-    SF->>DDB: UpdateItem: status=remediating
-    SF->>SF: Wait 60 seconds for metrics to stabilize
+    SF->>SF: Wait 60 seconds for metrics to settle
 
-    Note over App,Prom: Recovery Verification
-    App->>App: Read SSM parameter<br/>degraded_mode=true
-    App->>App: Skip optional operations<br/>Reduced error rate
+    Note over App,Prom: Recovery
+    App->>App: DEGRADED_MODE=true<br/>Skips the injected errors and latency
     App->>Prom: Expose metrics<br/>error_rate=0.01 (1%)
     Prom->>AM: Resolve alert: CheckoutHighErrorRate
     AM->>APIGW: POST /webhook<br/>status=resolved
     APIGW->>L1: Process resolved event
     L1->>EB: PutEvents: incident.resolved
     EB->>DDB: incident-recorder: UpdateItem<br/>status=resolved, resolved_at
+    loop Every 30 seconds, up to 10 minutes after the action
+        SF->>DDB: GetItem: resolved yet?
+    end
 
-    Note over SNS,DDB: Completion
-    EB->>SNS: Publish: Incident auto-resolved<br/>MTTR: 90 seconds
+    Note over SF,SNS: Completion
+    SF->>DDB: UpdateItem: remediation_result=auto_resolved,<br/>remediated_by, mttr_seconds
+    SF->>EB: PutEvents: incident.auto_resolved
+    EB->>SNS: Publish: auto-resolved after degrade_or_scale,<br/>with the MTTR
+    Note over SF,SNS: Still firing after 10 minutes, or the action failed:<br/>status=escalated, and incident.escalated goes to SNS
 ```
 
 ---
@@ -259,7 +272,7 @@ graph TB
         R1[alert_ingest Lambda Role<br/>Permissions:<br/>- eventbridge:PutEvents]
         R2[runbook_action Lambda Role<br/>Permissions:<br/>- eks:DescribeCluster<br/>- ssm:GetParameter<br/>- ssm:PutParameter<br/>- sts:GetCallerIdentity]
         R3[EventBridge Role<br/>Permissions:<br/>- states:StartExecution<br/>SNS, SQS and Logs grant it<br/>through resource policies]
-        R4[Step Functions Role<br/>Permissions:<br/>- lambda:InvokeFunction<br/>- dynamodb:UpdateItem<br/>- events:PutEvents]
+        R4[Step Functions Role<br/>Permissions:<br/>- lambda:InvokeFunction<br/>- dynamodb:UpdateItem<br/>- dynamodb:GetItem<br/>- events:PutEvents]
     end
 
     subgraph "EKS Access Entry"
@@ -357,11 +370,13 @@ graph TB
 
 **EventBridge**
 - Custom event bus: `event-driven-sre-bus` (`<name>-bus`)
-- Event sources: `sre.alertmanager`, `sre.datadog`
+- Event sources: `sre.alertmanager`, `sre.datadog`, and `sre.runbook` for the runbook's own events
 - Event patterns for routing:
   - `incident.created` -> DynamoDB, SNS, Step Functions
   - `incident.resolved` -> DynamoDB, SNS
   - `action.completed` -> DynamoDB
+  - `incident.escalated` -> SNS
+  - `incident.auto_resolved` -> SNS
   - every `sre.*` event -> CloudWatch Logs, `/aws/events/<name>`, kept 30 days
 - DynamoDB writes go through the `incident-recorder` Express state machine, since DynamoDB isn't an EventBridge target
 - Archive: 7-day event replay capability
@@ -370,16 +385,18 @@ graph TB
 ### 4. Orchestration Layer
 
 **Step Functions**
-- State machine: `incident-response-runbook`
+- State machine: `event-driven-sre-runbook` (`<name>-runbook`), a Standard workflow written in JSONata. The `incident.created` rule starts it with the incident as input.
 - Steps:
-  1. **Evaluate Alert**: Check severity and runbook eligibility
-  2. **Log Incident**: Update DynamoDB status
-  3. **Choose Action**: Map alert type to remediation action
-  4. **Execute Action**: Invoke runbook_action Lambda
-  5. **Wait for Stabilization**: 60-second delay
-  6. **Verify Resolution**: Check if alert resolved
-  7. **Update Status**: Mark incident as resolved or escalated
-- Error handling: Exponential retry with 3 attempts
+  1. **Evaluate Alert**: only firing alerts with a severity in `auto_remediate_severities` (default `critical`) go on. Warnings, info alerts and alerts annotated `runbook_action: notify_only` stop here; SNS has already notified on-call.
+  2. **Log Incident**: a conditional `UpdateItem` sets `status=remediating`, `remediation_started_at` and `runbook_execution`. It only succeeds once per incident, and not after the alert has resolved, so re-sent alerts and duplicate deliveries stop here.
+  3. **Choose Action**: map the alert name to an action. `CheckoutHighErrorRate`, `CheckoutHighLatencyP95` and `CheckoutSLOBurnFast` get `degrade_or_scale`, `CheckoutDown` gets `restart`. A `runbook_action` annotation overrides the table. The namespace comes from the alert's `namespace` label (or Datadog's `kube_namespace` tag), else `apps`; the deployment from its `deployment` label, `kube_deployment` tag or `service` label, else `checkout`; replicas from a `desired_replicas` annotation, else 4. No runbook for the alert means escalate.
+  4. **Execute Action**: invoke runbook_action. `InvalidRequest` (bad input) isn't retried; anything else gets 3 retries with exponential backoff and jitter. Either way the result goes out as an `action.completed` event, and a failure escalates.
+  5. **Wait for Stabilization**: 60 seconds (`stabilization_seconds`)
+  6. **Verify Resolution**: read the incident from DynamoDB every 30 seconds (`verify_poll_seconds`) until the incident recorder has marked it resolved, for up to 10 minutes after the action (`verify_timeout_seconds`). The original plan was 5 minutes, but the alert's 5 minute rate window plus Alertmanager's 2 minute `group_interval` mean a fixed service usually reads as resolved 3 to 7 minutes after the action.
+  7. **Update Status**: if resolved, set `remediation_result=auto_resolved`, `remediated_by` and `mttr_seconds`, and publish `incident.auto_resolved`. MTTR runs from when the platform first saw the alert to when it saw the resolution. Otherwise set `status=escalated` and `escalation_reason`, publish `incident.escalated`, and end the execution as failed. An incident that resolved in the meantime isn't escalated.
+- Escalation reasons: no runbook for the alert, the action failed after its retries, the alert still firing at the end of the verify window, or DynamoDB failing when the incident is logged or checked
+- Error handling: the DynamoDB and EventBridge steps also retry 3 times with backoff
+- Logs: `/aws/vendedlogs/states/<name>-runbook`, every state with its input and output, kept 30 days
 - Execution history: 90 days
 
 **runbook_action Lambda**
@@ -387,30 +404,36 @@ graph TB
 - Memory: 512 MB
 - Timeout: 120 seconds
 - VPC: Attached to private subnets (access to EKS API)
-- Functions:
-  - **enable_degraded_mode**: Update SSM parameter + rolling restart
-  - **scale_deployment**: Increase replica count
-  - **restart_deployment**: Force pod recreation
-  - **drain_node**: Safely evict pods from unhealthy node
+- Input: `{incident_id, alertname, severity, action, namespace, deployment, replicas}` from the state machine. It runs the action it's given and doesn't choose one itself.
+- Actions:
+  - **degrade**: set the SSM parameter, set `DEGRADED_MODE=true` on the deployment and restart it
+  - **scale**: set the replica count
+  - **restart**: rolling restart through the restart annotation
+  - **degrade_or_scale**: degrade, then scale
+  - **drain_node**: evict pods from an unhealthy node. Not built yet.
+- Validation: raises `InvalidRequest` for an unknown action, a namespace that isn't in `ALLOWED_NAMESPACES` (`apps`), a deployment name that isn't a valid Kubernetes name, or replicas outside 1 to `MAX_REPLICAS` (`remediation_max_replicas`, default 10)
 - Kubernetes access: an EKS access entry maps its IAM role to the `checkout-remediation` group (IRSA only applies to pods)
 - RBAC: Limited to `apps` namespace, `deployments` resource
 
 ### 5. Storage & Notification Layer
 
 **DynamoDB**
-- Table: `sre-incidents`
-- Primary key: `incident_id` (UUID)
-- Sort key: `timestamp` (ISO 8601)
+- Table: `event-driven-sre-incidents` (`<name>-incidents`)
+- Primary key: `incident_id` (UUID), no sort key. The id is derived from the Alertmanager fingerprint and `startsAt`, or the Datadog `alert_cycle_key`, so it already identifies one occurrence of an alert; a `timestamp` sort key would mean every writer needs the start time, which a Datadog recovery event doesn't carry.
+- Global secondary index `by-status`: `status` and `first_seen_at`, to list open or escalated incidents newest first
 - Attributes:
-  - `alert_name`: String
-  - `severity`: String (critical, warning, info)
-  - `status`: String (open, remediating, resolved, escalated)
-  - `labels`: Map
-  - `actions_taken`: List
-  - `resolved_at`: Number (Unix timestamp)
-- Encryption: KMS
+  - `alertname`, `service`, `severity` (critical, warning, info), `source`
+  - `status`: open, remediating, resolved, escalated
+  - `first_seen_at`, `last_seen_at`, `resolved_at`, `remediation_started_at`, `escalated_at`: ISO 8601 strings
+  - `actions_taken`: List of `{action, result, at, execution}`, plus `last_action`, `last_action_result`, `last_action_at`
+  - `remediation_result` (auto_resolved or escalated), `remediated_by`, `mttr_seconds`, `escalation_reason`, `runbook_execution`
+  - `notification_count`, `correlation_id`
+  - `payload`: the full normalized alert as JSON, labels included
+  - `expires_at`: Number (Unix time), the TTL attribute
+- Encryption: DynamoDB's default AWS owned key for now; a customer managed KMS key is still to come
 - Point-in-time recovery: Enabled
-- TTL: 90 days (auto-delete old incidents)
+- TTL: 90 days after the incident's last activity (`incident_retention_days`)
+- Deletion protection: Enabled (`incidents_deletion_protection`). `scripts/destroy.sh` turns it off before `terraform destroy`.
 
 **SNS Topic**
 - Topic: `sre-incident-notifications`
@@ -423,11 +446,12 @@ graph TB
 
 **CloudWatch Logs**
 - Log groups:
-  - `/aws/lambda/alert-ingest`
-  - `/aws/lambda/runbook-action`
-  - `/aws/states/incident-response-runbook`
+  - `/aws/lambda/<name>-alert-ingest`
+  - `/aws/lambda/<name>-runbook-action`
+  - `/aws/vendedlogs/states/<name>-runbook` (every state's input and output)
+  - `/aws/vendedlogs/states/<name>-incident-recorder` (failed writes only; Express workflows keep no execution history)
   - `/aws/events/<name>` (every event on the bus)
-- Retention: 30 days
+- Retention: 30 days for the state machine and event logs. The two Lambda log groups are created by Lambda on first run and don't have a retention set yet.
 - Insights queries: Pre-built dashboards for MTTR, alert volume
 - Metric filters: Extract custom metrics (remediation success rate)
 
@@ -538,9 +562,9 @@ graph TB
 
 **Scenario 2: EKS API unreachable**
 - Impact: Remediation actions fail
-- Detection: runbook_action Lambda timeout
-- Mitigation: Step Functions retry (3 attempts, exponential backoff)
-- Escalation: SNS notification to on-call after retries exhausted
+- Detection: runbook_action Lambda errors or times out
+- Mitigation: Step Functions retry (3 attempts, exponential backoff with jitter)
+- Escalation: after the retries, the runbook marks the incident `escalated` and publishes `incident.escalated`, which goes to SNS
 
 **Scenario 3: EventBridge target failure**
 - Impact: Incidents not logged to DynamoDB
@@ -551,8 +575,8 @@ graph TB
 **Scenario 4: DynamoDB table deleted**
 - Impact: No incident history
 - Detection: Terraform state drift
-- Mitigation: Point-in-time recovery (restore from backup)
-- Prevention: Enable deletion protection on table
+- Mitigation: Point-in-time recovery is on, so the table can be restored to any second in the last 35 days
+- Prevention: Deletion protection is on; deleting the table, `terraform destroy` included, fails until it's turned off
 
 ---
 

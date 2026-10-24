@@ -16,22 +16,15 @@
           "Next": "RecordResolved"
         },
         {
-          "And": [
-            { "Variable": "$.detail-type", "StringEquals": "action.completed" },
-            { "Variable": "$.detail.result", "StringEquals": "failed" }
-          ],
-          "Next": "RecordActionFailed"
-        },
-        {
           "Variable": "$.detail-type",
           "StringEquals": "action.completed",
-          "Next": "RecordActionCompleted"
+          "Next": "RecordAction"
         }
       ],
       "Default": "Ignore"
     },
     "RecordCreated": {
-      "Comment": "Upsert. A re-sent firing alert bumps last_seen_at and notification_count but doesn't reset the status.",
+      "Comment": "Upsert. A re-sent firing alert bumps last_seen_at and notification_count but doesn't reset the status. expires_at is the TTL: last activity plus the retention period.",
       "Type": "Task",
       "Resource": "arn:aws:states:::dynamodb:updateItem",
       "Parameters": {
@@ -39,7 +32,7 @@
         "Key": {
           "incident_id": { "S.$": "$.detail.incident_id" }
         },
-        "UpdateExpression": "SET #status = if_not_exists(#status, :open), alertname = :alertname, service = :service, severity = :severity, #source = :source, first_seen_at = if_not_exists(first_seen_at, :received_at), last_seen_at = :received_at, correlation_id = :correlation_id, payload = :payload ADD notification_count :one",
+        "UpdateExpression": "SET #status = if_not_exists(#status, :open), alertname = :alertname, service = :service, severity = :severity, #source = :source, first_seen_at = if_not_exists(first_seen_at, :received_at), last_seen_at = :received_at, correlation_id = :correlation_id, payload = :payload, expires_at = :expires ADD notification_count :one",
         "ExpressionAttributeNames": { "#status": "status", "#source": "source" },
         "ExpressionAttributeValues": {
           ":open": { "S": "open" },
@@ -50,7 +43,8 @@
           ":received_at": { "S.$": "$.detail.received_at" },
           ":correlation_id": { "S.$": "$.detail.correlation_id" },
           ":payload": { "S.$": "States.JsonToString($.detail)" },
-          ":one": { "N": "1" }
+          ":one": { "N": "1" },
+          ":expires": { "N.$": "States.Format('{}', States.MathAdd($.detail.timestamp, ${ttl_seconds}))" }
         }
       },
       "End": true
@@ -63,16 +57,18 @@
         "Key": {
           "incident_id": { "S.$": "$.detail.incident_id" }
         },
-        "UpdateExpression": "SET #status = :resolved, resolved_at = :received_at, last_seen_at = :received_at",
+        "UpdateExpression": "SET #status = :resolved, resolved_at = :received_at, last_seen_at = :received_at, expires_at = :expires",
         "ExpressionAttributeNames": { "#status": "status" },
         "ExpressionAttributeValues": {
           ":resolved": { "S": "resolved" },
-          ":received_at": { "S.$": "$.detail.received_at" }
+          ":received_at": { "S.$": "$.detail.received_at" },
+          ":expires": { "N.$": "States.Format('{}', States.MathAdd($.detail.timestamp, ${ttl_seconds}))" }
         }
       },
       "End": true
     },
-    "RecordActionCompleted": {
+    "RecordAction": {
+      "Comment": "Success or failure. The runbook decides whether to escalate.",
       "Type": "Task",
       "Resource": "arn:aws:states:::dynamodb:updateItem",
       "Parameters": {
@@ -82,39 +78,6 @@
         },
         "UpdateExpression": "SET actions_taken = list_append(if_not_exists(actions_taken, :empty), :action), last_action = :name, last_action_result = :result, last_action_at = :at",
         "ExpressionAttributeValues": {
-          ":empty": { "L": [] },
-          ":action": {
-            "L": [
-              {
-                "M": {
-                  "action": { "S.$": "$.detail.action" },
-                  "result": { "S.$": "$.detail.result" },
-                  "at": { "S.$": "$.time" },
-                  "execution": { "S.$": "$.detail.execution" }
-                }
-              }
-            ]
-          },
-          ":name": { "S.$": "$.detail.action" },
-          ":result": { "S.$": "$.detail.result" },
-          ":at": { "S.$": "$.time" }
-        }
-      },
-      "End": true
-    },
-    "RecordActionFailed": {
-      "Comment": "Remediation gave up after its retries, so the incident needs a person.",
-      "Type": "Task",
-      "Resource": "arn:aws:states:::dynamodb:updateItem",
-      "Parameters": {
-        "TableName": "${table_name}",
-        "Key": {
-          "incident_id": { "S.$": "$.detail.incident_id" }
-        },
-        "UpdateExpression": "SET #status = :escalated, actions_taken = list_append(if_not_exists(actions_taken, :empty), :action), last_action = :name, last_action_result = :result, last_action_at = :at",
-        "ExpressionAttributeNames": { "#status": "status" },
-        "ExpressionAttributeValues": {
-          ":escalated": { "S": "escalated" },
           ":empty": { "L": [] },
           ":action": {
             "L": [

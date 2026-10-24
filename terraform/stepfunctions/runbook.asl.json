@@ -1,117 +1,454 @@
 {
-  "Comment": "Remediation for one incident. Started by the incident.created EventBridge rule with the incident as input.",
-  "StartAt": "ClaimIncident",
+  "Comment": "Remediation for one incident: evaluate, log, choose an action, run it, wait, verify, then mark it resolved or escalate. Started by the incident.created rule with the incident as input.",
+  "QueryLanguage": "JSONata",
+  "StartAt": "EvaluateAlert",
   "States": {
-    "ClaimIncident": {
-      "Comment": "One run per incident. Alertmanager re-sends firing alerts and EventBridge delivers at least once, so later runs stop here.",
+    "EvaluateAlert": {
+      "Comment": "Step 1. Only firing alerts at an auto-remediated severity go on. The rest already reached on-call through SNS, and so did alerts annotated runbook_action: notify_only, which only notify.",
+      "Type": "Pass",
+      "Assign": {
+        "incident": "{% $states.input %}",
+        "autoRemediate": "{% $states.input.status = 'firing' and $states.input.severity in [${auto_remediate_severities}] and $not($exists($states.input.annotations.runbook_action) and $states.input.annotations.runbook_action = 'notify_only') %}",
+        "action": "none",
+        "escalationReason": "",
+        "checks": 0,
+        "routes": {
+          "CheckoutHighErrorRate": { "action": "degrade_or_scale" },
+          "CheckoutHighLatencyP95": { "action": "degrade_or_scale" },
+          "CheckoutSLOBurnFast": { "action": "degrade_or_scale" },
+          "CheckoutDown": { "action": "restart" }
+        }
+      },
+      "Next": "ShouldRemediate"
+    },
+    "ShouldRemediate": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Condition": "{% $autoRemediate %}",
+          "Next": "LogIncident"
+        }
+      ],
+      "Default": "NotAutoRemediated"
+    },
+    "NotAutoRemediated": {
+      "Type": "Succeed"
+    },
+    "LogIncident": {
+      "Comment": "Step 2. Claims the incident so it's remediated once. Alertmanager re-sends firing alerts and EventBridge delivers at least once, so later runs stop here, as do runs for an alert that already resolved.",
       "Type": "Task",
       "Resource": "arn:aws:states:::dynamodb:updateItem",
-      "Parameters": {
+      "Arguments": {
         "TableName": "${table_name}",
         "Key": {
-          "incident_id": { "S.$": "$.incident_id" }
+          "incident_id": { "S": "{% $incident.incident_id %}" }
         },
-        "UpdateExpression": "SET #status = :remediating, remediation_started_at = :now",
-        "ConditionExpression": "attribute_not_exists(remediation_started_at)",
+        "UpdateExpression": "SET #status = :remediating, remediation_started_at = :now, runbook_execution = :execution",
+        "ConditionExpression": "attribute_not_exists(remediation_started_at) AND (attribute_not_exists(#status) OR #status <> :resolved)",
         "ExpressionAttributeNames": { "#status": "status" },
         "ExpressionAttributeValues": {
           ":remediating": { "S": "remediating" },
-          ":now": { "S.$": "$$.State.EnteredTime" }
+          ":resolved": { "S": "resolved" },
+          ":now": { "S": "{% $states.context.State.EnteredTime %}" },
+          ":execution": { "S": "{% $states.context.Execution.Id %}" }
         }
       },
-      "ResultPath": null,
+      "Retry": [
+        {
+          "ErrorEquals": ["DynamoDB.ConditionalCheckFailedException"],
+          "MaxAttempts": 0
+        },
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0,
+          "JitterStrategy": "FULL"
+        }
+      ],
       "Catch": [
         {
           "ErrorEquals": ["DynamoDB.ConditionalCheckFailedException"],
-          "ResultPath": null,
           "Next": "AlreadyHandled"
+        },
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Assign": {
+            "escalationReason": "{% 'could not record the incident: ' & $states.errorOutput.Error %}"
+          },
+          "Next": "Escalate"
         }
       ],
-      "Next": "InvokeRunbookAction"
+      "Next": "ChooseAction"
     },
     "AlreadyHandled": {
+      "Comment": "Another run has this incident, or it resolved before we got to it.",
       "Type": "Succeed"
     },
-    "InvokeRunbookAction": {
+    "ChooseAction": {
+      "Comment": "Step 3. Maps the alert to an action. A runbook_action annotation on the alert wins over the table. The target comes from the alert's labels (or Datadog's kube_namespace and kube_deployment tags), falling back to the checkout deployment.",
+      "Type": "Pass",
+      "Assign": {
+        "action": "{% $exists($incident.annotations.runbook_action) ? $incident.annotations.runbook_action : ($exists($lookup($routes, $incident.alertname)) ? $lookup($routes, $incident.alertname).action : 'none') %}",
+        "target": {
+          "namespace": "{% $exists($incident.labels.namespace) ? $incident.labels.namespace : ($exists($incident.labels.kube_namespace) ? $incident.labels.kube_namespace : '${default_namespace}') %}",
+          "deployment": "{% $exists($incident.labels.deployment) ? $incident.labels.deployment : ($exists($incident.labels.kube_deployment) ? $incident.labels.kube_deployment : (($exists($incident.service) and $incident.service != 'unknown') ? $incident.service : '${default_deployment}')) %}",
+          "replicas": "{% $exists($incident.annotations.desired_replicas) ? $incident.annotations.desired_replicas : ${default_replicas} %}"
+        },
+        "escalationReason": "{% $exists($incident.annotations.runbook_action) ? 'unknown runbook_action ' & $incident.annotations.runbook_action & ' on ' & $incident.alertname : 'no runbook for ' & $incident.alertname %}"
+      },
+      "Next": "RunbookAvailable"
+    },
+    "RunbookAvailable": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Condition": "{% $action in ['degrade', 'restart', 'scale', 'degrade_or_scale'] %}",
+          "Next": "ExecuteAction"
+        }
+      ],
+      "Default": "Escalate"
+    },
+    "ExecuteAction": {
+      "Comment": "Step 4. runbook_action does the Kubernetes work. Bad input (InvalidRequest) isn't retried; anything else gets 3 retries with backoff.",
       "Type": "Task",
       "Resource": "arn:aws:states:::lambda:invoke",
-      "Parameters": {
+      "TimeoutSeconds": 150,
+      "Arguments": {
         "FunctionName": "${runbook_action_arn}",
-        "Payload.$": "$"
+        "Payload": {
+          "incident_id": "{% $incident.incident_id %}",
+          "alertname": "{% $incident.alertname %}",
+          "severity": "{% $incident.severity %}",
+          "action": "{% $action %}",
+          "namespace": "{% $target.namespace %}",
+          "deployment": "{% $target.deployment %}",
+          "replicas": "{% $target.replicas %}"
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["InvalidRequest"],
+          "MaxAttempts": 0
+        },
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Assign": {
+        "actionOutput": "{% $states.result.Payload %}"
+      },
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Assign": {
+            "actionError": "{% $states.errorOutput %}",
+            "escalationReason": "{% $action & ' failed: ' & $states.errorOutput.Error %}"
+          },
+          "Next": "ReportActionFailed"
+        }
+      ],
+      "Next": "ReportActionCompleted"
+    },
+    "ReportActionCompleted": {
+      "Comment": "The incident recorder adds this to actions_taken.",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::events:putEvents",
+      "Arguments": {
+        "Entries": [
+          {
+            "EventBusName": "${event_bus_name}",
+            "Source": "sre.runbook",
+            "DetailType": "action.completed",
+            "Detail": {
+              "incident_id": "{% $incident.incident_id %}",
+              "alertname": "{% $incident.alertname %}",
+              "action": "{% $action %}",
+              "result": "success",
+              "output": "{% $actionOutput %}",
+              "execution": "{% $states.context.Execution.Id %}"
+            }
+          }
+        ]
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "WaitForStabilization"
+        }
+      ],
+      "Next": "WaitForStabilization"
+    },
+    "ReportActionFailed": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::events:putEvents",
+      "Arguments": {
+        "Entries": [
+          {
+            "EventBusName": "${event_bus_name}",
+            "Source": "sre.runbook",
+            "DetailType": "action.completed",
+            "Detail": {
+              "incident_id": "{% $incident.incident_id %}",
+              "alertname": "{% $incident.alertname %}",
+              "action": "{% $action %}",
+              "result": "failed",
+              "error": "{% $actionError.Error %}",
+              "cause": "{% $exists($actionError.Cause) ? $actionError.Cause : '' %}",
+              "execution": "{% $states.context.Execution.Id %}"
+            }
+          }
+        ]
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "Escalate"
+        }
+      ],
+      "Next": "Escalate"
+    },
+    "WaitForStabilization": {
+      "Comment": "Step 5. Gives the rollout and the alert's rate window time to settle.",
+      "Type": "Wait",
+      "Seconds": "{% ${stabilization_seconds} %}",
+      "Next": "VerifyResolution"
+    },
+    "VerifyResolution": {
+      "Comment": "Step 6. The incident recorder sets status=resolved when the resolved alert comes in, so this reads the item.",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:getItem",
+      "Arguments": {
+        "TableName": "${table_name}",
+        "Key": {
+          "incident_id": { "S": "{% $incident.incident_id %}" }
+        },
+        "ConsistentRead": true,
+        "ProjectionExpression": "#status, first_seen_at, resolved_at",
+        "ExpressionAttributeNames": { "#status": "status" }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Assign": {
+        "item": "{% $exists($states.result.Item) ? $states.result.Item : {} %}",
+        "checks": "{% $checks + 1 %}"
+      },
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Assign": {
+            "escalationReason": "{% 'could not check the incident: ' & $states.errorOutput.Error %}"
+          },
+          "Next": "Escalate"
+        }
+      ],
+      "Next": "IsResolved"
+    },
+    "IsResolved": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Condition": "{% $item.status.S = 'resolved' %}",
+          "Assign": {
+            "mttr": "{% ($exists($item.first_seen_at.S) and $exists($item.resolved_at.S)) ? $round(($toMillis($item.resolved_at.S) - $toMillis($item.first_seen_at.S)) / 1000) : 0 %}"
+          },
+          "Next": "MarkResolved"
+        },
+        {
+          "Condition": "{% $checks >= ${verify_attempts} %}",
+          "Assign": {
+            "escalationReason": "{% $incident.alertname & ' still firing after ' & $action %}"
+          },
+          "Next": "Escalate"
+        }
+      ],
+      "Default": "WaitBeforeRecheck"
+    },
+    "WaitBeforeRecheck": {
+      "Type": "Wait",
+      "Seconds": "{% ${verify_poll_seconds} %}",
+      "Next": "VerifyResolution"
+    },
+    "MarkResolved": {
+      "Comment": "Step 7, resolved. MTTR runs from when the platform first saw the alert to when it saw the resolution.",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Arguments": {
+        "TableName": "${table_name}",
+        "Key": {
+          "incident_id": { "S": "{% $incident.incident_id %}" }
+        },
+        "UpdateExpression": "SET remediation_result = :result, remediated_by = :action, mttr_seconds = :mttr",
+        "ExpressionAttributeValues": {
+          ":result": { "S": "auto_resolved" },
+          ":action": { "S": "{% $action %}" },
+          ":mttr": { "N": "{% $string($mttr) %}" }
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "PublishAutoResolved"
+        }
+      ],
+      "Next": "PublishAutoResolved"
+    },
+    "PublishAutoResolved": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::events:putEvents",
+      "Arguments": {
+        "Entries": [
+          {
+            "EventBusName": "${event_bus_name}",
+            "Source": "sre.runbook",
+            "DetailType": "incident.auto_resolved",
+            "Detail": {
+              "incident_id": "{% $incident.incident_id %}",
+              "alertname": "{% $incident.alertname %}",
+              "service": "{% $incident.service %}",
+              "severity": "{% $incident.severity %}",
+              "action": "{% $action %}",
+              "mttr_seconds": "{% $mttr %}",
+              "execution": "{% $states.context.Execution.Id %}"
+            }
+          }
+        ]
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "AutoResolved"
+        }
+      ],
+      "Next": "AutoResolved"
+    },
+    "AutoResolved": {
+      "Type": "Succeed"
+    },
+    "Escalate": {
+      "Comment": "Step 7, escalated. Hands the incident to a person, unless the alert resolved in the meantime.",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Arguments": {
+        "TableName": "${table_name}",
+        "Key": {
+          "incident_id": { "S": "{% $incident.incident_id %}" }
+        },
+        "UpdateExpression": "SET #status = :escalated, escalated_at = :now, escalation_reason = :reason, remediation_result = :escalated",
+        "ConditionExpression": "attribute_not_exists(#status) OR #status <> :resolved",
+        "ExpressionAttributeNames": { "#status": "status" },
+        "ExpressionAttributeValues": {
+          ":escalated": { "S": "escalated" },
+          ":resolved": { "S": "resolved" },
+          ":now": { "S": "{% $states.context.State.EnteredTime %}" },
+          ":reason": { "S": "{% $escalationReason %}" }
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["DynamoDB.ConditionalCheckFailedException"],
+          "MaxAttempts": 0
+        },
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["DynamoDB.ConditionalCheckFailedException"],
+          "Next": "ResolvedBeforeEscalation"
+        },
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "PublishEscalation"
+        }
+      ],
+      "Next": "PublishEscalation"
+    },
+    "ResolvedBeforeEscalation": {
+      "Type": "Succeed"
+    },
+    "PublishEscalation": {
+      "Comment": "A rule sends this to SNS.",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::events:putEvents",
+      "Arguments": {
+        "Entries": [
+          {
+            "EventBusName": "${event_bus_name}",
+            "Source": "sre.runbook",
+            "DetailType": "incident.escalated",
+            "Detail": {
+              "incident_id": "{% $incident.incident_id %}",
+              "alertname": "{% $incident.alertname %}",
+              "service": "{% $incident.service %}",
+              "severity": "{% $incident.severity %}",
+              "action": "{% $action %}",
+              "reason": "{% $escalationReason %}",
+              "execution": "{% $states.context.Execution.Id %}"
+            }
+          }
+        ]
       },
       "Retry": [
         {
           "ErrorEquals": ["States.ALL"],
           "IntervalSeconds": 2,
-          "MaxAttempts": 3,
+          "MaxAttempts": 5,
           "BackoffRate": 2.0
         }
       ],
-      "ResultSelector": {
-        "action.$": "$.Payload.action",
-        "output.$": "$.Payload"
-      },
-      "ResultPath": "$.runbook_result",
-      "Catch": [
-        {
-          "ErrorEquals": ["States.ALL"],
-          "ResultPath": "$.error",
-          "Next": "ReportFailed"
-        }
-      ],
-      "Next": "ReportCompleted"
+      "Next": "Escalated"
     },
-    "ReportCompleted": {
-      "Type": "Task",
-      "Resource": "arn:aws:states:::events:putEvents",
-      "Parameters": {
-        "Entries": [
-          {
-            "EventBusName": "${event_bus_name}",
-            "Source": "sre.runbook",
-            "DetailType": "action.completed",
-            "Detail": {
-              "incident_id.$": "$.incident_id",
-              "alertname.$": "$.alertname",
-              "action.$": "$.runbook_result.action",
-              "result": "success",
-              "output.$": "$.runbook_result.output",
-              "execution.$": "$$.Execution.Id"
-            }
-          }
-        ]
-      },
-      "ResultPath": null,
-      "End": true
-    },
-    "ReportFailed": {
-      "Type": "Task",
-      "Resource": "arn:aws:states:::events:putEvents",
-      "Parameters": {
-        "Entries": [
-          {
-            "EventBusName": "${event_bus_name}",
-            "Source": "sre.runbook",
-            "DetailType": "action.completed",
-            "Detail": {
-              "incident_id.$": "$.incident_id",
-              "alertname.$": "$.alertname",
-              "action": "unknown",
-              "result": "failed",
-              "error.$": "$.error.Error",
-              "cause.$": "$.error.Cause",
-              "execution.$": "$$.Execution.Id"
-            }
-          }
-        ]
-      },
-      "ResultPath": null,
-      "Next": "RemediationFailed"
-    },
-    "RemediationFailed": {
+    "Escalated": {
       "Type": "Fail",
-      "Error": "RemediationFailed",
-      "Cause": "runbook_action failed after retries; the error is in the execution history and the action.completed event"
+      "Error": "Escalated",
+      "Cause": "{% $escalationReason %}"
     }
   }
 }
