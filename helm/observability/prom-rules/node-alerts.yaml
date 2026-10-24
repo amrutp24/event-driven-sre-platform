@@ -1,0 +1,22 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: node-alerts
+  labels:
+    release: mon
+spec:
+  groups:
+  - name: node.rules
+    rules:
+    # The runbook drains the node (drain_node). It only drains apps nodes, and
+    # escalates for a system node.
+    - alert: NodeUnderPressure
+      expr: |
+        kube_node_status_condition{condition=~"MemoryPressure|DiskPressure|PIDPressure", status="true"} == 1
+      for: 5m
+      labels:
+        severity: critical
+        service: cluster
+      annotations:
+        summary: "Node {{ $labels.node }} has had {{ $labels.condition }} for 5 minutes"
+        runbook: "stepfunctions:RunbookDrainNode"

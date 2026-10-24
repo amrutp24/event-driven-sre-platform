@@ -14,8 +14,9 @@ variable "eks_cluster_name" {
 }
 
 variable "eks_version" {
-  type    = string
-  default = "1.29"
+  description = "Kubernetes version. An existing cluster has to be upgraded one minor version at a time."
+  type        = string
+  default     = "1.36"
 }
 
 variable "vpc_cidr" {
@@ -140,6 +141,17 @@ variable "incidents_deletion_protection" {
   description = "Deletion protection on the incidents table. scripts/destroy.sh sets this to false before tearing down."
   type        = bool
   default     = true
+}
+
+variable "drain_min_schedulable_nodes" {
+  description = "drain_node refuses to drain an apps node unless at least this many other apps nodes are Ready and schedulable"
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.drain_min_schedulable_nodes >= 1
+    error_message = "Must be at least 1."
+  }
 }
 
 variable "remediation_max_replicas" {

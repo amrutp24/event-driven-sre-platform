@@ -117,7 +117,7 @@ All IAM roles and policies follow the principle of least privilege—granting on
 
 **Note**: The actual Kubernetes access is controlled by RBAC (see below), not IAM. The role also has the AWS-managed `AWSLambdaVPCAccessExecutionRole` policy so the Lambda can run in the private subnets.
 
-**Input checks**: the Lambda only runs what the state machine sends it, and checks that first. It raises `InvalidRequest` for an action other than `degrade`, `restart`, `scale` or `degrade_or_scale`, a namespace that isn't in `ALLOWED_NAMESPACES` (`apps`), a deployment name that isn't a valid Kubernetes name, or replicas outside 1 to `MAX_REPLICAS` (`remediation_max_replicas`, default 10). The state machine doesn't retry `InvalidRequest`; it escalates the incident instead. So an alert can't point the Lambda at another namespace or scale a deployment without limit, even though the target comes from the alert's labels.
+**Input checks**: the Lambda only runs what the state machine sends it, and checks that first. It raises `InvalidRequest` for an action other than `degrade`, `restart`, `scale`, `degrade_or_scale` or `drain_node`, a namespace that isn't in `ALLOWED_NAMESPACES` (`apps`), a deployment name that isn't a valid Kubernetes name, replicas outside 1 to `MAX_REPLICAS` (`remediation_max_replicas`, default 10), or `degrade` for anything but checkout. For `drain_node` it refuses an invalid or unknown node name, a node without the `nodegroup=apps` label, and a drain that would leave no other Ready, schedulable apps node (`drain_min_schedulable_nodes`, default 1). The state machine doesn't retry `InvalidRequest`; it escalates the incident instead. So an alert can't point the Lambda at another namespace, scale a deployment without limit, or drain a system node or the last apps node, even though the target comes from the alert's labels.
 
 ### Step Functions Execution Role
 
@@ -212,6 +212,22 @@ IRSA allows Kubernetes pods to assume IAM roles via the EKS OIDC provider, elimi
 - **Audit Trail**: Every AssumeRoleWithWebIdentity call logged in CloudTrail
 - **Least Privilege**: ServiceAccount bound to specific IAM role and Kubernetes Role
 
+### The checkout app's role
+
+The checkout pods read the degraded-mode flag from SSM. The chart's `checkout` service account carries the role from `terraform output checkout_role_arn` (`terraform/irsa.tf`, passed in by `scripts/deploy.sh`), and the role trusts only `apps:checkout`. Its one permission:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": ["ssm:GetParameter"],
+  "Resource": "arn:aws:ssm:REGION:ACCOUNT_ID:parameter/checkout/degraded_mode"
+}
+```
+
+It can't write the flag or read any other parameter. Only the runbook_action Lambda writes it.
+
+The container runs from `python:3.13-slim` as a non-root user (UID 10001).
+
 ### How the runbook_action Lambda authenticates
 
 IRSA only works for pods, and the Lambda isn't a pod. Instead it calls the Kubernetes API as its own IAM role, and the cluster maps that role to a Kubernetes group with an EKS access entry (`terraform/eks.tf`):
@@ -235,7 +251,7 @@ The Lambda runs in the private subnets and reaches the cluster's private API end
 **Security Properties**:
 - ✅ No kubeconfig, static token or long-lived key is stored anywhere
 - ✅ Only this IAM role is mapped to the `checkout-remediation` group
-- ✅ The group has no permissions outside the `apps` namespace
+- ✅ Outside the `apps` namespace, the group can only look at and cordon nodes, list pods and evict them (for `drain_node`)
 
 ---
 
@@ -243,7 +259,7 @@ The Lambda runs in the private subnets and reaches the cluster's private API end
 
 ### Principle: Namespace Isolation
 
-The runbook_action Lambda (through its access entry) has limited Kubernetes permissions scoped to the `apps` namespace. The Role and RoleBinding are in `k8s/rbac/remediation-role.yaml` and applied by `scripts/deploy.sh`.
+The runbook_action Lambda (through its access entry) can change workloads only in the `apps` namespace. The one exception is `drain_node`: nodes are cluster-scoped and a node runs pods from every namespace, so cordoning one and evicting its pods needs a ClusterRole. That ClusterRole can't change any workload, only nodes and evictions. The Role, the ClusterRole and their bindings are in `k8s/rbac/remediation-role.yaml` and applied by `scripts/deploy.sh`.
 
 ### Role Definition
 
@@ -254,21 +270,51 @@ metadata:
   name: checkout-remediation
   namespace: apps
 rules:
-  # Allow getting and patching deployments
+  # Read, scale and restart deployments
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["get", "list", "patch"]
 
-  # Allow listing pods (for verification)
+  # scale raises the HPA's minimum instead of fighting it over replicas
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "patch"]
+
+  # Look at pods to verify a rollout
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list"]
 
-  # Allow reading configmaps (if needed for config)
+  # Read app config
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["get", "list"]
 ```
+
+### ClusterRole for drain_node
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: checkout-remediation-nodes
+rules:
+  # Check the node's labels and readiness, then cordon it
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "patch"]
+
+  # Find the pods on the node
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]
+
+  - apiGroups: [""]
+    resources: ["pods/eviction"]
+    verbs: ["create"]
+```
+
+It's bound to the same `checkout-remediation` group with a ClusterRoleBinding of the same name. Eviction goes through the Eviction API, which respects PodDisruptionBudgets; there's no permission to delete pods outright. The Lambda also limits which nodes it will drain (see the input checks above), but RBAC can't express "only `apps` nodes", so the cluster-wide grant is the backstop, not the limit.
 
 ### RoleBinding
 
@@ -290,13 +336,13 @@ roleRef:
 
 ### What the Lambda CANNOT Do
 
-- ❌ Delete deployments, pods, or other resources
+- ❌ Delete deployments, pods, nodes or other resources (evicting is allowed, deleting isn't)
 - ❌ Create new deployments or pods
-- ❌ Modify resources in other namespaces (e.g., `kube-system`, `monitoring`)
+- ❌ Modify deployments or other workloads in other namespaces (e.g., `kube-system`, `monitoring`)
 - ❌ Access secrets or service accounts
 - ❌ Modify RBAC rules (roles, rolebindings, clusterroles)
 - ❌ Exec into pods or access pod logs
-- ❌ Delete nodes or modify cluster-level resources
+- ❌ Modify cluster-level resources other than nodes. It can patch nodes, and the Lambda only uses that to cordon them.
 
 ### Security Validation
 
@@ -310,8 +356,16 @@ kubectl auth can-i patch deployments -n apps --as=runbook-action --as-group=chec
 kubectl auth can-i delete deployments -n apps --as=runbook-action --as-group=checkout-remediation
 # Expected: no
 
-# Verify it CANNOT access other namespaces
-kubectl auth can-i get pods -n kube-system --as=runbook-action --as-group=checkout-remediation
+# Verify it CANNOT change workloads in other namespaces
+kubectl auth can-i patch deployments -n kube-system --as=runbook-action --as-group=checkout-remediation
+# Expected: no
+
+# drain_node: it can cordon nodes and evict pods anywhere, but not delete them
+kubectl auth can-i patch nodes --as=runbook-action --as-group=checkout-remediation
+# Expected: yes
+kubectl auth can-i create pods/eviction -n kube-system --as=runbook-action --as-group=checkout-remediation
+# Expected: yes
+kubectl auth can-i delete pods -n apps --as=runbook-action --as-group=checkout-remediation
 # Expected: no
 ```
 
@@ -426,7 +480,7 @@ All network traffic is encrypted:
 
 | Secret Type | Storage | Access Method |
 |-------------|---------|---------------|
-| **Feature Flags** | SSM Parameter Store (SecureString) | Lambda reads via AWS SDK |
+| **Feature Flags** | SSM Parameter Store (String; the flag isn't sensitive) | The runbook_action Lambda writes `/checkout/degraded_mode`; checkout pods read it through their IRSA role |
 | **Database Passwords** | AWS Secrets Manager | Pod reads via IRSA + CSI driver |
 | **API Keys** | AWS Secrets Manager | Injected as environment variables |
 | **TLS Certificates** | AWS Certificate Manager | ALB auto-fetches |
@@ -544,19 +598,20 @@ Every incident is logged with:
 12. **Infrastructure Scanning**: tfsec validates Terraform
 13. **VPC Endpoints**: Private connectivity to AWS services (optional, recommended)
 14. **API Gateway Throttling**: Rate limiting to prevent abuse
+15. **Non-root Container**: the checkout image runs as an unprivileged user
 
 ### 🚧 Recommended for Production
 
-15. **Multi-Factor Authentication (MFA)**: Require MFA for all AWS console access
-16. **Service Control Policies (SCPs)**: Prevent deletion of CloudTrail, KMS keys
-17. **GuardDuty**: Threat detection for AWS accounts
-18. **Security Hub**: Centralized security findings
-19. **Config Rules**: Continuous compliance monitoring (e.g., ensure encryption enabled)
-20. **Secrets Rotation**: Auto-rotate database passwords, API keys
-21. **WAF Rules**: Protect API Gateway from common attacks (SQL injection, XSS)
-22. **DDoS Protection**: AWS Shield Standard (free) or Advanced (paid)
-23. **VPC Flow Logs**: Network traffic analysis
-24. **S3 Bucket Policies**: Prevent public access to logs and artifacts
+16. **Multi-Factor Authentication (MFA)**: Require MFA for all AWS console access
+17. **Service Control Policies (SCPs)**: Prevent deletion of CloudTrail, KMS keys
+18. **GuardDuty**: Threat detection for AWS accounts
+19. **Security Hub**: Centralized security findings
+20. **Config Rules**: Continuous compliance monitoring (e.g., ensure encryption enabled)
+21. **Secrets Rotation**: Auto-rotate database passwords, API keys
+22. **WAF Rules**: Protect API Gateway from common attacks (SQL injection, XSS)
+23. **DDoS Protection**: AWS Shield Standard (free) or Advanced (paid)
+24. **VPC Flow Logs**: Network traffic analysis
+25. **S3 Bucket Policies**: Prevent public access to logs and artifacts
 
 ---
 
@@ -620,7 +675,7 @@ Use this checklist before deploying to production:
 **Mitigations**:
 - ✅ API Gateway validates JSON schema (reject malformed requests)
 - ✅ alert_ingest Lambda validates alert structure and source
-- ✅ RBAC limits Lambda to patch deployments only (cannot delete)
+- ✅ RBAC limits Lambda to patching deployments and HPAs, cordoning nodes and evicting pods (cannot delete anything)
 - ✅ The state machine only runs four known actions, and the Lambda rejects other namespaces, invalid deployment names and replica counts over `MAX_REPLICAS`
 - ✅ An incident is remediated once, however many times the alert is sent
 - ✅ API Gateway throttling prevents alert flood
@@ -650,7 +705,7 @@ Use this checklist before deploying to production:
 
 **Mitigations**:
 - ✅ Keep EKS version up-to-date (patches security issues)
-- ✅ RBAC limits the remediation group to the `apps` namespace
+- ✅ RBAC limits the remediation group's workload changes to the `apps` namespace; outside it, only cordons and evictions
 - ✅ Pod Security Standards (PSS) enforce best practices
 - ✅ Network policies isolate namespaces
 - ✅ Audit logs capture unauthorized access attempts

@@ -3,7 +3,9 @@ kind: Deployment
 metadata:
   name: checkout
 spec:
+  {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.replicaCount }}
+  {{- end }}
   selector:
     matchLabels:
       app: checkout
@@ -12,6 +14,15 @@ spec:
       labels:
         app: checkout
     spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      # Spread across nodes, so draining one node doesn't take every replica
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: checkout
       containers:
       - name: checkout
         image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -20,18 +31,29 @@ spec:
         env:
         - name: DEGRADED_MODE
           value: "{{ .Values.env.DEGRADED_MODE }}"
+        - name: DEGRADED_PARAM
+          value: "{{ .Values.env.DEGRADED_PARAM }}"
+        - name: AWS_REGION
+          value: "{{ .Values.env.AWS_REGION }}"
         - name: ERROR_RATE
           value: "{{ .Values.env.ERROR_RATE }}"
         - name: LATENCY_MS
           value: "{{ .Values.env.LATENCY_MS }}"
         - name: CHAOS
           value: "{{ .Values.env.CHAOS }}"
+        securityContext:
+          # The image's app user
+          runAsNonRoot: true
+          runAsUser: 10001
+          allowPrivilegeEscalation: false
         readinessProbe:
           httpGet: { path: /readyz, port: 8080 }
           initialDelaySeconds: 5
           periodSeconds: 5
+          failureThreshold: 3
         livenessProbe:
           httpGet: { path: /healthz, port: 8080 }
           initialDelaySeconds: 10
           periodSeconds: 10
+          timeoutSeconds: 5
         resources: {{- toYaml .Values.resources | nindent 10 }}

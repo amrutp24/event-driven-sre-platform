@@ -84,15 +84,16 @@ Expected: Error rate near 0, all targets healthy.
 
 ---
 
-## Demo Script (5-7 minutes)
+## Demo Script (about 15 minutes)
 
 ### Phase 1: Show Healthy State (30 seconds)
 
 **Script**: "Let me show you the system in a healthy state. We have a checkout microservice running on EKS, monitored by Prometheus."
 
 ```bash
-# Show running pods
+# Show running pods, and the autoscaler that keeps 3 to 10 of them
 kubectl get pods -n apps -l app=checkout
+kubectl get hpa checkout -n apps
 
 # Expected output:
 # NAME                        READY   STATUS    RESTARTS   AGE
@@ -194,7 +195,7 @@ aws logs tail /aws/vendedlogs/states/event-driven-sre-runbook --follow --format 
 **Show in AWS Console** (Step Functions → State machines → event-driven-sre-runbook → Executions):
 - The graph runs EvaluateAlert → ShouldRemediate → LogIncident → ChooseAction → RunbookAvailable → ExecuteAction → ReportActionCompleted, then sits in WaitForStabilization
 - ExecuteAction's details show what was sent to the Lambda: `action: degrade_or_scale`, `namespace: apps`, `deployment: checkout`, `replicas: 4`
-- Its output is what the Lambda returned, including `degraded: true` and `scaled_to: 4`
+- Its output is what the Lambda returned, including `degraded: true`, `scaled_to: 4` and `scaled_via: hpa`
 
 **Talking point**: "Step Functions claimed the incident in DynamoDB, picked degrade_or_scale for this alert, and had the runbook_action Lambda apply it. If Alertmanager re-sends the alert, the next run sees the claim and stops."
 
@@ -207,39 +208,37 @@ aws logs tail /aws/lambda/event-driven-sre-runbook-action --follow --format shor
 
 ### Phase 5: Verify Remediation Applied (1 minute)
 
-**Script**: "The Lambda set degraded mode on the deployment, restarted it and scaled it up. Let's verify the changes."
+**Script**: "The Lambda turned on degraded mode through SSM and raised the autoscaler's minimum. Let's verify the changes."
 
 ```bash
-# Replicas and DEGRADED_MODE on the deployment
-kubectl get deployment checkout -n apps \
-  -o jsonpath='{.spec.replicas} {.spec.template.spec.containers[0].env[?(@.name=="DEGRADED_MODE")].value}{"\n"}'
-
-# Expected output: 4 true
-
-# Restart annotation the Lambda added
-kubectl get deployment checkout -n apps \
-  -o jsonpath='{.spec.template.metadata.annotations.kubectl\.kubernetes\.io/restartedAt}{"\n"}'
-
-# Expected: Recent timestamp
-
-# SSM parameter the Lambda sets as a record
+# The SSM parameter the pods read
 aws ssm get-parameter --name /checkout/degraded_mode --query 'Parameter.Value' --output text
 
 # Expected output: true
 
-# Watch pods rolling restart
+# The pod's own view. Requests and scrapes re-read the parameter at most every 15 seconds.
+curl -s http://localhost:8080/metrics | grep checkout_degraded_mode_enabled
+
+# Expected output: checkout_degraded_mode_enabled 1.0
+
+# The HPA minimum the Lambda raised
+kubectl get hpa checkout -n apps
+
+# Expected: MINPODS 4, MAXPODS 10
+
+# Watch the extra pod start
 kubectl get pods -n apps -l app=checkout -w
 
-# Expected: Pods terminating and new pods starting
+# Expected: a fourth pod starting. The others keep running; nothing restarts.
 ```
 
-**Talking point**: "In degraded mode the service skips the injected errors and latency, and the extra replicas carry the load while it rolls out."
+**Talking point**: "In degraded mode the service skips the injected errors and latency. The pods picked the flag up on their own, without a restart, and the extra replica adds headroom while things settle."
 
 ---
 
 ### Phase 6: Observe Error Rate Drop (1 minute)
 
-**Script**: "As the new pods come online, the error rate drops below the threshold and the alert resolves."
+**Script**: "Once the pods see the flag, they stop failing requests, the error rate drops below the threshold and the alert resolves."
 
 ```bash
 # 5xx counts stop increasing
@@ -248,7 +247,7 @@ curl -s http://localhost:8080/metrics | grep 'http_requests_total{route="/checko
 # The alert's own expression
 # Open http://localhost:9090/graph
 # Query: sum(rate(http_requests_total{route="/checkout",code=~"5.."}[5m])) / sum(rate(http_requests_total{route="/checkout"}[5m]))
-# Expected: climbs to about 0.10, then falls once the new pods are up and crosses 0.05 a couple of minutes later
+# Expected: climbs to about 0.10, then falls once degraded mode is on and crosses 0.05 a couple of minutes later
 ```
 
 **Talking point**: "New requests aren't failing any more, but the alert looks at a 5 minute window, so the ratio takes a couple of minutes to drop under 5%. Then Alertmanager sends the resolved notification on its next 2 minute `group_interval`. The runbook is checking DynamoDB every 30 seconds in the meantime, and gives it up to 10 minutes from the action."
@@ -375,28 +374,30 @@ echo "System capacity: 1000 alerts/second, 100 concurrent remediations"
 
 To reset the system for another demo or return to normal state:
 
+The runbook doesn't undo its own changes, so this is also how to put things back after a real incident.
+
 ```bash
-# Step 1: Turn off error injection and degraded mode (the chart's defaults)
-kubectl set env deployment/checkout -n apps ERROR_RATE=0.00 DEGRADED_MODE=false
+# Step 1: Turn off error injection (the chart's default)
+kubectl set env deployment/checkout -n apps ERROR_RATE=0.00
 
 # Verify
 kubectl get deployment checkout -n apps -o jsonpath='{.spec.template.spec.containers[0].env}'
 
-# Step 2: Back to the chart's replica count
-kubectl scale deployment/checkout -n apps --replicas=2
-
-# Step 3: Reset the SSM record
+# Step 2: Turn off degraded mode. The pods pick it up within 15 seconds; no restart needed.
 aws ssm put-parameter \
   --name /checkout/degraded_mode \
   --value "false" \
   --overwrite
 
+# Step 3: Put the HPA minimum back to the chart's 3 (re-running deploy.sh does this too)
+kubectl patch hpa checkout -n apps --type merge -p '{"spec":{"minReplicas":3}}'
+
 # Step 4: Wait for rollout to complete
 kubectl rollout status deployment/checkout -n apps
 
 # Step 5: Verify healthy state
-curl -s http://localhost:8080/metrics | grep 'http_requests_total{route="/checkout"'
-# Expected: 5xx counts stopped increasing
+curl -s http://localhost:8080/metrics | grep -E 'checkout_degraded_mode_enabled|http_requests_total\{route="/checkout"'
+# Expected: checkout_degraded_mode_enabled 0.0, and 5xx counts stopped increasing
 
 # Step 6: Clear old incident records (optional)
 aws dynamodb delete-item \
@@ -544,28 +545,27 @@ kubectl auth can-i patch deployments -n apps --as=runbook-action --as-group=chec
 
 ### Issue 5: Degraded Mode Not Working
 
-**Symptoms**: SSM parameter updated, but app still has errors
+**Symptoms**: SSM parameter is `true`, but the app still returns errors
 
 **Debug steps**:
 ```bash
-# Check app is reading SSM
-kubectl logs -n apps -l app=checkout | grep -i "degraded"
-
-# Expected: Log entry showing parameter read
-
 # Check parameter value
 aws ssm get-parameter --name /checkout/degraded_mode --query 'Parameter.Value' --output text
 
-# Check IAM permissions for pods
-# Pods should have IRSA role to read SSM
+# The pod's own view (0.0 or 1.0), re-read at most every 15 seconds.
+curl -s http://localhost:8080/metrics | grep checkout_degraded_mode_enabled
+
+# A pod that can't read SSM logs one warning and keeps its last value
+kubectl logs -n apps -l app=checkout | grep "Can't read"
+
+# The service account should carry the IRSA role, and the pods should have AWS_ROLE_ARN
+kubectl get sa checkout -n apps -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}{"\n"}'
 kubectl describe pod -n apps -l app=checkout | grep -i "AWS_ROLE_ARN"
 ```
 
-**Fix**: If pods can't read SSM, check IAM policy:
+**Fix**: The role ARN should match `terraform -chdir=terraform output -raw checkout_role_arn`. If it's missing or different, re-run `scripts/deploy.sh`, which passes it to the chart, then restart the pods so they get the new credentials:
 ```bash
-cd terraform
-terraform plan -target=aws_iam_role.checkout_pod_role
-# Verify: Policy allows ssm:GetParameter
+kubectl rollout restart deployment/checkout -n apps
 ```
 
 ---
@@ -620,6 +620,33 @@ curl -X POST "$WEBHOOK_URL" -H "X-API-Key: $API_KEY" -H "Content-Type: applicati
 # Send the same body with "status": "resolved" and the record goes to resolved.
 ```
 
+### Variation 4: Drain a Node
+
+The runbook drains an `apps` node when `NodeUnderPressure` fires. To try it without real memory or disk pressure, send the alert yourself with a real node name. This really cordons the node and moves its pods.
+
+```bash
+NODE=$(kubectl get nodes -l nodegroup=apps -o jsonpath='{.items[0].metadata.name}')
+
+curl -X POST "$WEBHOOK_URL" -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
+  -d '{"alerts": [{"status": "firing",
+       "labels": {"alertname": "NodeUnderPressure", "severity": "critical", "service": "cluster",
+                  "node": "'"$NODE"'", "condition": "MemoryPressure"},
+       "annotations": {"summary": "Demo drain"},
+       "fingerprint": "demo-drain-1", "startsAt": "2026-10-23T10:00:00Z"}]}'
+
+kubectl get nodes -l nodegroup=apps     # the node shows SchedulingDisabled
+kubectl get pods -n apps -o wide -w     # checkout pods move off it, never fewer than 2 running
+
+# ExecuteAction's output has cordoned: true, evicted, skipped, unmanaged and still_blocked.
+# A system node, or the last schedulable apps node, is refused and the incident escalates.
+```
+
+This alert won't resolve on its own, so send the same body with `"status": "resolved"` (or the runbook escalates after 10 minutes). The node stays cordoned either way:
+
+```bash
+kubectl uncordon "$NODE"
+```
+
 ---
 
 ## Demo Timing Breakdown
@@ -630,7 +657,7 @@ curl -X POST "$WEBHOOK_URL" -H "X-API-Key: $API_KEY" -H "Content-Type: applicati
 | Phase 2: Inject failure | 30s | Set ERROR_RATE env var |
 | Phase 3: Alert fires | 7-8m | Ratio crosses 5% after about 2.5m, then the rule's 5m `for` |
 | Phase 4: Auto-remediation | 1m | Show Step Functions, Lambda logs |
-| Phase 5: Verify remediation | 1m | Show the deployment patch, SSM |
+| Phase 5: Verify remediation | 1m | Show SSM, the degraded-mode gauge, the HPA minimum |
 | Phase 6: Error rate drops | 3-5m | 5m rate window, then Alertmanager's 2m `group_interval` |
 | Phase 7: Incident record | 1m | Show DynamoDB entry |
 | Phase 8: Alert resolves | 30s | Show Alertmanager resolved, SNS emails |

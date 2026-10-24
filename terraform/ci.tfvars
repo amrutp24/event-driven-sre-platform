@@ -3,7 +3,7 @@
 name                      = "event-driven-sre-ci"
 aws_region                = "us-east-1"
 eks_cluster_name          = "event-driven-sre-ci-eks"
-eks_version               = "1.29"
+eks_version               = "1.36"
 vpc_cidr                  = "10.40.0.0/16"
 az_count                  = 2
 node_instance_type_system = "t3.medium"
