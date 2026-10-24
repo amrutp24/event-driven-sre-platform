@@ -375,51 +375,63 @@ kubectl auth can-i delete pods -n apps --as=runbook-action --as-group=checkout-r
 
 ### VPC Design
 
-- **Public Subnets**: ALB, NAT Gateway
-- **Private Subnets**: EKS worker nodes, RDS (if used)
-- **Isolated Subnets**: Lambda functions (if VPC-attached)
+- **Public Subnets**: the ALB and a NAT gateway per AZ
+- **Private Subnets**: EKS nodes, the runbook_action Lambda, and the interface endpoints when they're on
 
 ### Security Groups
 
 #### 1. EKS Node Security Group
 
+Created by the EKS module with its recommended rules:
+
 **Inbound Rules**:
-- Allow HTTPS (443) from ALB security group
-- Allow all traffic from same security group (pod-to-pod communication)
-- Allow HTTPS (443) from EKS control plane security group (kubelet)
+- From the control plane: HTTPS (443), the kubelet (10250) and the webhook ports
+- From other nodes: DNS and the ephemeral port range (pod-to-pod traffic)
+- From the ALB to the pods; the AWS Load Balancer Controller adds this rule
 
 **Outbound Rules**:
-- Allow HTTPS (443) to internet via NAT Gateway (pull images, call AWS APIs)
-- Allow all traffic to same security group
+- All traffic, which leaves through the NAT gateways (images, AWS APIs) unless an endpoint handles it
 
 #### 2. ALB Security Group
 
+Created by the AWS Load Balancer Controller for the internet-facing checkout ingress.
+
 **Inbound Rules**:
-- Allow HTTPS (443) from CloudFront IP ranges (or 0.0.0.0/0 if no CloudFront)
+- HTTPS (443) from anywhere. Only allowing CloudFront is not built yet; there's no CloudFront in front of it today.
 
 **Outbound Rules**:
-- Allow HTTPS (443) to EKS node security group
+- To the checkout pods
 
-#### 3. Lambda Security Group (if VPC-attached)
+The listener is HTTPS only, with the `ELBSecurityPolicy-TLS13-1-2-2021-06` policy: TLS 1.2 minimum, TLS 1.3 preferred.
+
+#### 3. runbook_action Lambda Security Group
 
 **Inbound Rules**:
 - None (Lambda functions do not accept incoming connections)
 
 **Outbound Rules**:
-- Allow HTTPS (443) to EKS control plane (API calls)
-- Allow HTTPS (443) to VPC endpoints (SSM, CloudWatch Logs)
+- HTTPS (443) only: the cluster's private API endpoint, and AWS APIs (EKS, SSM, STS) through the NAT gateways or the interface endpoints
+
+The cluster security group allows HTTPS from this group only.
+
+#### 4. VPC Endpoint Security Group
+
+Created when any interface endpoint is.
+
+**Inbound Rules**:
+- HTTPS (443) from the VPC CIDR
 
 ### VPC Endpoints
 
-To reduce data transfer costs and improve security, use VPC endpoints for:
+- **Gateway endpoints, always on** (they're free): S3 (ECR image layers) and DynamoDB, on the private route tables
+- **Interface endpoints, off by default** (`enable_vpc_endpoints`, about $88/month for six in two AZs): `ecr.api`, `ecr.dkr`, `sts`, `ssm`, `eks` and `logs`, in the private subnets with private DNS, so the usual hostnames resolve to them inside the VPC
+- **execute-api**, created whenever `webhook_private` is on, since a private API can only be reached through it. With private DNS on, other public REST APIs' default URLs stop resolving from inside the VPC.
 
-- **SSM**: `com.amazonaws.REGION.ssm`
-- **CloudWatch Logs**: `com.amazonaws.REGION.logs`
-- **DynamoDB**: `com.amazonaws.REGION.dynamodb` (Gateway endpoint, no cost)
-- **EventBridge**: `com.amazonaws.REGION.events`
-- **SNS**: `com.amazonaws.REGION.sns`
+**Security Benefit**: Traffic to those services stays on the AWS network instead of going out through the NAT gateways.
 
-**Security Benefit**: Traffic never leaves AWS network, reducing exposure to internet-based attacks.
+### Private Webhook
+
+`webhook_private = true` makes the webhook a private REST API. Its resource policy allows invokes only through the VPC's execute-api endpoint (`aws:SourceVpce`), so only callers inside the VPC, Alertmanager among them, can reach it. Datadog can't reach a private API, so this is for setups where Alertmanager is the only sender. The invoke URL stays the same; private DNS resolves it inside the VPC.
 
 ---
 
@@ -427,34 +439,33 @@ To reduce data transfer costs and improve security, use VPC endpoints for:
 
 ### Encryption at Rest
 
-All data stores are encrypted using AWS KMS:
+The platform has one customer managed key, `alias/PLATFORM_NAME` (`terraform/kms.tf`, output `kms_key_arn`), with yearly rotation on and a 30 day deletion window.
 
-| Service | Encryption | KMS Key |
-|---------|------------|---------|
-| **DynamoDB** | Enabled | AWS managed key or customer managed key |
-| **SNS** | Enabled | AWS managed key |
-| **CloudWatch Logs** | Enabled | AWS managed key or customer managed key |
-| **EKS Secrets** | Enabled | Customer managed key (recommended) |
-| **SSM Parameter Store** | Enabled (SecureString) | AWS managed key or customer managed key |
+| Data | Encryption | Key |
+|------|------------|-----|
+| **DynamoDB incidents table** | Enabled | Platform key |
+| **SNS topic** | Enabled | Platform key |
+| **SQS dead-letter queue** | Enabled | Platform key |
+| **Platform log groups** (both Lambdas, both state machines, the event log) | Enabled | Platform key |
+| **CloudTrail** (the trail and its S3 bucket, with an S3 bucket key) | Enabled | Platform key |
+| **Kubernetes secrets** | Enabled | The key the EKS module created for the cluster |
+| **ECR images** | Enabled | AES-256 |
+| **SSM `/checkout/degraded_mode`** | Not encrypted with KMS | A String parameter; the flag isn't sensitive |
 
-Today the incidents table uses DynamoDB's default AWS owned key, with point-in-time recovery and deletion protection on. The customer managed key below is still to come.
+EKS secrets stay on the module's key because a cluster can't be moved to a different key in place. The EKS control plane log group is the EKS module's own, kept 90 days, and not on the platform key.
 
-**Configuration Example (Terraform)**:
+**Key policy**: besides the account root, it lets these use the key:
+- DynamoDB, SNS, SQS and CloudWatch Logs on behalf of this account's roles (`kms:ViaService` and `kms:CallerAccount`)
+- CloudWatch Logs itself, only for this account's log groups (encryption context `aws:logs:arn`)
+- EventBridge, to publish to the encrypted topic and dead-letter to the encrypted queue
+- CloudTrail, only for this platform's trail (`aws:SourceArn`)
+
 ```hcl
-resource "aws_kms_key" "sre_platform" {
-  description             = "SRE Platform encryption key"
-  deletion_window_in_days = 30
-  enable_key_rotation     = true
-}
-
 resource "aws_dynamodb_table" "incidents" {
-  name         = "${var.name}-incidents"
-  billing_mode = "PAY_PER_REQUEST"
-  hash_key     = "incident_id"
-
+  # ...
   server_side_encryption {
     enabled     = true
-    kms_key_arn = aws_kms_key.sre_platform.arn
+    kms_key_arn = aws_kms_key.platform.arn
   }
 
   point_in_time_recovery {
@@ -465,12 +476,11 @@ resource "aws_dynamodb_table" "incidents" {
 
 ### Encryption in Transit
 
-All network traffic is encrypted:
-
-- **API Gateway**: TLS 1.2+ (configured by default)
-- **ALB**: TLS 1.2+ with ACM certificate
-- **EKS API Server**: TLS 1.2+ (configured by default)
-- **Inter-pod communication**: mTLS via service mesh (optional: Istio, Linkerd)
+- **ALB**: HTTPS only, with an ACM certificate and the `ELBSecurityPolicy-TLS13-1-2-2021-06` policy (TLS 1.2 minimum, TLS 1.3 preferred)
+- **Webhook (API Gateway)**: HTTPS only, with API Gateway's default TLS policy for the default endpoint. Pinning a TLS 1.2 minimum there (`security_policy` on the REST API) needs AWS provider 6, and the EKS module (~> 20) holds the provider below 6. That comes with the move to EKS module v21.
+- **SNS, the dead-letter queue and the CloudTrail bucket**: their resource policies deny any request without TLS (`aws:SecureTransport` false)
+- **EKS API server**: TLS, managed by AWS
+- **Inside the cluster**: plain HTTP, ALB to pods included. There's no service mesh.
 
 ---
 
@@ -478,23 +488,30 @@ All network traffic is encrypted:
 
 ### Where Secrets Are Stored
 
-| Secret Type | Storage | Access Method |
-|-------------|---------|---------------|
-| **Feature Flags** | SSM Parameter Store (String; the flag isn't sensitive) | The runbook_action Lambda writes `/checkout/degraded_mode`; checkout pods read it through their IRSA role |
-| **Database Passwords** | AWS Secrets Manager | Pod reads via IRSA + CSI driver |
-| **API Keys** | AWS Secrets Manager | Injected as environment variables |
-| **TLS Certificates** | AWS Certificate Manager | ALB auto-fetches |
-| **Image Pull Secrets** | Kubernetes Secrets | EKS auto-creates for ECR |
+The only secrets are the two webhook API keys.
+
+| Item | Storage | Access Method |
+|------|---------|---------------|
+| **Alertmanager's webhook API key** | Kubernetes Secret `alertmanager-webhook-key` in `monitoring`, encrypted with the EKS secrets key | `scripts/deploy.sh` writes it from `terraform output alertmanager_api_key`; Alertmanager mounts it as a file |
+| **Datadog's webhook API key** | A hidden custom variable in Datadog's webhook integration | Added by hand from `terraform output datadog_api_key` |
+| **Degraded-mode flag** (not a secret) | SSM String parameter `/checkout/degraded_mode` | The runbook_action Lambda writes it; checkout pods read it through their IRSA role |
+| **TLS certificate** | AWS Certificate Manager | The ALB fetches it |
+| **Image pulls** | No secret | Nodes pull from ECR with their node role |
+
+Both API key values are also in the Terraform state, as sensitive outputs, so keep the state bucket encrypted and access to it limited.
 
 ### Secret Rotation
 
-**SSM Parameter Store**:
-- Feature flags do not require rotation (not sensitive)
-- For sensitive parameters, use AWS Secrets Manager with auto-rotation
+**Webhook API keys**: replace one and redeploy:
 
-**Secrets Manager** (if used):
-- Enable automatic rotation for RDS passwords (Lambda-based)
-- Rotate API keys every 90 days (manual or automated)
+```bash
+terraform -chdir=terraform apply -replace='aws_api_gateway_api_key.webhook["alertmanager"]'
+bash scripts/deploy.sh   # writes the new key to Alertmanager's secret
+```
+
+For Datadog, replace `aws_api_gateway_api_key.webhook["datadog"]` and paste the new value into the Datadog integration.
+
+**Degraded-mode flag**: doesn't need rotation; it isn't sensitive.
 
 ### Secrets in Code
 
@@ -503,10 +520,9 @@ All network traffic is encrypted:
 - ❌ Database passwords in Terraform files
 - ❌ AWS credentials in Docker images
 
-**Use environment variables and parameter stores**:
-- ✅ Lambda reads SSM at runtime
-- ✅ Pods read secrets via Kubernetes Secrets or CSI driver
-- ✅ Terraform reads secrets from SSM or Secrets Manager
+**Where they come from instead**:
+- ✅ API keys are generated by Terraform and handed to Alertmanager through a Kubernetes Secret
+- ✅ AWS access is through IAM roles (Lambda execution roles, IRSA), never stored keys
 
 ---
 
@@ -514,12 +530,17 @@ All network traffic is encrypted:
 
 ### CloudTrail
 
-**What Is Logged**:
-- All API calls to AWS services (IAM, Lambda, EKS, DynamoDB, SSM, etc.)
-- AssumeRoleWithWebIdentity calls (IRSA token exchanges)
-- EKS control plane audit logs (Kubernetes API calls)
+`terraform/cloudtrail.tf` creates a multi-region trail, `PLATFORM_NAME-trail`, unless `enable_cloudtrail = false` (for accounts an organization trail already covers).
 
-**Retention**: 90 days in CloudTrail, then archived to S3 with lifecycle policy (e.g., move to Glacier after 1 year)
+**What Is Logged**:
+- Management events in every region: IAM, Lambda configuration and code updates, EKS, KMS, SSM writes and so on, plus global services
+- AssumeRoleWithWebIdentity calls (IRSA token exchanges)
+- Not data events (DynamoDB item reads and writes, S3 object access, Lambda invokes); those are billed per event
+- Kubernetes API calls are in the EKS audit logs, not CloudTrail (see below)
+
+**Storage**: the S3 bucket `PLATFORM_NAME-cloudtrail-ACCOUNT_ID` (output `cloudtrail_bucket`), encrypted with the platform key, versioned, with all public access blocked, ownership enforced, and a policy that only lets this trail write and denies non-TLS requests. Log file validation is on, so `aws cloudtrail validate-logs` can show whether a file was changed or deleted.
+
+**Retention**: 365 days (`cloudtrail_retention_days`), then the lifecycle rule deletes them. The bucket can't be deleted while it holds logs unless `cloudtrail_force_destroy` is set, which `scripts/destroy.sh` does.
 
 **Use Cases**:
 - **Forensics**: Who invoked which Lambda at what time?
@@ -536,7 +557,7 @@ All network traffic is encrypted:
 - `/aws/events/PLATFORM_NAME` (every event on the bus)
 - `/aws/eks/CLUSTER_NAME/cluster` (EKS control plane logs)
 
-**Retention**: 30 days for the state machine and event logs (configurable, consider cost vs compliance requirements)
+**Retention**: 30 days for the five platform log groups, all encrypted with the platform key. Terraform creates the two Lambda log groups too, so Lambda doesn't make its own unencrypted ones that never expire. The EKS module keeps its log group 90 days.
 
 Both state machines log execution data, so these log groups hold alert payloads: labels, annotations, and the action results. Alerts carry no secrets, and the webhook API keys never reach the state machines, but treat the log groups like the incident table when granting read access.
 
@@ -587,31 +608,32 @@ Every incident is logged with:
 1. **Least-Privilege IAM**: All roles have specific ARNs, no wildcards for application resources
 2. **IRSA and EKS access entries**: No long-lived credentials stored
 3. **Kubernetes RBAC**: the remediation group is limited to the `apps` namespace and specific operations
-4. **Encryption at Rest**: KMS for all data stores
-5. **Encryption in Transit**: TLS 1.2+ for all endpoints
-6. **Network Segmentation**: Private subnets for EKS, security groups for isolation
-7. **CloudTrail Logging**: All API calls audited
-8. **CloudWatch Logs**: All Lambda and Step Functions logs retained
+4. **Encryption at Rest**: the platform KMS key for the incidents table, SNS, the dead-letter queue, the log groups and CloudTrail; the EKS module's key for Kubernetes secrets; AES-256 for ECR
+5. **Encryption in Transit**: TLS 1.2+ policy on the ALB; SNS, the dead-letter queue and the CloudTrail bucket deny non-TLS requests. The webhook is HTTPS only, but its TLS policy waits on AWS provider 6.
+6. **Network Segmentation**: Private subnets for EKS and the remediation Lambda, security groups for isolation, an optional private webhook
+7. **CloudTrail Logging**: Multi-region management events with log file validation, kept 365 days
+8. **CloudWatch Logs**: Lambda, Step Functions and event logs kept 30 days, encrypted with the platform key
 9. **DynamoDB Incident History**: Complete audit trail
-10. **SSM Parameter Store**: SecureString for sensitive configuration
-11. **Container Image Scanning**: Trivy scans on every build
-12. **Infrastructure Scanning**: tfsec validates Terraform
-13. **VPC Endpoints**: Private connectivity to AWS services (optional, recommended)
+10. **No Secrets in SSM**: the degraded flag is a plain String; the webhook API keys are in a Kubernetes Secret that EKS encrypts
+11. **Container Image Scanning**: ECR scans on push, and Trivy scans the image in CI
+12. **Infrastructure Scanning**: Checkov and tflint run on the Terraform in CI (Checkov doesn't fail the build yet)
+13. **VPC Endpoints**: S3 and DynamoDB gateway endpoints always; interface endpoints optional (`enable_vpc_endpoints`)
 14. **API Gateway Throttling**: Rate limiting to prevent abuse
 15. **Non-root Container**: the checkout image runs as an unprivileged user
+16. **Immutable Image Tags**: each build is tagged with its git SHA, and ECR refuses to overwrite a tag
 
 ### 🚧 Recommended for Production
 
-16. **Multi-Factor Authentication (MFA)**: Require MFA for all AWS console access
-17. **Service Control Policies (SCPs)**: Prevent deletion of CloudTrail, KMS keys
-18. **GuardDuty**: Threat detection for AWS accounts
-19. **Security Hub**: Centralized security findings
-20. **Config Rules**: Continuous compliance monitoring (e.g., ensure encryption enabled)
-21. **Secrets Rotation**: Auto-rotate database passwords, API keys
-22. **WAF Rules**: Protect API Gateway from common attacks (SQL injection, XSS)
-23. **DDoS Protection**: AWS Shield Standard (free) or Advanced (paid)
-24. **VPC Flow Logs**: Network traffic analysis
-25. **S3 Bucket Policies**: Prevent public access to logs and artifacts
+17. **Multi-Factor Authentication (MFA)**: Require MFA for all AWS console access
+18. **Service Control Policies (SCPs)**: Prevent deletion of CloudTrail, KMS keys
+19. **GuardDuty**: Threat detection for AWS accounts
+20. **Security Hub**: Centralized security findings
+21. **Config Rules**: Continuous compliance monitoring (e.g., ensure encryption enabled)
+22. **Secrets Rotation**: Rotate the webhook API keys on a schedule
+23. **WAF Rules**: Protect the ALB and API Gateway from common attacks (SQL injection, XSS)
+24. **DDoS Protection**: AWS Shield Standard (free) or Advanced (paid)
+25. **VPC Flow Logs**: Network traffic analysis
+26. **TLS Policy on the Webhook**: once the repo moves to AWS provider 6
 
 ---
 
@@ -638,7 +660,7 @@ Use this checklist before deploying to production:
 - [ ] DynamoDB encrypted with customer managed KMS key
 - [ ] CloudWatch Logs encrypted
 - [ ] EKS secrets encrypted with customer managed KMS key
-- [ ] SSM parameters use SecureString type
+- [ ] Any secret you add to SSM uses SecureString (the degraded flag isn't secret and doesn't need it)
 - [ ] S3 buckets for logs have encryption and versioning enabled
 - [ ] DynamoDB point-in-time recovery enabled
 
@@ -651,7 +673,7 @@ Use this checklist before deploying to production:
 
 ### Application Security
 - [ ] Container images scanned with Trivy (no HIGH or CRITICAL vulnerabilities)
-- [ ] Terraform scanned with tfsec (no MEDIUM or higher issues)
+- [ ] Terraform scanned with Checkov, and Checkov set to fail the build (it's soft-fail today)
 - [ ] Flask app dependencies updated (no known vulnerabilities)
 - [ ] API Gateway throttling configured (prevent abuse)
 - [ ] Rate limiting enabled on alert webhook endpoint
@@ -690,8 +712,8 @@ Use this checklist before deploying to production:
 
 **Mitigations**:
 - ✅ Least-privilege IAM policies limit damage
-- ✅ CloudTrail logs all API calls (detect unusual activity)
-- ✅ GuardDuty alerts on anomalous IAM usage
+- ✅ CloudTrail logs management API calls in every region (detect unusual activity)
+- ❌ GuardDuty isn't set up by this repo; turn it on for the account
 - ✅ Lambda execution role cannot delete resources
 - ✅ Credentials are temporary (Lambda execution context, 6-hour max)
 
@@ -706,8 +728,8 @@ Use this checklist before deploying to production:
 **Mitigations**:
 - ✅ Keep EKS version up-to-date (patches security issues)
 - ✅ RBAC limits the remediation group's workload changes to the `apps` namespace; outside it, only cordons and evictions
-- ✅ Pod Security Standards (PSS) enforce best practices
-- ✅ Network policies isolate namespaces
+- ❌ Pod Security Standards (PSS) aren't enforced yet
+- ❌ No network policies between namespaces yet
 - ✅ Audit logs capture unauthorized access attempts
 
 **Residual Risk**: Low (requires Kubernetes 0-day exploit)
@@ -719,10 +741,10 @@ Use this checklist before deploying to production:
 **Impact**: Execute arbitrary code with Lambda IAM role permissions
 
 **Mitigations**:
-- ✅ Lambda deployment packages signed (integrity check)
-- ✅ S3 bucket for Lambda code has versioning and MFA delete
-- ✅ IAM policy prevents unauthorized updates to Lambda code
-- ✅ CloudTrail logs all Lambda function updates
+- ✅ Function code only changes through Terraform; no role in the platform has `lambda:UpdateFunctionCode`
+- ✅ CloudTrail logs every function code and configuration update
+- ✅ The checkout image tags are immutable, so a deployed tag can't be swapped for different code
+- ❌ Lambda code signing isn't set up
 
 **Residual Risk**: Very Low (requires AWS account compromise)
 
@@ -734,9 +756,9 @@ Use this checklist before deploying to production:
 
 **Mitigations**:
 - ✅ IAM policies prevent read access (only the incident recorder and the runbook state machine can write, and the runbook can only read single items)
-- ✅ DynamoDB encrypted at rest
-- ✅ VPC endpoint for DynamoDB (traffic stays on AWS network)
-- ✅ CloudTrail logs all DynamoDB API calls
+- ✅ DynamoDB encrypted at rest with the platform key
+- ✅ VPC gateway endpoint for DynamoDB (traffic from the VPC stays on the AWS network)
+- ❌ CloudTrail doesn't log item reads and writes (data events), only table-level calls
 
 **Residual Risk**: Low (requires IAM role compromise)
 

@@ -9,6 +9,8 @@ metadata:
     alb.ingress.kubernetes.io/group.name: "{{ .Values.ingress.albGroup }}"
     alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
     alb.ingress.kubernetes.io/certificate-arn: "{{ .Values.ingress.certificateArn }}"
+    # TLS 1.2 minimum, TLS 1.3 preferred
+    alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
 spec:
   rules:
   - host: {{ .Values.ingress.host }}
