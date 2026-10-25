@@ -123,3 +123,8 @@ output "incident_recorder_log_group" {
 output "runbook_action_lambda_arn" {
   value = module.sre.runbook_action_function_arn
 }
+
+output "rbac_manifest" {
+  description = "What runbook_action may do in the cluster; deploy.sh applies it"
+  value       = module.sre.rbac_manifest
+}

@@ -96,8 +96,17 @@ output "runbook_action_security_group_id" {
 }
 
 output "kubernetes_group" {
-  description = "Group runbook_action's role is in; bind it with k8s/rbac/remediation-role.yaml"
+  description = "Group runbook_action's role is in; rbac_manifest binds it"
   value       = var.kubernetes_group
+}
+
+output "rbac_manifest" {
+  description = "Kubernetes RBAC for kubernetes_group: a Role and RoleBinding in each of remediation_namespaces, and a ClusterRole for nodes and evictions when drainable_node_label is set. Apply it with terraform output -raw rbac_manifest | kubectl apply -f -"
+  value = templatefile("${path.module}/templates/rbac.yaml.tftpl", {
+    group      = var.kubernetes_group
+    namespaces = var.remediation_namespaces
+    drain_node = var.drainable_node_label != null
+  })
 }
 
 output "degraded_mode_parameter_name" {

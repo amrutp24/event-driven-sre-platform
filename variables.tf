@@ -44,9 +44,14 @@ variable "create_access_entry" {
 }
 
 variable "kubernetes_group" {
-  description = "Kubernetes group runbook_action's role is mapped to; k8s/rbac/remediation-role.yaml binds it"
+  description = "Kubernetes group runbook_action's role is mapped to. rbac_manifest binds it, and names its Roles after it."
   type        = string
   default     = "sre-remediation"
+
+  validation {
+    condition     = can(regex("^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$", var.kubernetes_group))
+    error_message = "Must be a lowercase DNS label (letters, digits and hyphens, at most 63 characters), since rbac_manifest names its Roles after it."
+  }
 }
 
 # ------------------------------------------------------------------ remediation

@@ -171,6 +171,50 @@ run "defaults" {
     condition     = output.kubernetes_group == "sre-remediation"
     error_message = "Outputs should report the Kubernetes group."
   }
+
+  assert {
+    condition = (
+      length([for d in split("\n---\n", replace(output.rbac_manifest, "\r", "")) : d if try(yamldecode(d).kind, "") == "Role"]) == 1
+      && length([for d in split("\n---\n", replace(output.rbac_manifest, "\r", "")) : d if try(yamldecode(d).kind, "") == "RoleBinding"]) == 1
+      && length([for d in split("\n---\n", replace(output.rbac_manifest, "\r", "")) : d if contains(["ClusterRole", "ClusterRoleBinding"], try(yamldecode(d).kind, ""))]) == 0
+    )
+    error_message = "rbac_manifest should have a Role and RoleBinding for apps and no cluster-wide permissions without drainable_node_label."
+  }
+}
+
+run "rbac_per_namespace_and_drain" {
+  command = plan
+
+  variables {
+    remediation_namespaces = ["apps", "payments", "search"]
+    drainable_node_label   = "nodegroup=apps"
+    kubernetes_group       = "remediators"
+  }
+
+  assert {
+    condition = (
+      [for d in split("\n---\n", replace(output.rbac_manifest, "\r", "")) : yamldecode(d).metadata.namespace if try(yamldecode(d).kind, "") == "Role"] == ["apps", "payments", "search"]
+      && [for d in split("\n---\n", replace(output.rbac_manifest, "\r", "")) : yamldecode(d).metadata.namespace if try(yamldecode(d).kind, "") == "RoleBinding"] == ["apps", "payments", "search"]
+    )
+    error_message = "rbac_manifest should have one Role and one RoleBinding per remediation namespace."
+  }
+
+  assert {
+    condition = alltrue([
+      for d in split("\n---\n", replace(output.rbac_manifest, "\r", "")) : yamldecode(d).subjects[0].name == "remediators"
+      if contains(["RoleBinding", "ClusterRoleBinding"], try(yamldecode(d).kind, ""))
+    ])
+    error_message = "Every binding should be for kubernetes_group."
+  }
+
+  assert {
+    condition = (
+      length([for d in split("\n---\n", replace(output.rbac_manifest, "\r", "")) : d if try(yamldecode(d).kind, "") == "ClusterRole"]) == 1
+      && length([for d in split("\n---\n", replace(output.rbac_manifest, "\r", "")) : d if try(yamldecode(d).kind, "") == "ClusterRoleBinding"]) == 1
+      && strcontains(output.rbac_manifest, "pods/eviction")
+    )
+    error_message = "With drainable_node_label set, rbac_manifest should grant the node and eviction permissions drain_node needs."
+  }
 }
 
 run "checkout_demo" {
@@ -395,6 +439,7 @@ run "rejects_bad_inputs" {
   variables {
     remediation_namespaces    = []
     drainable_node_label      = "apps"
+    kubernetes_group          = "SRE_Remediation"
     log_retention_days        = 31
     auto_remediate_severities = ["page"]
   }
@@ -402,6 +447,7 @@ run "rejects_bad_inputs" {
   expect_failures = [
     var.remediation_namespaces,
     var.drainable_node_label,
+    var.kubernetes_group,
     var.log_retention_days,
     var.auto_remediate_severities,
   ]

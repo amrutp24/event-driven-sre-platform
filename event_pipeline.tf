@@ -414,9 +414,9 @@ resource "aws_iam_role_policy" "sfn_invoke_lambda" {
 # ------------------------------------------------------------------ cluster access
 
 # runbook_action calls the Kubernetes API as its IAM role. IRSA only applies to
-# pods, so the role gets an access entry instead, in a group that
-# k8s/rbac/remediation-role.yaml binds. No access policy is associated, so
-# those bindings are all it's allowed.
+# pods, so the role gets an access entry instead, in a group that the
+# rbac_manifest output binds. No access policy is associated, so those
+# bindings are all it's allowed.
 resource "aws_eks_access_entry" "runbook_action" {
   count = var.create_access_entry ? 1 : 0
 
