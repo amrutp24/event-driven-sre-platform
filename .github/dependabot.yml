@@ -18,6 +18,10 @@ updates:
       - /examples/existing-cluster
     schedule:
       interval: weekly
+    # Module majors (EKS v20 to v21, IAM v5 to v6) are deliberate upgrades
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
     groups:
       terraform:
         patterns: ["*"]
