@@ -4,6 +4,10 @@ A Terraform module that adds automated incident response to an EKS cluster. Aler
 
 The module brings the pipeline (API Gateway, two Lambdas, EventBridge, Step Functions, DynamoDB, SNS, KMS). You bring the cluster. See [Known gaps](#known-gaps) for what's still missing.
 
+![Architecture: alerts from the cluster go through the webhook and the event bus to the incident record, the runbook and notifications; the runbook acts back on the cluster](https://raw.githubusercontent.com/amrutp24/terraform-aws-event-driven-sre/main/docs/architecture/architecture.png)
+
+The diagram is generated from [docs/architecture/diagram.py](docs/architecture/diagram.py) with [Diagrams](https://diagrams.mingrammer.com/).
+
 ## How it works
 
 1. Alertmanager posts firing and resolved alerts to `POST /webhook` on an API Gateway REST API, with an `X-API-Key` header. API Gateway checks the body against a JSON schema and rate-limits requests (1000 per second, bursts of 2000). Datadog monitors can send to the same endpoint; see [docs/API.md](docs/API.md).

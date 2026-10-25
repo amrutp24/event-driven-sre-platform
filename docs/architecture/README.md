@@ -18,6 +18,10 @@ The alert pipeline (webhook, Lambdas, EventBridge, Step Functions, DynamoDB, SNS
 
 ## High-Level Architecture
 
+![Architecture](architecture.png)
+
+Generated from [diagram.py](diagram.py) with [Diagrams](https://diagrams.mingrammer.com/); the instructions to rebuild it are at the top of that file. The Mermaid diagram below has more detail on the edge and the cluster.
+
 ```mermaid
 graph TB
     subgraph "User Traffic & Edge"
