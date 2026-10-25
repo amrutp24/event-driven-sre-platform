@@ -90,6 +90,8 @@ Prometheus Alertmanager sends alerts in the following format:
 }
 ```
 
+The example payloads in this document use `examples/complete`'s settings (`degraded_mode_deployment` and `default_deployment` set to `checkout`). With the module defaults, `degrade` and `degrade_or_scale` escalate instead.
+
 ### Required Fields
 
 | Field | Type | Description |
@@ -105,7 +107,7 @@ Prometheus Alertmanager sends alerts in the following format:
 | Field | Type | Description |
 |-------|------|-------------|
 | `alerts[].annotations` | object | Human-readable metadata (summary, description, runbook_url) |
-| `alerts[].annotations.runbook_action` | string | Override the default action: `degrade`, `scale`, `restart`, `degrade_or_scale` or `drain_node`. `notify_only` skips the runbook: the alert is recorded and sent to SNS, nothing more. Any other value escalates a critical alert. |
+| `alerts[].annotations.runbook_action` | string | Override the default action: `degrade`, `scale`, `restart`, `degrade_or_scale` or `drain_node`. `degrade` and `degrade_or_scale` only work when `degraded_mode_deployment` is set, and only for that deployment; otherwise the action is refused and the incident escalates. `drain_node` needs `drainable_node_label` (see `labels.node`). `notify_only` skips the runbook: the alert is recorded and sent to SNS, nothing more. Any other value escalates an alert at a severity in `auto_remediate_severities`. |
 | `alerts[].annotations.desired_replicas` | string | Replica count for `scale` and `degrade_or_scale` (default `default_scale_replicas`, 4, at most `remediation_max_replicas`). With an HPA, this becomes the HPA's minimum instead. |
 | `alerts[].labels.namespace`, `alerts[].labels.deployment` | string | What the runbook acts on. Without them it uses the first of `remediation_namespaces` and the `service` label as the deployment, then `default_deployment`; with neither, the action is refused and the incident escalates. Namespaces outside `remediation_namespaces` are refused. |
 | `alerts[].labels.node` | string | The node `drain_node` drains. `NodeUnderPressure` carries it from kube-state-metrics. Only nodes with `drainable_node_label` (`nodegroup=apps` in `examples/complete`) are drained, and nothing is drained when it isn't set. |
@@ -267,7 +269,7 @@ The API key is still required. `alert_webhook_url` doesn't change; the endpoint'
 
 ### TLS
 
-The webhook is HTTPS only. It uses API Gateway's default TLS policy: pinning a TLS 1.2 minimum on the REST API needs AWS provider 6, which the EKS module (~> 20) doesn't allow yet.
+The webhook is HTTPS only. It uses API Gateway's default TLS policy: pinning a TLS 1.2 minimum on the REST API needs AWS provider 6, and the module still supports provider 5.x. (Only `examples/complete` is held on 5, by the EKS module v20.)
 
 ---
 
@@ -280,11 +282,11 @@ The webhook is HTTPS only. It uses API Gateway's default TLS policy: pinning a T
 | `INVALID_SEVERITY` | 400 | Severity is not one of `critical`, `warning`, `info` | Use valid severity values |
 | `INVALID_API_KEY` | 403 | `X-API-Key` header missing or wrong | Use the key from `terraform output` |
 | `RATE_LIMIT_EXCEEDED` | 429 | Too many requests in a short time | Reduce alert frequency or request throttle increase |
-| `INTERNAL_ERROR` | 500 | Lambda function encountered an error | Check CloudWatch Logs for details |
+| `INTERNAL_ERROR` | 500 | Unexpected error while publishing to EventBridge | Check CloudWatch Logs for details |
 | `EVENTBRIDGE_ERROR` | 502 | Failed to publish event to EventBridge | Check EventBridge service health |
 | `TIMEOUT` | 504 | API Gateway stopped waiting for the Lambda (29 seconds) | Retry the request; check CloudWatch Logs if it keeps happening |
 
-`INVALID_PAYLOAD` comes from API Gateway when the body doesn't match the schema, and from `alert_ingest` otherwise. Errors from API Gateway have `details.request_id` instead of field details. `INTERNAL_ERROR` and `EVENTBRIDGE_ERROR` include `details.correlation_id`.
+`INVALID_PAYLOAD` comes from API Gateway when the body doesn't match the schema, and from `alert_ingest` otherwise. Errors from API Gateway have `details.request_id` instead of field details. `INTERNAL_ERROR` and `EVENTBRIDGE_ERROR` include `details.correlation_id`. Any other unhandled exception in the Lambda reaches API Gateway, which returns its default `502` with `{"message": "Internal server error"}`.
 
 ---
 
@@ -292,15 +294,15 @@ The webhook is HTTPS only. It uses API Gateway's default TLS policy: pinning a T
 
 **Default Limits**:
 - **Requests per second**: 1000 (burst: 2000), set by `webhook_rate_limit` and `webhook_burst_limit`
-- **Concurrent requests**: 100, the `alert_ingest` reserved concurrency (`alert_ingest_reserved_concurrency`)
+- **Concurrent requests**: unreserved by default; set `alert_ingest_reserved_concurrency` to cap them
 
 **Behavior**:
 - If rate limit exceeded, API Gateway returns `429 Too Many Requests`
-- Alertmanager automatically retries with exponential backoff (default: 3 attempts)
+- Alertmanager retries failed webhook calls with backoff until the notification times out, then tries again at the next `group_interval`
 
 **Increasing Limits**:
-- Contact AWS Support to request higher API Gateway throttle limits
-- Typical production limit: 10,000 requests/second
+- Raise `webhook_rate_limit` and `webhook_burst_limit`, up to the account's API Gateway limit (10,000 requests/second by default)
+- Contact AWS Support only to go above the account limit
 
 ---
 
@@ -460,18 +462,21 @@ Configure Alertmanager to send alerts to the webhook:
 
 `examples/complete/helm/observability/alertmanager-values.yaml` sets this up through kube-prometheus-stack; the equivalent plain **alertmanager.yml** is:
 ```yaml
-global:
-  resolve_timeout: 5m
-
 route:
-  receiver: 'sre-webhook'
+  receiver: 'aws-webhook'
   group_by: ['alertname', 'service']
-  group_wait: 10s
-  group_interval: 10s
-  repeat_interval: 12h
+  group_wait: 30s
+  group_interval: 2m
+  repeat_interval: 30m
+  routes:
+    # The chart's always-firing heartbeat alerts go nowhere
+    - receiver: 'null'
+      matchers:
+        - alertname =~ "InfoInhibitor|Watchdog"
 
 receivers:
-  - name: 'sre-webhook'
+  - name: 'null'
+  - name: 'aws-webhook'
     webhook_configs:
       - url: 'https://abc123.execute-api.us-west-2.amazonaws.com/prod/webhook'
         send_resolved: true
@@ -666,7 +671,6 @@ aws cloudwatch put-metric-alarm \
 6. **Test the webhook with `notify_only` or a `warning` alert** before letting critical alerts through, since both stop before the runbook changes anything
 7. **Enable API key authentication** in production
 8. **Use `webhook_private`** if Alertmanager is the only sender
-9. **Configure Alertmanager retry** for transient failures
 
 ---
 
@@ -674,11 +678,11 @@ aws cloudwatch put-metric-alarm \
 
 | Version | Date | Changes |
 |---------|------|---------|
-| 1.0 | 2026-02-02 | Initial API documentation |
 | 1.4 | 2026-10-23 | `drain_node` action and the `node` label (or Datadog `host` tag). `desired_replicas` raises the HPA's minimum when the deployment has one. |
 | 1.3 | 2026-10-23 | The runbook state machine picks the action; `runbook_action: notify_only` skips the runbook and other unknown values escalate. `namespace`/`deployment` labels and `desired_replicas` set the target. |
 | 1.2 | 2026-10-23 | `alert_ingest` publishes to EventBridge only; rules route to DynamoDB, SNS and Step Functions. `remediation_started` removed from the response. |
 | 1.1 | 2026-10-23 | `POST /webhook` on a REST API with schema validation, API keys and throttling; Datadog payloads; `202` and `400` responses as documented |
+| 1.0 | 2026-02-02 | Initial API documentation |
 
 ---
 
