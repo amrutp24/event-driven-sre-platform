@@ -120,7 +120,7 @@ module "sre" {
   bash scripts/destroy.sh         # after uninstalling the Helm releases; protections off, then terraform destroy
   ```
 
-  Running continuously in `us-east-1` it costs roughly $460 a month, nearly all of it the cluster, the nodes and the NAT gateways. The breakdown is in [its README](examples/complete/README.md#cost). Tear it down when you're done. [examples/complete/DEMO.md](examples/complete/DEMO.md) walks through breaking the app and watching it get fixed.
+  Running continuously in `us-east-1` it costs roughly $445 a month, nearly all of it the cluster, the nodes and the NAT gateways. The breakdown is in [its README](examples/complete/README.md#cost). Tear it down when you're done. [examples/complete/DEMO.md](examples/complete/DEMO.md) walks through breaking the app and watching it get fixed.
 - [examples/existing-cluster](examples/existing-cluster): the minimal call, for a cluster you already have. On its own the module costs about $14 a month at 1000 alerts a day, plus $1 for its KMS key.
 
 ## What's in the repo
