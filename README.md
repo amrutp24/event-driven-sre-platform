@@ -144,7 +144,6 @@ module "sre" {
 ├── apps/checkout/            # demo Flask service, Dockerfile, unit tests
 ├── helm/                     # checkout chart, kube-prometheus-stack values and alert rules, optional Datadog values
 ├── scripts/                  # bootstrap.sh, install-addons.sh, build-image.sh, deploy.sh, destroy.sh (examples/complete)
-├── tests/integration/        # end-to-end tests against LocalStack
 └── docs/                     # architecture, API, security, demo walkthrough
 ```
 
@@ -251,8 +250,6 @@ cd stepfunctions && pip install -r tests/requirements.txt && pytest tests/
 # The demo app
 cd examples/complete/apps/checkout && pip install -r requirements-dev.txt && pytest tests/ --cov
 ```
-
-`tests/integration/` runs the alert path end to end against LocalStack (`setup.sh`, then pytest, then `cleanup.sh`). It isn't part of CI.
 
 CI (`.github/workflows/integration-tests.yml`) runs Checkov on the module and on `examples/complete` (settings and skipped checks, with reasons, in `.checkov.yaml`), Trivy on the container image, the module tests, the app, Lambda and state machine tests, `terraform fmt`, `terraform validate` on the module and both examples, and `tflint` on the module and `examples/complete`.
 
