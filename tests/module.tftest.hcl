@@ -449,6 +449,39 @@ run "notifications" {
   }
 }
 
+run "rejects_long_name" {
+  command = plan
+
+  variables {
+    name = "a-name-that-is-forty-one-characters-long1"
+  }
+
+  expect_failures = [var.name]
+}
+
+run "rejects_name_with_other_characters" {
+  command = plan
+
+  variables {
+    name = "event_driven_sre"
+  }
+
+  expect_failures = [var.name]
+}
+
+run "accepts_a_forty_character_name" {
+  command = plan
+
+  variables {
+    name = "a-name-that-is-exactly-forty-chars-long0"
+  }
+
+  assert {
+    condition     = aws_cloudwatch_event_archive.sre.name == "a-name-that-is-exactly-forty-chars-long0-archive"
+    error_message = "A 40-character name should be accepted."
+  }
+}
+
 run "rejects_bad_email" {
   command = plan
 

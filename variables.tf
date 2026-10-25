@@ -1,7 +1,12 @@
 variable "name" {
-  description = "Prefix for every resource name"
+  description = "Prefix for every resource name. Letters, digits and hyphens, at most 40 characters (the event archive's name, <name>-archive, can't be longer than 48)."
   type        = string
   default     = "event-driven-sre"
+
+  validation {
+    condition     = length(var.name) <= 40 && can(regex("^[A-Za-z0-9-]+$", var.name))
+    error_message = "Use only letters, digits and hyphens, at most 40 characters."
+  }
 }
 
 variable "tags" {
