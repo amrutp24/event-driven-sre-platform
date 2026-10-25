@@ -1,5 +1,5 @@
 variable "name" {
-  description = "Prefix for every resource name. Letters, digits and hyphens, at most 40 characters (the event archive's name, <name>-archive, can't be longer than 48)."
+  description = "Prefix for every resource name. Letters, digits and hyphens, at most 40 characters (the event archive is named after it with -archive added, and can't be longer than 48)."
   type        = string
   default     = "event-driven-sre"
 
@@ -107,7 +107,7 @@ variable "degraded_mode_deployment" {
 }
 
 variable "degraded_mode_parameter_name" {
-  description = "SSM parameter degrade sets to \"true\". Defaults to /<name>/degraded-mode. Only used with degraded_mode_deployment."
+  description = "SSM parameter degrade sets to \"true\". Defaults to /NAME/degraded-mode, with NAME from var.name. Only used with degraded_mode_deployment."
   type        = string
   default     = null
 }
