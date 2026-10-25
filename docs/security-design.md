@@ -1,5 +1,7 @@
 # Security design
 
+Names and values like the `apps` namespace, the `checkout` deployment, the `/checkout/degraded_mode` parameter and the `nodegroup=apps` drain label are what `examples/complete` passes to the module. The module itself has no default namespace, deployment or routes, and leaves degraded mode and `drain_node` off until `degraded_mode_deployment` and `drainable_node_label` are set; the permissions for them are only created then.
+
 ## Table of Contents
 
 1. [Security Overview](#security-overview)
@@ -98,7 +100,7 @@ All IAM roles and policies follow the principle of least privilege, granting onl
     {
       "Effect": "Allow",
       "Action": ["ssm:PutParameter", "ssm:GetParameter"],
-      "Resource": "arn:aws:ssm:REGION:*:parameter/checkout/*"
+      "Resource": "arn:aws:ssm:REGION:ACCOUNT_ID:parameter/checkout/degraded_mode"
     },
     {
       "Effect": "Allow",
@@ -111,13 +113,13 @@ All IAM roles and policies follow the principle of least privilege, granting onl
 
 **Why This Is Secure**:
 - Only describe specific EKS cluster (not all clusters)
-- SSM access limited to `/checkout/*` namespace (not all parameters)
+- SSM access only to the degraded-mode parameter, and only when `degraded_mode_deployment` is set; without it the role has no SSM statement
 - Cannot delete SSM parameters or modify other application configs
 - `sts:GetCallerIdentity` required to sign the EKS authentication token (cannot be scoped)
 
 **Note**: The actual Kubernetes access is controlled by RBAC (see below), not IAM. The role also has the AWS-managed `AWSLambdaVPCAccessExecutionRole` policy so the Lambda can run in the private subnets.
 
-**Input checks**: the Lambda only runs what the state machine sends it, and checks that first. It raises `InvalidRequest` for an action other than `degrade`, `restart`, `scale`, `degrade_or_scale` or `drain_node`, a namespace that isn't in `ALLOWED_NAMESPACES` (`apps`), a deployment name that isn't a valid Kubernetes name, replicas outside 1 to `MAX_REPLICAS` (`remediation_max_replicas`, default 10), or `degrade` for anything but checkout. For `drain_node` it refuses an invalid or unknown node name, a node without the `nodegroup=apps` label, and a drain that would leave no other Ready, schedulable apps node (`drain_min_schedulable_nodes`, default 1). The state machine doesn't retry `InvalidRequest`; it escalates the incident instead. So an alert can't point the Lambda at another namespace, scale a deployment without limit, or drain a system node or the last apps node, even though the target comes from the alert's labels.
+**Input checks**: the Lambda only runs what the state machine sends it, and checks that first. It raises `InvalidRequest` for an action other than `degrade`, `restart`, `scale`, `degrade_or_scale` or `drain_node`, a namespace that isn't in `ALLOWED_NAMESPACES` (`remediation_namespaces`), a deployment name that isn't a valid Kubernetes name, replicas outside 1 to `MAX_REPLICAS` (`remediation_max_replicas`, default 10), `degrade` for anything but `degraded_mode_deployment`, or `degrade` at all when that isn't set. It refuses `drain_node` when `drainable_node_label` isn't set, and otherwise an invalid or unknown node name, a node without that label, and a drain that would leave no other Ready, schedulable apps node (`drain_min_schedulable_nodes`, default 1). The state machine doesn't retry `InvalidRequest`; it escalates the incident instead. So an alert can't point the Lambda at another namespace, scale a deployment without limit, or drain a system node or the last apps node, even though the target comes from the alert's labels.
 
 ### Step Functions Execution Role
 
@@ -184,7 +186,7 @@ The other targets grant EventBridge access through resource policies, each limit
 | Resource | Allows `events.amazonaws.com` to | Limited to |
 | --- | --- | --- |
 | SNS topic `PLATFORM_NAME-alerts` | `sns:Publish` | the `incident-created`, `incident-resolved`, `incident-escalated` and `incident-auto-resolved` rules |
-| SNS topic `PLATFORM_NAME-chat` (only with `chat_notifications`) | `sns:Publish` | the same four rules |
+| SNS topic `PLATFORM_NAME-chat` (only with `create_chat_topic`) | `sns:Publish` | the same four rules |
 | SQS queue `PLATFORM_NAME-events-dlq` | `sqs:SendMessage` | the platform's six rules |
 | Log group `/aws/events/PLATFORM_NAME` | `logs:CreateLogStream`, `logs:PutLogEvents` | that log group |
 
@@ -264,7 +266,7 @@ The Lambda runs in the private subnets and reaches the cluster's private API end
 
 ### Principle: Namespace Isolation
 
-The runbook_action Lambda (through its access entry) can change workloads only in the `apps` namespace. The one exception is `drain_node`: nodes are cluster-scoped and a node runs pods from every namespace, so cordoning one and evicting its pods needs a ClusterRole. That ClusterRole can't change any workload, only nodes and evictions. The Role, the ClusterRole and their bindings are in `k8s/rbac/remediation-role.yaml` and applied by `scripts/deploy.sh`.
+The runbook_action Lambda (through its access entry) can change workloads only in the `apps` namespace. The one exception is `drain_node`: nodes are cluster-scoped and a node runs pods from every namespace, so cordoning one and evicting its pods needs a ClusterRole. That ClusterRole can't change any workload, only nodes and evictions. The Role, the ClusterRole and their bindings are the module's `rbac_manifest` output, rendered from `templates/rbac.yaml.tftpl`: a Role and RoleBinding in each of `remediation_namespaces`, and the ClusterRole and its binding only when `drainable_node_label` is set. Apply it with `terraform output -raw rbac_manifest | kubectl apply -f -`; `examples/complete/scripts/deploy.sh` does that.
 
 ### Role Definition
 

@@ -109,18 +109,18 @@ module "sre" {
 
 ## Examples
 
-- [examples/complete](examples/complete): the full demo. A VPC with flow logs, EKS 1.36, IRSA roles, ECR, CloudTrail, optional VPC endpoints, one KMS key passed to the module, optional email and Slack notifications, and the `checkout` demo app with Prometheus alerting on top. Deploy it with the scripts in `examples/complete/scripts`, in order:
+- [examples/complete](examples/complete): the full demo. A VPC with flow logs, EKS 1.36, IRSA roles, ECR, CloudTrail, optional VPC endpoints, one KMS key passed to the module, optional email and Slack notifications, and the `checkout` demo app with Prometheus alerting on top. Deploy it with its scripts, in order (they run from `examples/complete` wherever they're called from):
 
   ```bash
   cd examples/complete
-  bash scripts/bootstrap.sh       # terraform apply in examples/complete, configure kubectl
+  bash scripts/bootstrap.sh       # terraform init and apply, configure kubectl
   bash scripts/install-addons.sh  # AWS Load Balancer Controller, ExternalDNS (only with route53_zone_arns), cert-manager
   bash scripts/build-image.sh     # build apps/checkout and push it to ECR, tagged with the short git SHA
   bash scripts/deploy.sh          # Alertmanager's API key, kube-prometheus-stack, the alert rules, the checkout app and the remediation RBAC
   bash scripts/destroy.sh         # after uninstalling the Helm releases; protections off, then terraform destroy
   ```
 
-  Running continuously in `us-east-1` it costs roughly $460 a month, nearly all of it the cluster, the nodes and the NAT gateways. The breakdown is in [docs/architecture/README.md](docs/architecture/README.md#monthly-cost-estimate). Tear it down when you're done. [examples/complete/DEMO.md](examples/complete/DEMO.md) walks through breaking the app and watching it get fixed.
+  Running continuously in `us-east-1` it costs roughly $460 a month, nearly all of it the cluster, the nodes and the NAT gateways. The breakdown is in [its README](examples/complete/README.md#cost). Tear it down when you're done. [examples/complete/DEMO.md](examples/complete/DEMO.md) walks through breaking the app and watching it get fixed.
 - [examples/existing-cluster](examples/existing-cluster): the minimal call, for a cluster you already have. On its own the module costs about $14 a month at 1000 alerts a day, plus $1 for its KMS key.
 
 ## What's in the repo
@@ -134,17 +134,20 @@ module "sre" {
 ├── event_routing.tf          # EventBridge rules and targets, incident recorder, archive, dead-letter queue, audit log
 ├── kms.tf                    # the module's KMS key (create_kms_key)
 ├── notifications.tf          # email subscriptions and the optional chat topic
+├── templates/                # RBAC manifest template behind the rbac_manifest output
 ├── api/                      # JSON schema for the webhook payload
 ├── stepfunctions/            # runbook and incident recorder definitions, with tests
 ├── lambda/                   # alert_ingest and runbook_action, each with unit tests; Terraform zips them
-├── k8s/rbac/                 # the remediation Role and ClusterRole for the sre-remediation group
+├── tests/                    # terraform test against a mocked AWS provider
 ├── examples/
 │   ├── complete/             # VPC, EKS, IRSA, ECR, CloudTrail, VPC endpoints, KMS key, Slack, and the module
+│   │   ├── apps/checkout/    # demo Flask service, Dockerfile, unit tests
+│   │   ├── helm/             # checkout chart, kube-prometheus-stack values and alert rules, optional Datadog values
+│   │   ├── scripts/          # bootstrap.sh, install-addons.sh, build-image.sh, deploy.sh, destroy.sh
+│   │   └── DEMO.md           # break the app and watch it get fixed
 │   └── existing-cluster/     # the module on a cluster you already have
-├── apps/checkout/            # demo Flask service, Dockerfile, unit tests
-├── helm/                     # checkout chart, kube-prometheus-stack values and alert rules, optional Datadog values
-├── scripts/                  # bootstrap.sh, install-addons.sh, build-image.sh, deploy.sh, destroy.sh (examples/complete)
-└── docs/                     # architecture, API, security, demo walkthrough
+├── docs/                     # architecture, API, security design
+└── .github/                  # CI, release-please, Dependabot
 ```
 
 ## Prerequisites
@@ -335,7 +338,16 @@ cd stepfunctions && pip install -r tests/requirements.txt && pytest tests/
 cd examples/complete/apps/checkout && pip install -r requirements-dev.txt && pytest tests/ --cov
 ```
 
-CI (`.github/workflows/integration-tests.yml`) runs Checkov on the module and on `examples/complete` (settings and skipped checks, with reasons, in `.checkov.yaml`), Trivy on the container image, the module tests, the app, Lambda and state machine tests, `terraform fmt`, `terraform validate` on the module and both examples, and `tflint` on the module and `examples/complete`.
+CI (`.github/workflows/ci.yml`) runs on every pull request and push to `main`:
+
+- the module tests, and the Lambda, state machine and app tests
+- `terraform fmt`, and `terraform validate` on the module and both examples with Terraform 1.5.7 (the oldest the module supports) and the latest 1.x
+- tflint on the module and `examples/complete`
+- Checkov on the module and on `examples/complete`. Settings and skipped checks, with reasons, are in `.checkov.yaml`. It reports findings without failing the build.
+- Trivy on the repo (results in the Security tab), and on the checkout image built from `examples/complete/apps/checkout`, which fails on a critical vulnerability that has a fix
+- a check that the tables in this README match what terraform-docs generates
+
+`pre-commit run -a` runs the formatting, validation, lint and docs hooks locally; see [CONTRIBUTING.md](CONTRIBUTING.md). Releases are made by release-please from conventional commit titles, and the changes are in [CHANGELOG.md](CHANGELOG.md). To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## Known gaps
 

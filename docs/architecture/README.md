@@ -1,10 +1,12 @@
-# Event-Driven SRE Platform - Architecture Documentation
+# Architecture
 
 ## Overview
 
-This document provides a comprehensive view of the event-driven SRE platform architecture, showing how alerts flow through the system from detection to automated remediation.
+How alerts flow through the system, from detection to remediation.
 
 The alert pipeline (webhook, Lambdas, EventBridge, Step Functions, DynamoDB, SNS, KMS) is the Terraform module at the repo root. The VPC, EKS cluster, IRSA roles, ECR, CloudTrail and VPC endpoints come from `examples/complete`, which calls the module.
+
+Names and values like the `apps` namespace, the `checkout` deployment, the `/checkout/degraded_mode` parameter, the `nodegroup=apps` drain label and the alert routes are the ones `examples/complete` passes to the module. The module itself has no routes (nothing is remediated until `runbook_routes` is set), no default deployment, and degraded mode and `drain_node` stay off until `degraded_mode_deployment` and `drainable_node_label` are set.
 
 ## Table of Contents
 
@@ -27,7 +29,6 @@ graph TB
     subgraph "User Traffic & Edge"
         Users[Users/Clients]
         R53[Route53 DNS]
-        CF[CloudFront + WAF]
     end
 
     subgraph "AWS VPC"
@@ -57,20 +58,19 @@ graph TB
         subgraph "Storage & Notifications"
             DDB[(DynamoDB<br/>Incident Records)]
             SNS[SNS alerts topic<br/>Email subscriptions]
-            CHAT[SNS chat topic<br/>optional, chat_notifications]
+            CHAT[SNS chat topic<br/>optional, create_chat_topic]
             CW[CloudWatch Logs<br/>Audit Trail]
         end
     end
 
     subgraph "External Monitoring"
-        DD[Datadog<br/>Logs + APM + SLOs]
+        DD[Datadog monitors<br/>optional]
         SLACK[Slack channel<br/>Amazon Q Developer<br/>in chat applications]
     end
 
     %% Traffic Flow
     Users -->|HTTPS| R53
-    R53 --> CF
-    CF -->|TLS| ALB
+    R53 --> ALB
     ALB -->|HTTP| APP
 
     %% Observability Flow
@@ -78,7 +78,6 @@ graph TB
     SM -->|Scrape :8080/metrics| PROM
     PROM -->|Query| GRAF
     PROM -->|Alert Rules| AM
-    APP -->|Logs + Traces| DD
 
     %% Alert Flow
     AM -->|Webhook POST| APIGW
@@ -109,7 +108,7 @@ graph TB
     classDef storage fill:#3F8624,stroke:#fff,stroke-width:2px,color:#fff
     classDef external fill:#632CA6,stroke:#fff,stroke-width:2px,color:#fff
 
-    class APIGW,L1,L2,EB,SF,REC,ALB,R53,CF,SNS,CHAT,CW aws
+    class APIGW,L1,L2,EB,SF,REC,ALB,R53,SNS,CHAT,CW aws
     class APP,PROM,AM,GRAF,SM k8s
     class DDB,SSM storage
     class DD,SLACK external
@@ -353,8 +352,7 @@ graph TB
 - Evaluates PromQL alert rules every 30 seconds
 - Doesn't scrape the scheduler, controller manager or etcd. EKS runs them, Prometheus can't reach them, and the chart's rules would report them down for good (`KubeSchedulerDown`, `KubeControllerManagerDown`), which the runbook escalates every time.
 - Alert rules defined in PrometheusRule CRD
-- TSDB retention: 15 days
-- High availability: 2 replicas with remote write to external storage
+- TSDB retention: 7 days, one replica, no remote write (`helm/observability/kube-prometheus-stack-values.yaml` in `examples/complete`)
 
 **Alertmanager**
 - Groups related alerts (reduces noise)
@@ -364,11 +362,9 @@ graph TB
 - Webhook integration with API Gateway
 - Retry logic: 3 attempts with exponential backoff
 
-**Datadog Monitoring** (Optional)
-- APM traces for distributed tracing
-- Log aggregation with structured logging
-- Custom SLO monitors (availability, latency, error budget)
-- Synthetics for external endpoint monitoring
+**Datadog** (optional)
+- Datadog monitors can send to the same webhook; the payload format is in [docs/API.md](../API.md#datadog-webhook-format)
+- `examples/complete/helm/datadog/values.yaml` has values for the Datadog agent (logs and APM collection on), but no script installs it, the checkout app isn't instrumented for APM, and the repo defines no Datadog monitors, SLOs or Synthetics tests
 
 ### 2. Ingestion Layer
 
@@ -403,7 +399,7 @@ graph TB
   - `action.completed` -> DynamoDB
   - `incident.escalated` -> SNS
   - `incident.auto_resolved` -> SNS
-  - with `chat_notifications`, the four SNS rules also send to the chat topic
+  - with `create_chat_topic`, the four SNS rules also send to the chat topic
   - every `sre.*` event -> CloudWatch Logs, `/aws/events/<name>`, kept 30 days
 - DynamoDB writes go through the `incident-recorder` Express state machine, since DynamoDB isn't an EventBridge target
 - Archive: 7-day event replay capability
@@ -416,7 +412,7 @@ graph TB
 - Steps:
   1. **Evaluate Alert**: only firing alerts with a severity in `auto_remediate_severities` (default `critical`) go on. Warnings, info alerts and alerts annotated `runbook_action: notify_only` stop here; SNS has already notified on-call.
   2. **Log Incident**: a conditional `UpdateItem` sets `status=remediating`, `remediation_started_at` and `runbook_execution`. It only succeeds once per incident, and not after the alert has resolved, so re-sent alerts and duplicate deliveries stop here.
-  3. **Choose Action**: map the alert name to an action. `CheckoutHighErrorRate`, `CheckoutHighLatencyP95` and `CheckoutSLOBurnFast` get `degrade_or_scale`, `CheckoutDown` gets `restart`, `NodeUnderPressure` gets `drain_node`. A `runbook_action` annotation overrides the table. The namespace comes from the alert's `namespace` label (or Datadog's `kube_namespace` tag), else `apps`; the deployment from its `deployment` label, `kube_deployment` tag or `service` label, else `checkout`; replicas from a `desired_replicas` annotation, else 4; the node from its `node` label or Datadog's `host` tag (the EC2 private DNS name, which is the node name). No runbook for the alert means escalate.
+  3. **Choose Action**: map the alert name to an action with `runbook_routes`. In `examples/complete`, `CheckoutHighErrorRate`, `CheckoutHighLatencyP95` and `CheckoutSLOBurnFast` get `degrade_or_scale`, `CheckoutDown` gets `restart`, `NodeUnderPressure` gets `drain_node`. A `runbook_action` annotation overrides the table. The namespace comes from the alert's `namespace` label (or Datadog's `kube_namespace` tag), else the first of `remediation_namespaces`; the deployment from its `deployment` label, `kube_deployment` tag or `service` label, else `default_deployment`; replicas from a `desired_replicas` annotation, else `default_scale_replicas` (4); the node from its `node` label or Datadog's `host` tag (the EC2 private DNS name, which is the node name). No runbook for the alert means escalate.
   4. **Execute Action**: invoke runbook_action. `InvalidRequest` (bad input) isn't retried; anything else gets 3 retries with exponential backoff and jitter. Either way the result goes out as an `action.completed` event, and a failure escalates.
   5. **Wait for Stabilization**: 60 seconds (`stabilization_seconds`)
   6. **Verify Resolution**: read the incident from DynamoDB every 30 seconds (`verify_poll_seconds`) until the incident recorder has marked it resolved, for up to 10 minutes after the action (`verify_timeout_seconds`). The original plan was 5 minutes, but the alert's 5 minute rate window plus Alertmanager's 2 minute `group_interval` mean a fixed service usually reads as resolved 3 to 7 minutes after the action.
@@ -433,12 +429,12 @@ graph TB
 - VPC: Attached to private subnets (access to EKS API)
 - Input: `{incident_id, alertname, severity, action, namespace, deployment, replicas, node}` from the state machine. It runs the action it's given and doesn't choose one itself.
 - Actions:
-  - **degrade**: set the SSM parameter `/checkout/degraded_mode` to `true`. The checkout pods read it live, so there's no restart. Only checkout has a degraded mode (`DEGRADED_DEPLOYMENT`); degrading any other deployment is an `InvalidRequest`.
+  - **degrade**: set the SSM parameter `/checkout/degraded_mode` to `true`. The checkout pods read it live, so there's no restart. Only `degraded_mode_deployment` has a degraded mode (`DEGRADED_DEPLOYMENT`); degrading any other deployment is an `InvalidRequest`, and so is any degrade when `degraded_mode_deployment` isn't set.
   - **scale**: if the deployment has an HPA, raise its `minReplicas` to the target (and `maxReplicas` too if the target is above it); patching the deployment's replicas directly would be undone by the HPA within seconds. Without an HPA it patches the replicas.
   - **restart**: rolling restart through the restart annotation
   - **degrade_or_scale**: degrade, then scale
   - **drain_node**: cordon the node, then evict its pods through the Eviction API the way `kubectl drain` does, skipping DaemonSet and mirror pods and pods that are finished or already terminating. A pod with no owner isn't evicted, since nothing would recreate it; it's listed under `unmanaged`. Evictions a PodDisruptionBudget blocks are retried every 5 seconds for up to a minute, then left; the result lists them, and the verify step decides whether the alert cleared. The node stays cordoned; replacing or uncordoning it is left to a person.
-- Validation: raises `InvalidRequest` for an unknown action, a namespace that isn't in `ALLOWED_NAMESPACES` (`apps`), a deployment name that isn't a valid Kubernetes name, or replicas outside 1 to `MAX_REPLICAS` (`remediation_max_replicas`, default 10, the HPA's maximum). For `drain_node`: a missing or invalid node name, a node that doesn't exist, a node without the `nodegroup=apps` label (`DRAINABLE_NODE_LABEL`; system nodes need a person), or fewer than 1 other Ready, schedulable apps node to take its pods (`drain_min_schedulable_nodes`).
+- Validation: raises `InvalidRequest` for an unknown action, a namespace that isn't in `ALLOWED_NAMESPACES` (`remediation_namespaces`), a deployment name that isn't a valid Kubernetes name, or replicas outside 1 to `MAX_REPLICAS` (`remediation_max_replicas`, default 10, the HPA's maximum). For `drain_node`: a missing or invalid node name, a node that doesn't exist, a node without the `drainable_node_label` label (`DRAINABLE_NODE_LABEL`, `nodegroup=apps` in the example; system nodes need a person), any drain when `drainable_node_label` isn't set, or fewer than 1 other Ready, schedulable apps node to take its pods (`drain_min_schedulable_nodes`).
 - Nothing is put back after the incident resolves. Degraded mode stays on and the HPA minimum stays raised until someone reverts them (a `helm upgrade` of the checkout chart also resets the minimum to 3):
   ```bash
   aws ssm put-parameter --name /checkout/degraded_mode --value false --overwrite
@@ -446,13 +442,13 @@ graph TB
   kubectl uncordon NODE_NAME   # after a drain, once the node is healthy
   ```
 - Kubernetes access: an EKS access entry maps its IAM role to the `sre-remediation` group (IRSA only applies to pods)
-- RBAC: a Role in `apps` for deployments and HPAs, and a ClusterRole for nodes, listing pods and creating evictions. Nodes are cluster-scoped and a node runs pods from every namespace, so draining can't be done with a namespaced Role. There's no permission to delete pods.
+- RBAC: the module's `rbac_manifest` output (rendered from `templates/rbac.yaml.tftpl`), applied with `terraform output -raw rbac_manifest | kubectl apply -f -`. It has a Role in each of `remediation_namespaces` for deployments and HPAs, and, only when `drainable_node_label` is set, a ClusterRole for nodes, listing pods and creating evictions. Nodes are cluster-scoped and a node runs pods from every namespace, so draining can't be done with a namespaced Role. There's no permission to delete pods.
 
 ### 5. Storage & Notification Layer
 
 **DynamoDB**
 - Table: `event-driven-sre-incidents` (`<name>-incidents`)
-- Primary key: `incident_id` (UUID), no sort key. The id is derived from the Alertmanager fingerprint and `startsAt`, or the Datadog `alert_cycle_key`, so it already identifies one occurrence of an alert; a `timestamp` sort key would mean every writer needs the start time, which a Datadog recovery event doesn't carry.
+- Primary key: `incident_id`, no sort key. It's a version 5 UUID derived from the Alertmanager fingerprint and `startsAt`, or the Datadog `alert_cycle_key`, so it already identifies one occurrence of an alert; a `timestamp` sort key would mean every writer needs the start time, which a Datadog recovery event doesn't carry.
 - Global secondary index `by-status`: `status` and `first_seen_at`, to list open or escalated incidents newest first
 - Attributes:
   - `alertname`, `service`, `severity` (critical, warning, info), `source`
@@ -470,7 +466,7 @@ graph TB
 
 **SNS Topics**
 - Alerts topic: `<name>-alerts` (output `sns_topic_arn`). EventBridge publishes a one-line text message per event, like `[critical] checkout - CheckoutHighErrorRate is firing. ... (incident <id>)`.
-- Chat topic: `<name>-chat` (output `chat_topic_arn`), only with `chat_notifications = true`. The same four rules publish to it in the custom notification format of Amazon Q Developer in chat applications (AWS Chatbot), which only renders its own format. Titles look like `critical: CheckoutHighErrorRate is firing on checkout`, `Escalated: X on Y needs a person`, `Resolved: X on Y` and `Auto-resolved: X on Y`, with the incident ID in the text.
+- Chat topic: `<name>-chat` (output `chat_topic_arn`), only with `create_chat_topic = true`. The same four rules publish to it in the custom notification format of Amazon Q Developer in chat applications (AWS Chatbot), which only renders its own format. Titles look like `critical: CheckoutHighErrorRate is firing on checkout`, `Escalated: X on Y needs a person`, `Resolved: X on Y` and `Auto-resolved: X on Y`, with the incident ID in the text.
 - Both are encrypted with the platform key and refuse publishes without TLS.
 - Subscriptions:
   - Email: one per address in `notification_emails`, on the alerts topic. SNS sends each address a confirmation email, and nothing arrives until the link in it is clicked.
@@ -486,8 +482,7 @@ graph TB
   - `/aws/vendedlogs/states/<name>-incident-recorder` (failed writes only; Express workflows keep no execution history)
   - `/aws/events/<name>` (every event on the bus)
 - Retention: 30 days for all five, encrypted with the platform KMS key. Terraform creates the Lambda log groups too, so Lambda doesn't make unencrypted ones that never expire.
-- Insights queries: Pre-built dashboards for MTTR, alert volume
-- Metric filters: Extract custom metrics (remediation success rate)
+- No dashboards, saved Insights queries or metric filters are built yet
 
 ### 6. Application Layer
 
@@ -578,15 +573,13 @@ graph TB
 - **Pipeline metrics**: Alert ingestion rate, remediation success rate, MTTR
 - **Infrastructure metrics**: Pod CPU/memory, node capacity, Lambda duration
 
-### Dashboards
-- **SRE Dashboard**: Real-time incident status, alert volume, remediation actions
-- **Application Dashboard**: Service health, error rate trends, latency heatmaps
-- **Cost Dashboard**: Lambda invocations, EventBridge events, DynamoDB consumption
+### Dashboards and alerts on the pipeline
 
-### Alerts on the Alerting System
-- **Meta-monitoring**: Alert if alert_ingest Lambda errors > 1%
-- **Pipeline health**: Alert if EventBridge delivery failures > 5%
-- **Remediation failures**: Alert if runbook_action Lambda fails 3 times in 10 minutes
+Not built yet. kube-prometheus-stack brings its own Grafana dashboards for the cluster, but there are no dashboards for the pipeline, and no CloudWatch alarms on it. The ones worth adding first:
+
+- alert_ingest Lambda errors
+- messages in the events dead-letter queue (`events_dlq_url`)
+- failed runbook executions and runbook_action Lambda errors
 
 ---
 
@@ -596,7 +589,7 @@ graph TB
 
 **Scenario 1: alert_ingest Lambda fails**
 - Impact: Alerts not ingested, no remediation
-- Detection: CloudWatch alarm on Lambda errors
+- Detection: the Lambda's `Errors` metric (no alarm is built yet) and Alertmanager's failed-notification logs
 - Mitigation: Alertmanager retries webhook (3 attempts), DLQ captures failed events
 - Recovery: Replay events from EventBridge archive
 
@@ -608,7 +601,7 @@ graph TB
 
 **Scenario 3: EventBridge target failure**
 - Impact: Incidents not logged to DynamoDB
-- Detection: CloudWatch metric filter on failed PutItem
+- Detection: messages in the dead-letter queue and failures in the incident recorder's log group (no alarm is built yet)
 - Mitigation: EventBridge DLQ captures failed events
 - Recovery: Reprocess events from DLQ
 
@@ -626,7 +619,7 @@ graph TB
 - Alert ingestion: 1000 alerts/second (API Gateway throttle)
 - Concurrent remediations: the account's unreserved Lambda concurrency by default; `runbook_action_reserved_concurrency` caps it (10 is a good cap) if the account limit has room
 - Event throughput: 10,000 events/second (EventBridge soft limit)
-- Incident storage: Unlimited (DynamoDB auto-scaling)
+- Incident storage: no practical limit; the table is on-demand (`PAY_PER_REQUEST`)
 
 ### Scaling Strategies
 1. **Horizontal scaling**: Increase Lambda concurrency
@@ -638,37 +631,7 @@ graph TB
 
 ## Cost Optimization
 
-### Monthly Cost Estimate
-
-This is for `examples/complete`. The module on its own is the alert pipeline and KMS key lines.
-
-`us-east-1` on-demand prices, running all month with the default variables, before free tiers. The cluster is nearly all of it; the alert pipeline is small even at 1000 alerts a day.
-
-| Item | Monthly |
-| --- | --- |
-| EKS control plane ($0.10/hour) | $73 |
-| 4 × m6i.large nodes, 2 per node group ($0.096/hour each) | $280 |
-| EBS root volumes, 4 × 20 GB gp3 | $6 |
-| 2 NAT gateways ($0.045/hour each, plus $0.045/GB processed) | $66 plus data |
-| Load balancer for the checkout ingress ($0.0225/hour plus LCUs) | about $16 plus usage |
-| KMS key ($1, plus $0.03 per 10,000 requests) | about $1 |
-| CloudTrail management events (the first trail in an account is free) and its S3 bucket | under $1 |
-| S3 and DynamoDB gateway endpoints | $0 |
-| EKS control plane logs, all five types ($0.50/GB ingested) | a few dollars, depending on cluster activity |
-| Alert pipeline at 1000 alerts/day (below) | about $14 |
-| **Total** | **about $460** |
-| Optional: 6 interface endpoints in 2 AZs (`enable_vpc_endpoints`, $0.01/hour each per AZ, plus $0.01/GB) | add $88 |
-| Optional: the execute-api endpoint for `webhook_private` (2 AZs) | add $15 |
-
-The alert pipeline line assumes 1000 webhook calls a day (30,000 a month), one alert each, half of them firing alerts that each start a runbook run of about 30 state transitions (remediate, then poll for up to 10 minutes):
-
-- API Gateway (REST): 30,000 requests × $3.50/M = $0.11
-- Lambda: alert_ingest (256 MB, about 100 ms) and runbook_action (512 MB, about 2 s per action): about $0.30
-- EventBridge: about 60,000 custom events × $1/M = $0.06, plus a few cents for the archive
-- Step Functions: 15,000 runbook runs × 30 transitions = 450,000 × $25/M = $11.25; the Express incident recorder, 45,000 runs: about $0.05
-- DynamoDB on demand: about 150,000 writes (index included) and 135,000 reads: about $0.12
-- SNS: 45,000 publishes, $0.02; email deliveries, $2 per 100,000 after the first 1,000: about $0.90. The chat topic doubles the publishes; Amazon Q Developer in chat applications itself is free.
-- CloudWatch Logs for the pipeline, about 1 GB at $0.50/GB: $0.50
+The monthly cost of `examples/complete`, line by line, is in [its README](../../examples/complete/README.md#cost). The module on its own is about $14 a month at 1000 alerts a day, plus $1 for its KMS key; nearly all of it is the runbook's Step Functions transitions.
 
 ### Optimization Techniques
 - Tear it down when you're not using it; the fixed cluster costs are about 95% of the bill
@@ -681,37 +644,37 @@ The alert pipeline line assumes 1000 webhook calls a day (30,000 a month), one a
 
 ## Security Best Practices Implemented
 
-- ✅ Least-privilege IAM policies (no wildcards for application resources)
-- ✅ Encryption at rest: one customer managed KMS key, rotated yearly, for the incidents table, the SNS topics, the dead-letter queue, the platform's log groups and CloudTrail. Kubernetes secrets use the EKS module's own key, and ECR images AES-256.
-- ✅ Encryption in transit: a TLS 1.2+ policy on the ALB (TLS 1.3 preferred), and the SNS topics, the dead-letter queue and the CloudTrail bucket refuse requests without TLS. The webhook is HTTPS only, but its TLS policy can't be pinned until the move to AWS provider 6.
-- ✅ IRSA and EKS access entries instead of long-lived credentials
-- ✅ Kubernetes RBAC: workload changes limited to the `apps` namespace, and a ClusterRole only for cordoning nodes and evicting pods
-- ✅ VPC security groups (allow-list only)
-- ✅ CloudTrail: a multi-region trail of management events with log file validation (`enable_cloudtrail`, on by default)
-- ✅ Secrets: the only secrets are the webhook API keys, kept in a Kubernetes Secret that EKS encrypts. The SSM degraded flag is a plain String and isn't sensitive.
-- ✅ Container images: ECR scan on push and immutable tags, plus Trivy in CI
-- ✅ Network segmentation: private subnets for EKS and the remediation Lambda, S3 and DynamoDB gateway endpoints, optional interface endpoints (`enable_vpc_endpoints`) and an optional private webhook (`webhook_private`)
-- ✅ VPC flow logs, encrypted and kept 30 days
-- ✅ Nodes require IMDSv2 with a hop limit of 1, so pods can't borrow the node's IAM role
+- Least-privilege IAM policies (no wildcards for application resources)
+- Encryption at rest: one customer managed KMS key, rotated yearly, for the incidents table, the SNS topics, the dead-letter queue, the platform's log groups and CloudTrail. Kubernetes secrets use the EKS module's own key, and ECR images AES-256.
+- Encryption in transit: a TLS 1.2+ policy on the ALB (TLS 1.3 preferred), and the SNS topics, the dead-letter queue and the CloudTrail bucket refuse requests without TLS. The webhook is HTTPS only, but its TLS policy can't be pinned until the move to AWS provider 6.
+- IRSA and EKS access entries instead of long-lived credentials
+- Kubernetes RBAC: workload changes limited to the `apps` namespace, and a ClusterRole only for cordoning nodes and evicting pods
+- VPC security groups (allow-list only)
+- CloudTrail: a multi-region trail of management events with log file validation (`enable_cloudtrail`, on by default)
+- Secrets: the only secrets are the webhook API keys, kept in a Kubernetes Secret that EKS encrypts. The SSM degraded flag is a plain String and isn't sensitive.
+- Container images: ECR scan on push and immutable tags, plus Trivy in CI
+- Network segmentation: private subnets for EKS and the remediation Lambda, S3 and DynamoDB gateway endpoints, optional interface endpoints (`enable_vpc_endpoints`) and an optional private webhook (`webhook_private`)
+- VPC flow logs, encrypted and kept 30 days
+- Nodes require IMDSv2 with a hop limit of 1, so pods can't borrow the node's IAM role
 - Not built yet: CloudFront and WAF in front of the ALB. The EKS public endpoint is open to the internet unless `eks_public_access_cidrs` is set.
 
 ---
 
 ## Future Enhancements
 
-### Short-term (Next Sprint)
+Ideas, none of them started:
+
+### Smaller
 - Add more runbook actions (canary deployment, traffic shift)
 - Implement alert correlation (group related alerts)
 - Add Slack bot for interactive remediation approval
-- Create Terraform module for multi-region deployment
 
-### Medium-term (Next Quarter)
+### Larger
 - Machine learning for anomaly detection
 - Automated rollback if remediation causes further degradation
-- SLO-based alerting (error budget exhaustion)
 - Cost anomaly detection and auto-scaling
 
-### Long-term (Next Year)
+### Much larger
 - Multi-cloud support (GCP, Azure)
 - Chaos engineering platform integration (Gremlin, Chaos Mesh)
 - Self-healing infrastructure (auto-replace unhealthy nodes)
@@ -727,7 +690,3 @@ The alert pipeline line assumes 1000 webhook calls a day (30,000 a month), one a
 - [Prometheus Alert Rules](https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/)
 - [Step Functions Error Handling](https://docs.aws.amazon.com/step-functions/latest/dg/concepts-error-handling.html)
 
----
-
-**Last Updated**: 2026-02-02
-**Maintained By**: SRE Platform Team
