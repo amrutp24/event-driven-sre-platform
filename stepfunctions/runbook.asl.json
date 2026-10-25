@@ -81,7 +81,7 @@
       "Type": "Succeed"
     },
     "ChooseAction": {
-      "Comment": "Step 3. Maps the alert to an action. A runbook_action annotation on the alert wins over the table. The target comes from the alert's labels (or Datadog's kube_namespace and kube_deployment tags), falling back to the checkout deployment. drain_node uses the node label, or Datadog's host tag.",
+      "Comment": "Step 3. Maps the alert to an action. A runbook_action annotation on the alert wins over the table. The target comes from the alert's labels (or Datadog's kube_namespace and kube_deployment tags), falling back to the service label, then default_deployment. With neither set, the Lambda refuses the action and the incident escalates. drain_node uses the node label, or Datadog's host tag.",
       "Type": "Pass",
       "Assign": {
         "action": "{% $exists($incident.annotations.runbook_action) ? $incident.annotations.runbook_action : ($exists($lookup($routes, $incident.alertname)) ? $lookup($routes, $incident.alertname).action : 'none') %}",
