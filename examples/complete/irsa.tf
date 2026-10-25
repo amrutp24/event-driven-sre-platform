@@ -1,7 +1,7 @@
 # AWS Load Balancer Controller IRSA
 module "alb_controller_irsa" {
   source  = "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts-eks"
-  version = "~> 5.0"
+  version = "~> 6.8"
 
   role_name                              = "${var.name}-alb-controller"
   attach_load_balancer_controller_policy = true
@@ -19,7 +19,7 @@ module "alb_controller_irsa" {
 # ExternalDNS IRSA (Route53)
 module "external_dns_irsa" {
   source  = "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts-eks"
-  version = "~> 5.0"
+  version = "~> 6.8"
 
   # Only with hosted zones to manage: a policy with no zones is invalid
   create_role                   = length(var.route53_zone_arns) > 0
@@ -54,7 +54,7 @@ resource "aws_iam_policy" "checkout_degraded_flag" {
 
 module "checkout_irsa" {
   source  = "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts-eks"
-  version = "~> 5.0"
+  version = "~> 6.8"
 
   role_name = "${var.name}-checkout"
   role_policy_arns = {
@@ -74,7 +74,7 @@ module "checkout_irsa" {
 # Cert-manager IRSA is optional depending on DNS01 integrations (Route53)
 module "cert_manager_irsa" {
   source  = "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts-eks"
-  version = "~> 5.0"
+  version = "~> 6.8"
 
   role_name = "${var.name}-cert-manager"
 
