@@ -318,6 +318,27 @@ run "rejects_default_replicas_above_the_max" {
   expect_failures = [aws_sfn_state_machine.runbook]
 }
 
+run "outputs" {
+  command = apply
+
+  assert {
+    condition = (
+      output.alert_ingest_function_arn == aws_lambda_function.alert_ingest.arn
+      && output.alert_ingest_function_name == "event-driven-sre-alert-ingest"
+      && output.runbook_action_function_name == "event-driven-sre-runbook-action"
+      && output.rest_api_id == aws_api_gateway_rest_api.alerts_api.id
+      && output.rest_api_execution_arn == aws_api_gateway_rest_api.alerts_api.execution_arn
+      && output.alerts_topic_name == "event-driven-sre-alerts"
+    )
+    error_message = "The function, API and topic outputs should point at the module's resources."
+  }
+
+  assert {
+    condition     = output.alertmanager_api_key != null && output.datadog_api_key != null
+    error_message = "With webhook_require_api_key on, both keys should be output."
+  }
+}
+
 run "bring_your_own_key" {
   command = apply
 
@@ -466,7 +487,7 @@ run "optional_pieces_off" {
   }
 
   assert {
-    condition     = length(aws_api_gateway_api_key.webhook) == 0 && length(aws_api_gateway_usage_plan.webhook) == 0 && !aws_api_gateway_method.webhook_post.api_key_required && output.alertmanager_api_key == ""
+    condition     = length(aws_api_gateway_api_key.webhook) == 0 && length(aws_api_gateway_usage_plan.webhook) == 0 && !aws_api_gateway_method.webhook_post.api_key_required && output.alertmanager_api_key == null && output.datadog_api_key == null
     error_message = "With webhook_require_api_key off there should be no keys or usage plan."
   }
 }
@@ -505,7 +526,7 @@ run "no_notifications_by_default" {
   command = plan
 
   assert {
-    condition     = length(aws_sns_topic_subscription.email) == 0 && length(aws_sns_topic.chat) == 0 && length(aws_cloudwatch_event_target.to_chat) == 0
+    condition     = length(aws_sns_topic_subscription.email) == 0 && length(aws_sns_topic.chat) == 0 && length(aws_cloudwatch_event_target.to_chat) == 0 && output.chat_topic_arn == null
     error_message = "Nothing should subscribe or publish to chat unless asked."
   }
 }
@@ -515,7 +536,7 @@ run "notifications" {
 
   variables {
     notification_emails = ["oncall@example.com", "sre@example.com"]
-    chat_notifications  = true
+    create_chat_topic   = true
   }
 
   assert {
@@ -525,7 +546,7 @@ run "notifications" {
 
   assert {
     condition     = length(aws_sns_topic.chat) == 1 && aws_sns_topic.chat[0].kms_master_key_id == aws_kms_key.platform[0].arn && output.chat_topic_arn == aws_sns_topic.chat[0].arn
-    error_message = "chat_notifications should create an encrypted chat topic and output it."
+    error_message = "create_chat_topic should create an encrypted chat topic and output it."
   }
 
   assert {
@@ -574,6 +595,30 @@ run "accepts_a_forty_character_name" {
     condition     = aws_cloudwatch_event_archive.sre.name == "a-name-that-is-exactly-forty-chars-long0-archive"
     error_message = "A 40-character name should be accepted."
   }
+}
+
+run "rejects_bad_network_and_limits" {
+  command = plan
+
+  variables {
+    vpc_id                              = "0123456789abcdef0"
+    subnet_ids                          = []
+    cluster_security_group_id           = "vpc-0123456789abcdef0"
+    webhook_rate_limit                  = 0
+    webhook_burst_limit                 = -5
+    runbook_action_reserved_concurrency = -2
+    alert_ingest_reserved_concurrency   = 1.5
+  }
+
+  expect_failures = [
+    var.vpc_id,
+    var.subnet_ids,
+    var.cluster_security_group_id,
+    var.webhook_rate_limit,
+    var.webhook_burst_limit,
+    var.runbook_action_reserved_concurrency,
+    var.alert_ingest_reserved_concurrency,
+  ]
 }
 
 run "rejects_bad_email" {

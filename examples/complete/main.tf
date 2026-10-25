@@ -44,5 +44,5 @@ module "sre" {
 
   # Email straight from SNS; Slack through chatbot.tf
   notification_emails = var.notification_emails
-  chat_notifications  = var.slack_workspace_id != null && var.slack_channel_id != null
+  create_chat_topic   = var.slack_workspace_id != null && var.slack_channel_id != null
 }

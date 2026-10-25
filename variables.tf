@@ -25,16 +25,31 @@ variable "cluster_name" {
 variable "vpc_id" {
   description = "VPC runbook_action runs in"
   type        = string
+
+  validation {
+    condition     = can(regex("^vpc-[0-9a-f]+$", var.vpc_id))
+    error_message = "Must be a VPC ID, vpc-..."
+  }
 }
 
 variable "subnet_ids" {
   description = "Private subnets for runbook_action, and for the execute-api endpoint when webhook_private is true"
   type        = list(string)
+
+  validation {
+    condition     = length(var.subnet_ids) > 0
+    error_message = "Give at least one subnet."
+  }
 }
 
 variable "cluster_security_group_id" {
   description = "The cluster's security group. The module adds an ingress rule for 443 from runbook_action's security group."
   type        = string
+
+  validation {
+    condition     = can(regex("^sg-[0-9a-f]+$", var.cluster_security_group_id))
+    error_message = "Must be a security group ID, sg-..."
+  }
 }
 
 variable "create_access_entry" {
@@ -152,12 +167,22 @@ variable "runbook_action_reserved_concurrency" {
   description = "Concurrent executions reserved for runbook_action, which caps how many remediations hit the cluster at once (10 is a good cap). -1 leaves it unreserved, the default, because AWS keeps at least 50 to 100 executions unreserved per account and new accounts often have a limit of 50."
   type        = number
   default     = -1
+
+  validation {
+    condition     = var.runbook_action_reserved_concurrency >= -1 && floor(var.runbook_action_reserved_concurrency) == var.runbook_action_reserved_concurrency
+    error_message = "Must be a whole number, -1 or more."
+  }
 }
 
 variable "alert_ingest_reserved_concurrency" {
   description = "Concurrent executions reserved for alert_ingest. -1 leaves it unreserved, the default, because AWS keeps at least 50 to 100 executions unreserved per account and new accounts often have a limit of 50."
   type        = number
   default     = -1
+
+  validation {
+    condition     = var.alert_ingest_reserved_concurrency >= -1 && floor(var.alert_ingest_reserved_concurrency) == var.alert_ingest_reserved_concurrency
+    error_message = "Must be a whole number, -1 or more."
+  }
 }
 
 variable "auto_remediate_severities" {
@@ -267,12 +292,22 @@ variable "webhook_rate_limit" {
   description = "Steady-state requests per second allowed on the webhook"
   type        = number
   default     = 1000
+
+  validation {
+    condition     = var.webhook_rate_limit > 0
+    error_message = "Must be more than 0."
+  }
 }
 
 variable "webhook_burst_limit" {
   description = "Burst of requests allowed on the webhook"
   type        = number
   default     = 2000
+
+  validation {
+    condition     = var.webhook_burst_limit > 0 && floor(var.webhook_burst_limit) == var.webhook_burst_limit
+    error_message = "Must be a whole number, more than 0."
+  }
 }
 
 variable "webhook_private" {
@@ -292,7 +327,7 @@ variable "notification_emails" {
   }
 }
 
-variable "chat_notifications" {
+variable "create_chat_topic" {
   description = "Also publish incidents to a second topic in the format Amazon Q Developer in chat applications (AWS Chatbot) renders, for a Slack or Teams channel to subscribe to. See examples/complete/chatbot.tf."
   type        = bool
   default     = false

@@ -4,15 +4,25 @@ output "alert_webhook_url" {
 }
 
 output "alertmanager_api_key" {
-  description = "X-API-Key for Alertmanager; empty when webhook_require_api_key is false"
-  value       = try(aws_api_gateway_api_key.webhook["alertmanager"].value, "")
+  description = "X-API-Key for Alertmanager; null when webhook_require_api_key is false"
+  value       = try(aws_api_gateway_api_key.webhook["alertmanager"].value, null)
   sensitive   = true
 }
 
 output "datadog_api_key" {
-  description = "X-API-Key for the Datadog webhook; empty when webhook_require_api_key is false"
-  value       = try(aws_api_gateway_api_key.webhook["datadog"].value, "")
+  description = "X-API-Key for the Datadog webhook; null when webhook_require_api_key is false"
+  value       = try(aws_api_gateway_api_key.webhook["datadog"].value, null)
   sensitive   = true
+}
+
+output "rest_api_id" {
+  description = "ID of the webhook's REST API"
+  value       = aws_api_gateway_rest_api.alerts_api.id
+}
+
+output "rest_api_execution_arn" {
+  description = "Execution ARN of the webhook's REST API, for execute-api:Invoke permissions"
+  value       = aws_api_gateway_rest_api.alerts_api.execution_arn
 }
 
 output "event_bus_name" {
@@ -50,6 +60,11 @@ output "sns_topic_arn" {
   value       = aws_sns_topic.alerts.arn
 }
 
+output "alerts_topic_name" {
+  description = "Name of the incident notifications topic"
+  value       = aws_sns_topic.alerts.name
+}
+
 output "events_dlq_url" {
   description = "Events EventBridge couldn't deliver after retries"
   value       = aws_sqs_queue.events_dlq.url
@@ -80,9 +95,24 @@ output "kms_key_arn" {
   value       = local.kms_key_arn
 }
 
+output "alert_ingest_function_arn" {
+  description = "Lambda behind the webhook that validates alerts and puts them on the bus"
+  value       = aws_lambda_function.alert_ingest.arn
+}
+
+output "alert_ingest_function_name" {
+  description = "Name of the alert_ingest Lambda"
+  value       = aws_lambda_function.alert_ingest.function_name
+}
+
 output "runbook_action_function_arn" {
   description = "Lambda that carries out remediation actions against the cluster"
   value       = aws_lambda_function.runbook_action.arn
+}
+
+output "runbook_action_function_name" {
+  description = "Name of the runbook_action Lambda"
+  value       = aws_lambda_function.runbook_action.function_name
 }
 
 output "runbook_action_role_arn" {
@@ -110,16 +140,16 @@ output "rbac_manifest" {
 }
 
 output "degraded_mode_parameter_name" {
-  description = "SSM parameter the degrade action sets to true; the app reads it"
+  description = "SSM parameter the degrade action sets to true; the app reads it. Null without degraded_mode_deployment."
   value       = local.degraded_mode_parameter_name
 }
 
 output "degraded_mode_parameter_arn" {
-  description = "Grant the degraded-mode deployment ssm:GetParameter on this"
+  description = "Grant the degraded-mode deployment ssm:GetParameter on this. Null without degraded_mode_deployment."
   value       = local.degraded_mode_parameter_arn
 }
 
 output "chat_topic_arn" {
-  description = "Topic for a Slack or Teams channel configuration to subscribe to; empty when chat_notifications is false"
-  value       = try(aws_sns_topic.chat[0].arn, "")
+  description = "Topic for a Slack or Teams channel configuration to subscribe to; null when create_chat_topic is false"
+  value       = try(aws_sns_topic.chat[0].arn, null)
 }
