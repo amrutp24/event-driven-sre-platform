@@ -18,7 +18,7 @@ State is local; there's no backend block.
 ## Prerequisites
 
 - The AWS CLI, Terraform, kubectl, Helm, Docker and git
-- In `helm/checkout/values.yaml`, `ingress.host` and `ingress.certificateArn` (an ACM certificate for that host), or `ingress.enabled=false` for no load balancer
+- For a public load balancer (off by default), `ingress.enabled=true` in `helm/checkout/values.yaml`, with `ingress.host` and `ingress.certificateArn` (an ACM certificate for that host)
 - `eks_public_access_cidrs` set to your own address; the default is open to the internet
 - `route53_zone_arns` if you want ExternalDNS to manage records. Without it there's no ExternalDNS role and `install-addons.sh` skips ExternalDNS.
 
@@ -97,7 +97,7 @@ bash scripts/destroy.sh         # deletion protection and the trail bucket's pro
 
 ## Cost
 
-Roughly $460 a month running continuously, at `us-east-1` on-demand prices with the default variables, before free tiers. The cluster is nearly all of it; the alert pipeline is small even at 1000 alerts a day, and it plus the KMS key line is what the module costs on its own. Tear it down when you're done.
+Roughly $445 a month running continuously, at `us-east-1` on-demand prices with the default variables, before free tiers. The cluster is nearly all of it; the alert pipeline is small even at 1000 alerts a day, and it plus the KMS key line is what the module costs on its own. Tear it down when you're done.
 
 | Item | Monthly |
 | --- | --- |
@@ -105,15 +105,15 @@ Roughly $460 a month running continuously, at `us-east-1` on-demand prices with 
 | 4 × m6i.large nodes, 2 per node group ($0.096/hour each) | $280 |
 | EBS root volumes, 4 × 20 GB gp3 | $6 |
 | 2 NAT gateways ($0.045/hour each, plus $0.045/GB processed) | $66 plus data |
-| Load balancer for the checkout ingress ($0.0225/hour plus LCUs) | about $16 plus usage |
 | KMS key ($1, plus $0.03 per 10,000 requests) | about $1 |
 | CloudTrail management events (the first trail in an account is free) and its S3 bucket | under $1 |
 | S3 and DynamoDB gateway endpoints | $0 |
 | EKS control plane logs, all five types ($0.50/GB ingested) | a few dollars, depending on cluster activity |
 | Alert pipeline at 1000 alerts/day (below) | about $14 |
-| **Total** | **about $460** |
+| **Total** | **about $445** |
 | Optional: 6 interface endpoints in 2 AZs (`enable_vpc_endpoints`, $0.01/hour each per AZ, plus $0.01/GB) | add $88 |
 | Optional: the execute-api endpoint for `webhook_private` (2 AZs) | add $15 |
+| Optional: load balancer for the checkout ingress (`ingress.enabled`, $0.0225/hour plus LCUs) | add about $16 plus usage |
 
 The alert pipeline line assumes 1000 webhook calls a day (30,000 a month), one alert each, half of them firing alerts that each start a runbook run of about 30 state transitions (remediate, then poll for up to 10 minutes):
 
