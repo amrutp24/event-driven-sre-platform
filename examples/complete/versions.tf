@@ -4,7 +4,7 @@ terraform {
     aws = {
       source = "hashicorp/aws"
       # The EKS module v20 doesn't support provider v6
-      version = ">= 5.95, < 6.0"
+      version = ">= 5.95, < 6.71"
     }
     archive = {
       source  = "hashicorp/archive"
