@@ -59,12 +59,16 @@ resource "aws_kms_key" "platform" {
         }
       },
       {
-        # Publishing to the encrypted SNS topic and dead-lettering to the encrypted queue
+        # Publishing to the encrypted SNS topic and dead-lettering to the
+        # encrypted queue, for this account's rules only
         Sid       = "EventBridge"
         Effect    = "Allow"
         Principal = { Service = "events.amazonaws.com" }
         Action    = ["kms:Decrypt", "kms:GenerateDataKey*"]
         Resource  = "*"
+        Condition = {
+          StringEquals = { "aws:SourceAccount" = local.account_id }
+        }
       },
     ]
   })

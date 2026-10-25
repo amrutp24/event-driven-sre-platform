@@ -82,6 +82,14 @@ run "defaults" {
   }
 
   assert {
+    condition = (
+      jsondecode(aws_kms_key.platform[0].policy).Statement[3].Sid == "EventBridge"
+      && jsondecode(aws_kms_key.platform[0].policy).Statement[3].Condition.StringEquals["aws:SourceAccount"] == "123456789012"
+    )
+    error_message = "EventBridge should only use the key for this account's rules."
+  }
+
+  assert {
     condition     = aws_dynamodb_table.incidents.deletion_protection_enabled && aws_dynamodb_table.incidents.ttl[0].attribute_name == "expires_at"
     error_message = "The incidents table should have deletion protection and a TTL on expires_at."
   }
