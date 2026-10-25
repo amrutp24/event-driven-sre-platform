@@ -284,6 +284,22 @@ def test_unknown_service_falls_back_to_checkout():
     assert payload(run(detail))["deployment"] == "checkout"
 
 
+# The module's own defaults: no routes and no default deployment
+MODULE_DEFAULTS = {**RUNBOOK_VARS, "routes": "{}", "default_deployment": ""}
+
+
+def test_with_no_routes_a_critical_alert_escalates():
+    result = run(incident(), definition=load("runbook.asl.json", MODULE_DEFAULTS))
+    assert (result.error, result.cause) == ("Escalated", "no runbook for CheckoutHighErrorRate")
+    assert result.calls_to("ExecuteAction") == []
+
+
+def test_with_no_default_deployment_the_lambda_gets_an_empty_one():
+    detail = incident(service="unknown", labels={"alertname": "AppDown", "severity": "critical"},
+                      alertname="AppDown", annotations={"runbook_action": "restart"})
+    assert payload(run(detail, definition=load("runbook.asl.json", MODULE_DEFAULTS)))["deployment"] == ""
+
+
 # ---------------------------------------------------------------- escalation
 
 def test_unknown_alert_is_claimed_then_escalated():

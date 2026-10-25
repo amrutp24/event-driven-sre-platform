@@ -63,13 +63,14 @@ output "alert_webhook_url" {
 
 output "alertmanager_api_key" {
   description = "X-API-Key for Alertmanager; empty when webhook_require_api_key is false"
-  value       = module.sre.alertmanager_api_key
-  sensitive   = true
+  # The module outputs null then; deploy.sh reads this with -raw
+  value     = module.sre.alertmanager_api_key != null ? module.sre.alertmanager_api_key : ""
+  sensitive = true
 }
 
 output "datadog_api_key" {
   description = "X-API-Key for the Datadog webhook; empty when webhook_require_api_key is false"
-  value       = module.sre.datadog_api_key
+  value       = module.sre.datadog_api_key != null ? module.sre.datadog_api_key : ""
   sensitive   = true
 }
 
@@ -122,4 +123,9 @@ output "incident_recorder_log_group" {
 
 output "runbook_action_lambda_arn" {
   value = module.sre.runbook_action_function_arn
+}
+
+output "rbac_manifest" {
+  description = "What runbook_action may do in the cluster; deploy.sh applies it"
+  value       = module.sre.rbac_manifest
 }

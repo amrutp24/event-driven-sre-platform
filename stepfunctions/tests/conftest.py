@@ -1,6 +1,7 @@
 """
 Fixtures for the state machine tests. Template values match what Terraform
-passes with the default variables.
+passes for examples/complete (the checkout demo), which sets the routes and
+targets; the timings are the module's defaults.
 """
 import importlib.util
 import json
@@ -19,7 +20,7 @@ TABLE = "event-driven-sre-incidents"
 BUS = "event-driven-sre-bus"
 RUNBOOK_ACTION_ARN = "arn:aws:lambda:us-east-1:123456789012:function:event-driven-sre-runbook-action"
 
-# var.runbook_routes' default; Terraform passes it through jsonencode
+# examples/complete's runbook_routes; Terraform passes it through jsonencode
 ROUTES = {
     "CheckoutHighErrorRate": {"action": "degrade_or_scale"},
     "CheckoutHighLatencyP95": {"action": "degrade_or_scale"},
@@ -29,6 +30,7 @@ ROUTES = {
 }
 
 RUNBOOK_VARS = {
+    "partition": "aws",
     "table_name": TABLE,
     "runbook_action_arn": RUNBOOK_ACTION_ARN,
     "event_bus_name": BUS,
@@ -44,6 +46,7 @@ RUNBOOK_VARS = {
 }
 
 RECORDER_VARS = {
+    "partition": "aws",
     "table_name": TABLE,
     "ttl_seconds": 7776000,
 }
@@ -83,6 +86,21 @@ def incident(**overrides):
     }
     record.update(overrides)
     return record
+
+
+# runbook_action's environment as Terraform sets it for examples/complete
+RUNBOOK_ACTION_ENV = {
+    "ALLOWED_NAMESPACES": "apps",
+    "DEGRADED_DEPLOYMENT": "checkout",
+    "DEGRADED_PARAM": "/checkout/degraded_mode",
+    "DRAINABLE_NODE_LABEL": "nodegroup=apps",
+}
+
+
+@pytest.fixture(autouse=True)
+def runbook_action_env(monkeypatch):
+    for name, value in RUNBOOK_ACTION_ENV.items():
+        monkeypatch.setenv(name, value)
 
 
 @pytest.fixture

@@ -1,7 +1,12 @@
 variable "name" {
-  description = "Prefix for every resource name"
+  description = "Prefix for every resource name. Letters, digits and hyphens, at most 40 characters (the event archive is named after it with -archive added, and can't be longer than 48)."
   type        = string
   default     = "event-driven-sre"
+
+  validation {
+    condition     = length(var.name) <= 40 && can(regex("^[A-Za-z0-9-]+$", var.name))
+    error_message = "Use only letters, digits and hyphens, at most 40 characters."
+  }
 }
 
 variable "tags" {
@@ -20,16 +25,31 @@ variable "cluster_name" {
 variable "vpc_id" {
   description = "VPC runbook_action runs in"
   type        = string
+
+  validation {
+    condition     = can(regex("^vpc-[0-9a-f]+$", var.vpc_id))
+    error_message = "Must be a VPC ID, vpc-..."
+  }
 }
 
 variable "subnet_ids" {
   description = "Private subnets for runbook_action, and for the execute-api endpoint when webhook_private is true"
   type        = list(string)
+
+  validation {
+    condition     = length(var.subnet_ids) > 0
+    error_message = "Give at least one subnet."
+  }
 }
 
 variable "cluster_security_group_id" {
   description = "The cluster's security group. The module adds an ingress rule for 443 from runbook_action's security group."
   type        = string
+
+  validation {
+    condition     = can(regex("^sg-[0-9a-f]+$", var.cluster_security_group_id))
+    error_message = "Must be a security group ID, sg-..."
+  }
 }
 
 variable "create_access_entry" {
@@ -39,9 +59,14 @@ variable "create_access_entry" {
 }
 
 variable "kubernetes_group" {
-  description = "Kubernetes group runbook_action's role is mapped to; k8s/rbac/remediation-role.yaml binds it"
+  description = "Kubernetes group runbook_action's role is mapped to. rbac_manifest binds it, and names its Roles after it."
   type        = string
   default     = "sre-remediation"
+
+  validation {
+    condition     = can(regex("^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$", var.kubernetes_group))
+    error_message = "Must be a lowercase DNS label (letters, digits and hyphens, at most 63 characters), since rbac_manifest names its Roles after it."
+  }
 }
 
 # ------------------------------------------------------------------ remediation
@@ -49,7 +74,6 @@ variable "kubernetes_group" {
 variable "remediation_namespaces" {
   description = "Namespaces runbook_action may act in. The first is the runbook's target when an alert doesn't name one."
   type        = list(string)
-  default     = ["apps"]
 
   validation {
     condition     = length(var.remediation_namespaces) > 0
@@ -58,23 +82,17 @@ variable "remediation_namespaces" {
 }
 
 variable "default_deployment" {
-  description = "Deployment the runbook targets when an alert doesn't name one"
+  description = "Deployment the runbook targets when an alert names neither a deployment nor a service. With null, such an alert is escalated."
   type        = string
-  default     = "checkout"
+  default     = null
 }
 
 variable "runbook_routes" {
-  description = "Which action the runbook takes for each alertname"
+  description = "Which action the runbook takes for each alertname. An alert at an auto-remediated severity with no route (and no runbook_action annotation) is escalated, so with the default nothing is remediated."
   type = map(object({
     action = string
   }))
-  default = {
-    CheckoutHighErrorRate  = { action = "degrade_or_scale" }
-    CheckoutHighLatencyP95 = { action = "degrade_or_scale" }
-    CheckoutSLOBurnFast    = { action = "degrade_or_scale" }
-    CheckoutDown           = { action = "restart" }
-    NodeUnderPressure      = { action = "drain_node" }
-  }
+  default = {}
 
   validation {
     condition     = alltrue([for r in values(var.runbook_routes) : contains(["degrade", "restart", "scale", "degrade_or_scale", "drain_node"], r.action)])
@@ -83,30 +101,30 @@ variable "runbook_routes" {
 }
 
 variable "degraded_mode_deployment" {
-  description = "The only deployment degrade works for; it reads the degraded-mode parameter"
+  description = "The only deployment degrade works for; it reads the degraded-mode parameter. With null, degraded mode is off: no parameter, no SSM permissions, and degrade and degrade_or_scale are rejected."
   type        = string
-  default     = "checkout"
+  default     = null
 }
 
 variable "degraded_mode_parameter_name" {
-  description = "SSM parameter degrade sets to \"true\""
+  description = "SSM parameter degrade sets to \"true\". Defaults to /NAME/degraded-mode, with NAME from var.name. Only used with degraded_mode_deployment."
   type        = string
-  default     = "/checkout/degraded_mode"
+  default     = null
 }
 
 variable "create_degraded_mode_parameter" {
-  description = "Create the degraded-mode parameter with the value \"false\". Turn it off if it already exists."
+  description = "Create the degraded-mode parameter with the value \"false\". Turn it off if it already exists. Only used with degraded_mode_deployment."
   type        = bool
   default     = true
 }
 
 variable "drainable_node_label" {
-  description = "drain_node only drains nodes with this label, as key=value"
+  description = "drain_node only drains nodes with this label, as key=value. With null, drain_node is off: it's rejected, and rbac_manifest has no node permissions."
   type        = string
-  default     = "nodegroup=apps"
+  default     = null
 
   validation {
-    condition     = can(regex("^[^=]+=.*$", var.drainable_node_label))
+    condition     = var.drainable_node_label == null || can(regex("^[^=]+=.*$", var.drainable_node_label))
     error_message = "Must be key=value."
   }
 }
@@ -119,6 +137,18 @@ variable "drain_min_schedulable_nodes" {
   validation {
     condition     = var.drain_min_schedulable_nodes >= 1
     error_message = "Must be at least 1."
+  }
+}
+
+# Checked against remediation_max_replicas by a precondition on the runbook
+variable "default_scale_replicas" {
+  description = "Replicas scale and degrade_or_scale go to when the alert has no desired_replicas annotation. At most remediation_max_replicas."
+  type        = number
+  default     = 4
+
+  validation {
+    condition     = var.default_scale_replicas >= 1 && floor(var.default_scale_replicas) == var.default_scale_replicas
+    error_message = "Must be a whole number, at least 1."
   }
 }
 
@@ -137,12 +167,22 @@ variable "runbook_action_reserved_concurrency" {
   description = "Concurrent executions reserved for runbook_action, which caps how many remediations hit the cluster at once (10 is a good cap). -1 leaves it unreserved, the default, because AWS keeps at least 50 to 100 executions unreserved per account and new accounts often have a limit of 50."
   type        = number
   default     = -1
+
+  validation {
+    condition     = var.runbook_action_reserved_concurrency >= -1 && floor(var.runbook_action_reserved_concurrency) == var.runbook_action_reserved_concurrency
+    error_message = "Must be a whole number, -1 or more."
+  }
 }
 
 variable "alert_ingest_reserved_concurrency" {
   description = "Concurrent executions reserved for alert_ingest. -1 leaves it unreserved, the default, because AWS keeps at least 50 to 100 executions unreserved per account and new accounts often have a limit of 50."
   type        = number
   default     = -1
+
+  validation {
+    condition     = var.alert_ingest_reserved_concurrency >= -1 && floor(var.alert_ingest_reserved_concurrency) == var.alert_ingest_reserved_concurrency
+    error_message = "Must be a whole number, -1 or more."
+  }
 }
 
 variable "auto_remediate_severities" {
@@ -252,12 +292,22 @@ variable "webhook_rate_limit" {
   description = "Steady-state requests per second allowed on the webhook"
   type        = number
   default     = 1000
+
+  validation {
+    condition     = var.webhook_rate_limit > 0
+    error_message = "Must be more than 0."
+  }
 }
 
 variable "webhook_burst_limit" {
   description = "Burst of requests allowed on the webhook"
   type        = number
   default     = 2000
+
+  validation {
+    condition     = var.webhook_burst_limit > 0 && floor(var.webhook_burst_limit) == var.webhook_burst_limit
+    error_message = "Must be a whole number, more than 0."
+  }
 }
 
 variable "webhook_private" {
@@ -277,7 +327,7 @@ variable "notification_emails" {
   }
 }
 
-variable "chat_notifications" {
+variable "create_chat_topic" {
   description = "Also publish incidents to a second topic in the format Amazon Q Developer in chat applications (AWS Chatbot) renders, for a Slack or Teams channel to subscribe to. See examples/complete/chatbot.tf."
   type        = bool
   default     = false

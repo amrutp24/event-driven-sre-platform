@@ -50,10 +50,10 @@ def validating(runbook_action):
     return invoke
 
 
-def run_runbook(detail, runbook_action, **tasks):
+def run_runbook(detail, runbook_action, variables=RUNBOOK_VARS, **tasks):
     tasks.setdefault("ExecuteAction", validating(runbook_action))
     tasks.setdefault("VerifyResolution", [STILL_FIRING, resolved()])
-    return Simulator(load("runbook.asl.json", RUNBOOK_VARS), tasks).run(detail)
+    return Simulator(load("runbook.asl.json", variables), tasks).run(detail)
 
 
 def test_alertmanager_alert_runs_end_to_end(ingest, runbook_action):
@@ -155,3 +155,30 @@ def test_runbook_payload_has_every_field_the_lambda_reads(runbook_action):
     assert set(sent) == {"incident_id", "alertname", "severity", "action", "namespace", "deployment",
                          "replicas", "node"}
     runbook_action._validate(sent)  # raises InvalidRequest if anything's off
+
+
+# ---------------------------------------------------------------- module defaults
+
+# No routes, no default deployment, and runbook_action without degraded mode or drain_node
+MODULE_DEFAULTS = {**RUNBOOK_VARS, "routes": "{}", "default_deployment": ""}
+
+
+@pytest.fixture
+def module_defaults_env(monkeypatch):
+    for name in ("DEGRADED_DEPLOYMENT", "DEGRADED_PARAM", "DRAINABLE_NODE_LABEL"):
+        monkeypatch.delenv(name)
+
+
+@pytest.mark.parametrize("labels, annotations, why", [
+    ({"service": "unknown"}, {"runbook_action": "restart"}, "namespace and deployment are required"),
+    ({}, {"runbook_action": "degrade"}, "degraded mode isn't configured"),
+    ({"node": NODE}, {"runbook_action": "drain_node"}, "drain_node isn't configured"),
+])
+def test_what_the_defaults_leave_off_escalates(ingest, runbook_action, module_defaults_env, labels, annotations, why):
+    [(_, _, detail)] = ingest(alertmanager(alertname="AppDown", labels=labels, annotations=annotations))
+    result = run_runbook(detail, runbook_action, variables=MODULE_DEFAULTS)
+
+    call = result.calls_to("ExecuteAction")[0]
+    assert (call.error, call.retries) == ("InvalidRequest", 0)
+    assert why in result.events("action.completed")[0]["Detail"]["cause"]
+    assert result.end_state == "Escalated"

@@ -1,15 +1,19 @@
 # What the runbook-action Lambda may do in the cluster.
 #
 # The Lambda calls the Kubernetes API as its IAM role. The module gives that
-# role an EKS access entry in the "sre-remediation" group (kubernetes_group),
-# and these bindings are the only things that group is granted. The Role and
-# RoleBinding are for the apps namespace; add a copy for each other namespace
-# in remediation_namespaces. Applied by scripts/deploy.sh.
+# role an EKS access entry in the "${group}" group (kubernetes_group), and
+# these bindings are the only things that group is granted: a Role and
+# RoleBinding in each of remediation_namespaces, and the node permissions
+# drain_node needs when drainable_node_label is set. Rendered by the module:
+#
+#   terraform output -raw rbac_manifest | kubectl apply -f -
+%{ for namespace in namespaces ~}
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: sre-remediation
-  namespace: apps
+  name: ${group}
+  namespace: ${namespace}
 rules:
   # Read, scale and restart deployments
   - apiGroups: ["apps"]
@@ -31,16 +35,18 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: sre-remediation
-  namespace: apps
+  name: ${group}
+  namespace: ${namespace}
 subjects:
   - kind: Group
-    name: sre-remediation
+    name: ${group}
     apiGroup: rbac.authorization.k8s.io
 roleRef:
   kind: Role
-  name: sre-remediation
+  name: ${group}
   apiGroup: rbac.authorization.k8s.io
+%{ endfor ~}
+%{ if drain_node ~}
 ---
 # drain_node. Nodes are cluster-scoped and a node runs pods from every
 # namespace, so this can't be a namespaced Role. Eviction goes through the
@@ -49,7 +55,7 @@ roleRef:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: sre-remediation-nodes
+  name: ${group}-nodes
 rules:
   # Check the node's labels and readiness, then cordon it
   - apiGroups: [""]
@@ -66,12 +72,13 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: sre-remediation-nodes
+  name: ${group}-nodes
 subjects:
   - kind: Group
-    name: sre-remediation
+    name: ${group}
     apiGroup: rbac.authorization.k8s.io
 roleRef:
   kind: ClusterRole
-  name: sre-remediation-nodes
+  name: ${group}-nodes
   apiGroup: rbac.authorization.k8s.io
+%{ endif ~}

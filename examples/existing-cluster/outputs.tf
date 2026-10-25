@@ -8,3 +8,8 @@ output "alertmanager_api_key" {
   value       = module.sre.alertmanager_api_key
   sensitive   = true
 }
+
+output "rbac_manifest" {
+  description = "Apply with terraform output -raw rbac_manifest | kubectl apply -f -"
+  value       = module.sre.rbac_manifest
+}

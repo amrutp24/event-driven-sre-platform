@@ -41,6 +41,12 @@ class InvalidRequest(Exception):
 def get_env(name, default=None):
     return os.environ.get(name, default)
 
+def _sts_endpoint(region: str) -> str:
+    """STS's regional endpoint, like aws eks get-token uses. The global one only
+    accepts signatures scoped to us-east-1."""
+    suffix = "amazonaws.com.cn" if region.startswith("cn-") else "amazonaws.com"
+    return f"https://sts.{region}.{suffix}/"
+
 def _eks_bearer_token(cluster_name: str, region: str) -> str:
     """Generate an EKS authentication token (k8s-aws-v1) using a presigned STS GetCallerIdentity URL."""
     session = botocore.session.get_session()
@@ -56,7 +62,7 @@ def _eks_bearer_token(cluster_name: str, region: str) -> str:
 
     params = {
         "method": "GET",
-        "url": "https://sts.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15",
+        "url": f"{_sts_endpoint(region)}?Action=GetCallerIdentity&Version=2011-06-15",
         "body": {},
         "headers": {"x-k8s-aws-id": cluster_name},
         "context": {},
@@ -166,7 +172,7 @@ def _scale(endpoint, token, ca, namespace, deployment, replicas):
 
 def _drainable_label():
     """DRAINABLE_NODE_LABEL is key=value, or just a key that has to be present."""
-    key, sep, value = get_env("DRAINABLE_NODE_LABEL", "nodegroup=apps").partition("=")
+    key, sep, value = get_env("DRAINABLE_NODE_LABEL", "").partition("=")
     return key, (value if sep else None)
 
 def _ready_and_schedulable(node):
@@ -289,6 +295,13 @@ def _validate(event):
     if action not in ACTIONS:
         raise InvalidRequest(f"Unknown action {action!r}; expected one of {', '.join(ACTIONS)}")
 
+    # Both are off unless Terraform sets them up (degraded_mode_deployment,
+    # drainable_node_label)
+    if action in DEGRADE_ACTIONS and not (get_env("DEGRADED_DEPLOYMENT") and get_env("DEGRADED_PARAM")):
+        raise InvalidRequest("degraded mode isn't configured")
+    if action == "drain_node" and not get_env("DRAINABLE_NODE_LABEL"):
+        raise InvalidRequest("drain_node isn't configured")
+
     if action == "drain_node":
         # namespace and deployment are ignored here: a node alert from
         # kube-state-metrics carries the exporter's namespace, not a target
@@ -304,14 +317,14 @@ def _validate(event):
     if not namespace or not deployment:
         raise InvalidRequest("namespace and deployment are required")
 
-    allowed = [n.strip() for n in get_env("ALLOWED_NAMESPACES", "apps").split(",") if n.strip()]
+    allowed = [n.strip() for n in get_env("ALLOWED_NAMESPACES", "").split(",") if n.strip()]
     if namespace not in allowed:
         raise InvalidRequest(f"Namespace {namespace!r} isn't in ALLOWED_NAMESPACES ({', '.join(allowed)})")
 
     if not isinstance(deployment, str) or not DNS_1123_LABEL.match(deployment):
         raise InvalidRequest(f"Deployment {deployment!r} isn't a valid Kubernetes name")
 
-    degraded_deployment = get_env("DEGRADED_DEPLOYMENT", "checkout")
+    degraded_deployment = get_env("DEGRADED_DEPLOYMENT")
     if action in DEGRADE_ACTIONS and deployment != degraded_deployment:
         raise InvalidRequest(f"degraded mode is only wired up for {degraded_deployment}")
 
@@ -329,7 +342,7 @@ def lambda_handler(event, context):
     cluster = get_env("CLUSTER_NAME")
     if not cluster:
         raise RuntimeError("CLUSTER_NAME env var is required")
-    degraded_param = get_env("DEGRADED_PARAM", "/checkout/degraded_mode")
+    degraded_param = get_env("DEGRADED_PARAM")
 
     action, namespace, deployment, replicas = _validate(event)
 

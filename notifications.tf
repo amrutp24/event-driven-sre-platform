@@ -2,7 +2,7 @@
 #
 # Email subscribes straight to the alerts topic. Slack (or Teams) goes through
 # AWS's chat integration, Amazon Q Developer in chat applications, which only
-# renders its own custom notification format. So with chat_notifications on,
+# renders its own custom notification format. So with create_chat_topic on,
 # the same four rules also feed a chat topic with messages in that format, and
 # the channel configuration subscribes to it (see examples/complete/chatbot.tf;
 # its API isn't in every region, so it's set up outside the module).
@@ -16,7 +16,7 @@ resource "aws_sns_topic_subscription" "email" {
 }
 
 resource "aws_sns_topic" "chat" {
-  count = var.chat_notifications ? 1 : 0
+  count = var.create_chat_topic ? 1 : 0
 
   name              = "${var.name}-chat"
   kms_master_key_id = local.kms_key_arn
@@ -24,7 +24,7 @@ resource "aws_sns_topic" "chat" {
 }
 
 resource "aws_sns_topic_policy" "chat" {
-  count = var.chat_notifications ? 1 : 0
+  count = var.create_chat_topic ? 1 : 0
 
   arn = aws_sns_topic.chat[0].arn
   policy = jsonencode({
@@ -86,7 +86,7 @@ locals {
 }
 
 resource "aws_cloudwatch_event_target" "to_chat" {
-  for_each = var.chat_notifications ? local.chat_messages : {}
+  for_each = var.create_chat_topic ? local.chat_messages : {}
 
   rule           = each.value.rule
   event_bus_name = aws_cloudwatch_event_bus.sre.name

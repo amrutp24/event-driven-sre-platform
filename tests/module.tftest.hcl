@@ -12,7 +12,7 @@ mock_provider "aws" {
     defaults = { account_id = "123456789012" }
   }
   mock_data "aws_partition" {
-    defaults = { partition = "aws" }
+    defaults = { partition = "aws", dns_suffix = "amazonaws.com", reverse_dns_prefix = "com.amazonaws" }
   }
   mock_data "aws_vpc" {
     defaults = { cidr_block = "10.40.0.0/16" }
@@ -65,6 +65,7 @@ variables {
   vpc_id                    = "vpc-0123456789abcdef0"
   subnet_ids                = ["subnet-0aaaaaaaaaaaaaaaa", "subnet-0bbbbbbbbbbbbbbbb"]
   cluster_security_group_id = "sg-0123456789abcdef0"
+  remediation_namespaces    = ["apps"]
 }
 
 run "defaults" {
@@ -78,6 +79,14 @@ run "defaults" {
   assert {
     condition     = aws_dynamodb_table.incidents.server_side_encryption[0].kms_key_arn == aws_kms_key.platform[0].arn
     error_message = "The incidents table should use the module's key."
+  }
+
+  assert {
+    condition = (
+      jsondecode(aws_kms_key.platform[0].policy).Statement[3].Sid == "EventBridge"
+      && jsondecode(aws_kms_key.platform[0].policy).Statement[3].Condition.StringEquals["aws:SourceAccount"] == "123456789012"
+    )
+    error_message = "EventBridge should only use the key for this account's rules."
   }
 
   assert {
@@ -104,18 +113,17 @@ run "defaults" {
   }
 
   assert {
-    condition     = length(keys(jsondecode(aws_sfn_state_machine.runbook.definition).States.EvaluateAlert.Assign.routes)) == 5
-    error_message = "The runbook should render the 5 default routes."
+    condition     = length(keys(jsondecode(aws_sfn_state_machine.runbook.definition).States.EvaluateAlert.Assign.routes)) == 0
+    error_message = "No alert should be routed to an action by default."
   }
 
   assert {
-    condition     = jsondecode(aws_sfn_state_machine.runbook.definition).States.EvaluateAlert.Assign.routes.NodeUnderPressure.action == "drain_node"
-    error_message = "NodeUnderPressure should route to drain_node by default."
-  }
-
-  assert {
-    condition     = strcontains(jsondecode(aws_sfn_state_machine.runbook.definition).States.ChooseAction.Assign.target.namespace, "'apps'")
-    error_message = "The runbook's default namespace should be the first remediation namespace."
+    condition = (
+      strcontains(jsondecode(aws_sfn_state_machine.runbook.definition).States.ChooseAction.Assign.target.namespace, "'apps'")
+      && endswith(jsondecode(aws_sfn_state_machine.runbook.definition).States.ChooseAction.Assign.target.deployment, ": '')) %}")
+      && endswith(jsondecode(aws_sfn_state_machine.runbook.definition).States.ChooseAction.Assign.target.replicas, ": 4 %}")
+    )
+    error_message = "The runbook should default to the first remediation namespace, no deployment and 4 replicas."
   }
 
   assert {
@@ -129,8 +137,18 @@ run "defaults" {
   }
 
   assert {
-    condition     = strcontains(aws_iam_role_policy.runbook_lambda_policy.policy, "cluster/test-cluster") && strcontains(aws_iam_role_policy.runbook_lambda_policy.policy, aws_ssm_parameter.checkout_degraded_mode[0].arn)
-    error_message = "runbook_action's policy should be scoped to the cluster and the degraded-mode parameter."
+    condition     = strcontains(aws_iam_role_policy.runbook_lambda_policy.policy, "cluster/test-cluster") && !strcontains(aws_iam_role_policy.runbook_lambda_policy.policy, "ssm:")
+    error_message = "runbook_action's policy should be scoped to the cluster, with no SSM access while degraded mode is off."
+  }
+
+  assert {
+    condition = (
+      length(aws_ssm_parameter.degraded_mode) == 0
+      && output.degraded_mode_parameter_name == null
+      && output.degraded_mode_parameter_arn == null
+      && length(setintersection(keys(aws_lambda_function.runbook_action.environment[0].variables), ["DEGRADED_DEPLOYMENT", "DEGRADED_PARAM", "DRAINABLE_NODE_LABEL"])) == 0
+    )
+    error_message = "Degraded mode and drain_node should be off by default: no parameter, and nothing in runbook_action's environment."
   }
 
   assert {
@@ -158,8 +176,166 @@ run "defaults" {
   }
 
   assert {
-    condition     = output.kubernetes_group == "sre-remediation" && output.degraded_mode_parameter_name == "/checkout/degraded_mode"
-    error_message = "Outputs should report the Kubernetes group and the degraded-mode parameter."
+    condition     = output.kubernetes_group == "sre-remediation"
+    error_message = "Outputs should report the Kubernetes group."
+  }
+
+  assert {
+    condition = (
+      length([for d in split("\n---\n", replace(output.rbac_manifest, "\r", "")) : d if try(yamldecode(d).kind, "") == "Role"]) == 1
+      && length([for d in split("\n---\n", replace(output.rbac_manifest, "\r", "")) : d if try(yamldecode(d).kind, "") == "RoleBinding"]) == 1
+      && length([for d in split("\n---\n", replace(output.rbac_manifest, "\r", "")) : d if contains(["ClusterRole", "ClusterRoleBinding"], try(yamldecode(d).kind, ""))]) == 0
+    )
+    error_message = "rbac_manifest should have a Role and RoleBinding for apps and no cluster-wide permissions without drainable_node_label."
+  }
+}
+
+run "rbac_per_namespace_and_drain" {
+  command = plan
+
+  variables {
+    remediation_namespaces = ["apps", "payments", "search"]
+    drainable_node_label   = "nodegroup=apps"
+    kubernetes_group       = "remediators"
+  }
+
+  assert {
+    condition = (
+      [for d in split("\n---\n", replace(output.rbac_manifest, "\r", "")) : yamldecode(d).metadata.namespace if try(yamldecode(d).kind, "") == "Role"] == ["apps", "payments", "search"]
+      && [for d in split("\n---\n", replace(output.rbac_manifest, "\r", "")) : yamldecode(d).metadata.namespace if try(yamldecode(d).kind, "") == "RoleBinding"] == ["apps", "payments", "search"]
+    )
+    error_message = "rbac_manifest should have one Role and one RoleBinding per remediation namespace."
+  }
+
+  assert {
+    condition = alltrue([
+      for d in split("\n---\n", replace(output.rbac_manifest, "\r", "")) : yamldecode(d).subjects[0].name == "remediators"
+      if contains(["RoleBinding", "ClusterRoleBinding"], try(yamldecode(d).kind, ""))
+    ])
+    error_message = "Every binding should be for kubernetes_group."
+  }
+
+  assert {
+    condition = (
+      length([for d in split("\n---\n", replace(output.rbac_manifest, "\r", "")) : d if try(yamldecode(d).kind, "") == "ClusterRole"]) == 1
+      && length([for d in split("\n---\n", replace(output.rbac_manifest, "\r", "")) : d if try(yamldecode(d).kind, "") == "ClusterRoleBinding"]) == 1
+      && strcontains(output.rbac_manifest, "pods/eviction")
+    )
+    error_message = "With drainable_node_label set, rbac_manifest should grant the node and eviction permissions drain_node needs."
+  }
+}
+
+run "checkout_demo" {
+  command = apply
+
+  # What examples/complete passes
+  variables {
+    runbook_routes = {
+      CheckoutHighErrorRate  = { action = "degrade_or_scale" }
+      CheckoutHighLatencyP95 = { action = "degrade_or_scale" }
+      CheckoutSLOBurnFast    = { action = "degrade_or_scale" }
+      CheckoutDown           = { action = "restart" }
+      NodeUnderPressure      = { action = "drain_node" }
+    }
+    default_deployment           = "checkout"
+    degraded_mode_deployment     = "checkout"
+    degraded_mode_parameter_name = "/checkout/degraded_mode"
+    drainable_node_label         = "nodegroup=apps"
+  }
+
+  assert {
+    condition     = length(keys(jsondecode(aws_sfn_state_machine.runbook.definition).States.EvaluateAlert.Assign.routes)) == 5 && jsondecode(aws_sfn_state_machine.runbook.definition).States.EvaluateAlert.Assign.routes.NodeUnderPressure.action == "drain_node"
+    error_message = "The runbook should render the 5 checkout routes."
+  }
+
+  assert {
+    condition     = strcontains(jsondecode(aws_sfn_state_machine.runbook.definition).States.ChooseAction.Assign.target.deployment, "'checkout'")
+    error_message = "The runbook's default deployment should be checkout."
+  }
+
+  assert {
+    condition = (
+      length(aws_ssm_parameter.degraded_mode) == 1
+      && aws_ssm_parameter.degraded_mode[0].name == "/checkout/degraded_mode"
+      && aws_ssm_parameter.degraded_mode[0].value == "false"
+      && output.degraded_mode_parameter_name == "/checkout/degraded_mode"
+      && output.degraded_mode_parameter_arn == aws_ssm_parameter.degraded_mode[0].arn
+    )
+    error_message = "Degraded mode should create the parameter and output it."
+  }
+
+  assert {
+    condition     = strcontains(aws_iam_role_policy.runbook_lambda_policy.policy, "ssm:PutParameter") && strcontains(aws_iam_role_policy.runbook_lambda_policy.policy, aws_ssm_parameter.degraded_mode[0].arn)
+    error_message = "runbook_action should be allowed to set the degraded-mode parameter."
+  }
+
+  assert {
+    condition = (
+      aws_lambda_function.runbook_action.environment[0].variables["DEGRADED_DEPLOYMENT"] == "checkout"
+      && aws_lambda_function.runbook_action.environment[0].variables["DEGRADED_PARAM"] == "/checkout/degraded_mode"
+      && aws_lambda_function.runbook_action.environment[0].variables["DRAINABLE_NODE_LABEL"] == "nodegroup=apps"
+    )
+    error_message = "runbook_action should get the degraded-mode deployment, its parameter and the drainable label."
+  }
+}
+
+run "degraded_mode_parameter_name_default" {
+  command = apply
+
+  variables {
+    name                     = "payments-sre"
+    degraded_mode_deployment = "payments-api"
+  }
+
+  assert {
+    condition     = aws_ssm_parameter.degraded_mode[0].name == "/payments-sre/degraded-mode" && aws_lambda_function.runbook_action.environment[0].variables["DEGRADED_PARAM"] == "/payments-sre/degraded-mode"
+    error_message = "The parameter name should default to /<name>/degraded-mode."
+  }
+}
+
+run "default_scale_replicas" {
+  command = plan
+
+  variables {
+    default_scale_replicas   = 6
+    remediation_max_replicas = 6
+  }
+
+  assert {
+    condition     = endswith(jsondecode(aws_sfn_state_machine.runbook.definition).States.ChooseAction.Assign.target.replicas, ": 6 %}")
+    error_message = "The runbook should scale to default_scale_replicas when the alert doesn't say."
+  }
+}
+
+run "rejects_default_replicas_above_the_max" {
+  command = plan
+
+  variables {
+    default_scale_replicas   = 11
+    remediation_max_replicas = 10
+  }
+
+  expect_failures = [aws_sfn_state_machine.runbook]
+}
+
+run "outputs" {
+  command = apply
+
+  assert {
+    condition = (
+      output.alert_ingest_function_arn == aws_lambda_function.alert_ingest.arn
+      && output.alert_ingest_function_name == "event-driven-sre-alert-ingest"
+      && output.runbook_action_function_name == "event-driven-sre-runbook-action"
+      && output.rest_api_id == aws_api_gateway_rest_api.alerts_api.id
+      && output.rest_api_execution_arn == aws_api_gateway_rest_api.alerts_api.execution_arn
+      && output.alerts_topic_name == "event-driven-sre-alerts"
+    )
+    error_message = "The function, API and topic outputs should point at the module's resources."
+  }
+
+  assert {
+    condition     = output.alertmanager_api_key != null && output.datadog_api_key != null
+    error_message = "With webhook_require_api_key on, both keys should be output."
   }
 }
 
@@ -225,6 +401,46 @@ run "private_webhook" {
   }
 }
 
+run "china_partition" {
+  command = plan
+
+  override_data {
+    target = data.aws_region.current
+    values = { name = "cn-north-1" }
+  }
+  override_data {
+    target = data.aws_partition.current
+    values = { partition = "aws-cn", dns_suffix = "amazonaws.com.cn", reverse_dns_prefix = "cn.com.amazonaws" }
+  }
+
+  variables {
+    webhook_private = true
+  }
+
+  assert {
+    condition = alltrue([
+      for s in values(jsondecode(aws_sfn_state_machine.runbook.definition).States) : startswith(s.Resource, "arn:aws-cn:states:::") if s.Type == "Task"
+      ]) && alltrue([
+      for s in values(jsondecode(aws_sfn_state_machine.incident_recorder.definition).States) : startswith(s.Resource, "arn:aws-cn:states:::") if s.Type == "Task"
+    ])
+    error_message = "Both state machines' task resources should use the partition."
+  }
+
+  assert {
+    condition = (
+      contains(jsondecode(aws_kms_key.platform[0].policy).Statement[1].Condition.StringEquals["kms:ViaService"], "dynamodb.cn-north-1.amazonaws.com.cn")
+      && jsondecode(aws_kms_key.platform[0].policy).Statement[2].Principal.Service == "logs.cn-north-1.amazonaws.com.cn"
+      && startswith(jsondecode(aws_kms_key.platform[0].policy).Statement[0].Principal.AWS, "arn:aws-cn:iam::")
+    )
+    error_message = "The key policy should use the partition's DNS suffix and ARNs."
+  }
+
+  assert {
+    condition     = aws_vpc_endpoint.webhook[0].service_name == "cn.com.amazonaws.cn-north-1.execute-api"
+    error_message = "The execute-api endpoint should use the partition's service name prefix."
+  }
+}
+
 run "custom_routes_and_targets" {
   command = apply
 
@@ -254,12 +470,14 @@ run "optional_pieces_off" {
 
   variables {
     create_access_entry            = false
+    degraded_mode_deployment       = "checkout"
+    degraded_mode_parameter_name   = "/checkout/degraded_mode"
     create_degraded_mode_parameter = false
     webhook_require_api_key        = false
   }
 
   assert {
-    condition     = length(aws_eks_access_entry.runbook_action) == 0 && length(aws_ssm_parameter.checkout_degraded_mode) == 0
+    condition     = length(aws_eks_access_entry.runbook_action) == 0 && length(aws_ssm_parameter.degraded_mode) == 0
     error_message = "The access entry and the parameter should be optional."
   }
 
@@ -269,7 +487,7 @@ run "optional_pieces_off" {
   }
 
   assert {
-    condition     = length(aws_api_gateway_api_key.webhook) == 0 && length(aws_api_gateway_usage_plan.webhook) == 0 && !aws_api_gateway_method.webhook_post.api_key_required && output.alertmanager_api_key == ""
+    condition     = length(aws_api_gateway_api_key.webhook) == 0 && length(aws_api_gateway_usage_plan.webhook) == 0 && !aws_api_gateway_method.webhook_post.api_key_required && output.alertmanager_api_key == null && output.datadog_api_key == null
     error_message = "With webhook_require_api_key off there should be no keys or usage plan."
   }
 }
@@ -290,6 +508,7 @@ run "rejects_bad_inputs" {
   variables {
     remediation_namespaces    = []
     drainable_node_label      = "apps"
+    kubernetes_group          = "SRE_Remediation"
     log_retention_days        = 31
     auto_remediate_severities = ["page"]
   }
@@ -297,6 +516,7 @@ run "rejects_bad_inputs" {
   expect_failures = [
     var.remediation_namespaces,
     var.drainable_node_label,
+    var.kubernetes_group,
     var.log_retention_days,
     var.auto_remediate_severities,
   ]
@@ -306,7 +526,7 @@ run "no_notifications_by_default" {
   command = plan
 
   assert {
-    condition     = length(aws_sns_topic_subscription.email) == 0 && length(aws_sns_topic.chat) == 0 && length(aws_cloudwatch_event_target.to_chat) == 0
+    condition     = length(aws_sns_topic_subscription.email) == 0 && length(aws_sns_topic.chat) == 0 && length(aws_cloudwatch_event_target.to_chat) == 0 && output.chat_topic_arn == null
     error_message = "Nothing should subscribe or publish to chat unless asked."
   }
 }
@@ -316,7 +536,7 @@ run "notifications" {
 
   variables {
     notification_emails = ["oncall@example.com", "sre@example.com"]
-    chat_notifications  = true
+    create_chat_topic   = true
   }
 
   assert {
@@ -326,7 +546,7 @@ run "notifications" {
 
   assert {
     condition     = length(aws_sns_topic.chat) == 1 && aws_sns_topic.chat[0].kms_master_key_id == aws_kms_key.platform[0].arn && output.chat_topic_arn == aws_sns_topic.chat[0].arn
-    error_message = "chat_notifications should create an encrypted chat topic and output it."
+    error_message = "create_chat_topic should create an encrypted chat topic and output it."
   }
 
   assert {
@@ -342,6 +562,63 @@ run "notifications" {
     )
     error_message = "Chat messages should be custom notifications with plain <placeholders> for EventBridge."
   }
+}
+
+run "rejects_long_name" {
+  command = plan
+
+  variables {
+    name = "a-name-that-is-forty-one-characters-long1"
+  }
+
+  expect_failures = [var.name]
+}
+
+run "rejects_name_with_other_characters" {
+  command = plan
+
+  variables {
+    name = "event_driven_sre"
+  }
+
+  expect_failures = [var.name]
+}
+
+run "accepts_a_forty_character_name" {
+  command = plan
+
+  variables {
+    name = "a-name-that-is-exactly-forty-chars-long0"
+  }
+
+  assert {
+    condition     = aws_cloudwatch_event_archive.sre.name == "a-name-that-is-exactly-forty-chars-long0-archive"
+    error_message = "A 40-character name should be accepted."
+  }
+}
+
+run "rejects_bad_network_and_limits" {
+  command = plan
+
+  variables {
+    vpc_id                              = "0123456789abcdef0"
+    subnet_ids                          = []
+    cluster_security_group_id           = "vpc-0123456789abcdef0"
+    webhook_rate_limit                  = 0
+    webhook_burst_limit                 = -5
+    runbook_action_reserved_concurrency = -2
+    alert_ingest_reserved_concurrency   = 1.5
+  }
+
+  expect_failures = [
+    var.vpc_id,
+    var.subnet_ids,
+    var.cluster_security_group_id,
+    var.webhook_rate_limit,
+    var.webhook_burst_limit,
+    var.runbook_action_reserved_concurrency,
+    var.alert_ingest_reserved_concurrency,
+  ]
 }
 
 run "rejects_bad_email" {

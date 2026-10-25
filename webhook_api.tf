@@ -87,7 +87,7 @@ resource "aws_vpc_endpoint" "webhook" {
   count = var.webhook_private ? 1 : 0
 
   vpc_id              = var.vpc_id
-  service_name        = "com.amazonaws.${local.region}.execute-api"
+  service_name        = "${data.aws_partition.current.reverse_dns_prefix}.${local.region}.execute-api"
   vpc_endpoint_type   = "Interface"
   subnet_ids          = var.subnet_ids
   security_group_ids  = [aws_security_group.webhook_endpoint[0].id]

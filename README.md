@@ -18,21 +18,31 @@ The module brings the pipeline (API Gateway, two Lambdas, EventBridge, Step Func
    | `incident.escalated`, `incident.auto_resolved` | `sre.runbook` | SNS |
    | any `sre.*` event | | CloudWatch Logs |
 
-   EventBridge can't write to DynamoDB, so the incident recorder, a small Express state machine, does those writes. With `chat_notifications` on, the four SNS rules also send to a second topic for Slack or Teams (see [Notifications](#notifications)).
+   EventBridge can't write to DynamoDB, so the incident recorder, a small Express state machine, does those writes. With `create_chat_topic` on, the four SNS rules also send to a second topic for Slack or Teams (see [Notifications](#notifications)).
 4. The runbook state machine only acts on firing `critical` alerts (`auto_remediate_severities`); the rest just notify. It claims the incident in DynamoDB first. Only one run can claim it, so an incident is remediated once even if the alert is re-sent or EventBridge delivers it twice.
 5. It picks an action from the alert name (`runbook_routes`) and invokes the `runbook-action` Lambda, retrying up to three times with backoff. The Lambda runs in your VPC and applies the action through the Kubernetes API, authenticating with an EKS token signed by its own IAM role. The result goes out as an `action.completed` event.
 6. It waits a minute, then checks DynamoDB every 30 seconds for the resolved alert. If the alert resolves within 10 minutes of the action, it records the MTTR and publishes `incident.auto_resolved`. If it doesn't, or the action failed, or there's no runbook for the alert, it marks the incident `escalated` and publishes `incident.escalated`. Both go to SNS.
 
-With the default `runbook_routes`:
+The actions:
+
+| Action | What the Lambda does |
+| --- | --- |
+| `restart` | Restarts the deployment, like `kubectl rollout restart`. |
+| `scale` | Raises the HPA's minimum to the alert's `desired_replicas` or `default_scale_replicas` (4), or scales the deployment when it has no HPA. Never above `remediation_max_replicas`. |
+| `degrade` | Sets the SSM parameter `degraded_mode_parameter_name` to `true`, for `degraded_mode_deployment` to read (no restart). Off unless `degraded_mode_deployment` is set. |
+| `degrade_or_scale` | `degrade`, then `scale`. |
+| `drain_node` | Cordons the node and evicts its pods, respecting PodDisruptionBudgets. Only nodes with `drainable_node_label`, and only if `drain_min_schedulable_nodes` other ones are Ready. Off unless `drainable_node_label` is set. |
+
+`runbook_routes` is empty by default, so nothing is remediated until you route alerts: a critical alert with no route is escalated. An action that isn't configured is rejected and escalated too. [examples/complete](examples/complete) routes the demo's alerts:
 
 | Alert | Action |
 | --- | --- |
-| `CheckoutHighErrorRate`, `CheckoutHighLatencyP95`, `CheckoutSLOBurnFast` | `degrade_or_scale`: turn on degraded mode by setting the SSM parameter `/checkout/degraded_mode` to `true` (the demo app reads it within 15 seconds, no restart), and raise the HPA's minimum to 4 replicas. |
-| `CheckoutDown` | `restart`: restart the deployment. |
-| `NodeUnderPressure` | `drain_node`: cordon the node and evict its pods, respecting PodDisruptionBudgets. Only nodes labelled `nodegroup=apps`, and only if another schedulable one is left. |
+| `CheckoutHighErrorRate`, `CheckoutHighLatencyP95`, `CheckoutSLOBurnFast` | `degrade_or_scale`: set `/checkout/degraded_mode` to `true` (the demo app reads it within 15 seconds), and raise the HPA's minimum to 4 replicas. |
+| `CheckoutDown` | `restart` |
+| `NodeUnderPressure` | `drain_node`, for nodes labelled `nodegroup=apps` |
 | Any other critical alert | Escalate. |
 
-An alert can override this with a `runbook_action` annotation (`degrade`, `restart`, `scale`, `degrade_or_scale` or `drain_node`, or `notify_only` to skip the runbook), and set the replica count with `desired_replicas`. The target is the alert's `namespace` and `deployment` labels (or Datadog's `kube_namespace` and `kube_deployment` tags), falling back to its `service` label and then `default_deployment` in the first of `remediation_namespaces`, and for a drain its `node` label (or Datadog's `host` tag). The Lambda refuses namespaces outside `remediation_namespaces` and more than `remediation_max_replicas` replicas.
+An alert can override this with a `runbook_action` annotation (`degrade`, `restart`, `scale`, `degrade_or_scale` or `drain_node`, or `notify_only` to skip the runbook), and set the replica count with `desired_replicas`. The target is the alert's `namespace` and `deployment` labels (or Datadog's `kube_namespace` and `kube_deployment` tags), falling back to its `service` label and then `default_deployment` in the first of `remediation_namespaces` (with no `default_deployment`, an alert that names neither is escalated), and for a drain its `node` label (or Datadog's `host` tag). The Lambda refuses namespaces outside `remediation_namespaces` and more than `remediation_max_replicas` replicas.
 
 None of this is undone automatically when the incident resolves; see [Known gaps](#known-gaps).
 
@@ -49,18 +59,31 @@ module "sre" {
   vpc_id                    = "vpc-0123456789abcdef0"
   subnet_ids                = ["subnet-0123456789abcdef0", "subnet-0fedcba9876543210"]
   cluster_security_group_id = "sg-0123456789abcdef0"
+
+  remediation_namespaces = ["shop"]
+  runbook_routes = {
+    CartDown         = { action = "restart" }
+    CartHighLatency  = { action = "scale" }
+    NodeDiskPressure = { action = "drain_node" }
+  }
+
+  # Optional: turn on drain_node and degrade
+  drainable_node_label     = "nodegroup=apps"
+  degraded_mode_deployment = "cart"
 }
 ```
 
 `subnet_ids` are private subnets that can reach the cluster's API endpoint and AWS APIs (through a NAT gateway or VPC endpoints). The module adds a rule to `cluster_security_group_id` that lets the Lambda in on 443.
 
-The cluster needs access entries enabled (authentication mode `API` or `API_AND_CONFIG_MAP`). The module gives the Lambda's role an access entry in the `sre-remediation` group (`kubernetes_group`) with no access policy, so the one manual step is the RBAC that says what that group may do:
+The cluster needs access entries enabled (authentication mode `API` or `API_AND_CONFIG_MAP`). The module gives the Lambda's role an access entry in the `sre-remediation` group (`kubernetes_group`) with no access policy, so the one manual step is the RBAC that says what that group may do. The module renders it as the `rbac_manifest` output: a Role and RoleBinding in each of `remediation_namespaces`, and a ClusterRole for nodes and evictions only when `drainable_node_label` is set.
 
 ```bash
-kubectl apply -f k8s/rbac/remediation-role.yaml
+terraform output -raw rbac_manifest | kubectl apply -f -
 ```
 
-The manifest's Role is for the `apps` namespace; add a copy for each other namespace in `remediation_namespaces`.
+From a root module that calls this one, add an output that passes `module.sre.rbac_manifest` through, as both examples do.
+
+With `degraded_mode_deployment` set, the module creates the SSM parameter `degraded_mode_parameter_name` (default `/<name>/degraded-mode`) with the value `false`. Your app reads it and serves a degraded response while it's `true`; give the app's role `ssm:GetParameter` on `degraded_mode_parameter_arn`.
 
 Point Alertmanager's webhook receiver at `alert_webhook_url` and send `alertmanager_api_key` in the `X-API-Key` header. For Datadog, see [docs/API.md](docs/API.md#datadog-webhook-format).
 
@@ -72,12 +95,12 @@ Neither Lambda has reserved concurrency by default (`-1`). New accounts often ha
 module "sre" {
   # ...
   notification_emails = ["oncall@example.com"]
-  chat_notifications  = true
+  create_chat_topic   = true
 }
 ```
 
 - `notification_emails` subscribes each address to the alerts topic (`sns_topic_arn`). SNS sends each one a confirmation email, and nothing arrives until its link is clicked.
-- `chat_notifications` adds a second topic, `chat_topic_arn`, encrypted with the same KMS key, with the same four events in the custom notification format of Amazon Q Developer in chat applications (AWS Chatbot). Subscribe a Slack or Teams channel configuration to it. Titles look like `critical: CheckoutHighErrorRate is firing on checkout`, `Escalated: CheckoutHighErrorRate on checkout needs a person`, `Resolved: ...` and `Auto-resolved: ...`, with the incident ID in the text. The module doesn't create the channel configuration, because the Chatbot API isn't in every region (not in `us-east-1`); [examples/complete](examples/complete/README.md#slack-and-email) does it for Slack with a provider in `us-east-2`.
+- `create_chat_topic` adds a second topic, `chat_topic_arn`, encrypted with the same KMS key, with the same four events in the custom notification format of Amazon Q Developer in chat applications (AWS Chatbot). Subscribe a Slack or Teams channel configuration to it. Titles look like `critical: CheckoutHighErrorRate is firing on checkout`, `Escalated: CheckoutHighErrorRate on checkout needs a person`, `Resolved: ...` and `Auto-resolved: ...`, with the incident ID in the text. The module doesn't create the channel configuration, because the Chatbot API isn't in every region (not in `us-east-1`); [examples/complete](examples/complete/README.md#slack-and-email) does it for Slack with a provider in `us-east-2`.
 - PagerDuty isn't built in. A PagerDuty SNS integration would subscribe to `sns_topic_arn`.
 
 ## Examples
@@ -135,22 +158,23 @@ The module has no provider blocks. It needs an EKS cluster with access entries e
 
 | Name | Description | Type | Default | Required |
 | --- | --- | --- | --- | :---: |
-| `name` | Prefix for every resource name | `string` | `"event-driven-sre"` | no |
+| `name` | Prefix for every resource name. Letters, digits and hyphens, at most 40 characters (the event archive is named after it with -archive added, and can't be longer than 48). | `string` | `"event-driven-sre"` | no |
 | `tags` | Tags for every resource that takes them | `map(string)` | `{}` | no |
 | `cluster_name` | EKS cluster that runbook_action remediates | `string` | n/a | yes |
 | `vpc_id` | VPC runbook_action runs in | `string` | n/a | yes |
 | `subnet_ids` | Private subnets for runbook_action, and for the execute-api endpoint when webhook_private is true | `list(string)` | n/a | yes |
 | `cluster_security_group_id` | The cluster's security group. The module adds an ingress rule for 443 from runbook_action's security group. | `string` | n/a | yes |
 | `create_access_entry` | Create an EKS access entry for runbook_action's role in kubernetes_group. The cluster needs access entries enabled (authentication mode API or API_AND_CONFIG_MAP). | `bool` | `true` | no |
-| `kubernetes_group` | Kubernetes group runbook_action's role is mapped to; k8s/rbac/remediation-role.yaml binds it | `string` | `"sre-remediation"` | no |
-| `remediation_namespaces` | Namespaces runbook_action may act in. The first is the runbook's target when an alert doesn't name one. | `list(string)` | `["apps"]` | no |
-| `default_deployment` | Deployment the runbook targets when an alert doesn't name one | `string` | `"checkout"` | no |
-| `runbook_routes` | Which action the runbook takes for each alertname | `map(object({action = string}))` | `{ CheckoutHighErrorRate = { action = "degrade_or_scale" }, CheckoutHighLatencyP95 = { action = "degrade_or_scale" }, CheckoutSLOBurnFast = { action = "degrade_or_scale" }, CheckoutDown = { action = "restart" }, NodeUnderPressure = { action = "drain_node" } }` | no |
-| `degraded_mode_deployment` | The only deployment degrade works for; it reads the degraded-mode parameter | `string` | `"checkout"` | no |
-| `degraded_mode_parameter_name` | SSM parameter degrade sets to "true" | `string` | `"/checkout/degraded_mode"` | no |
-| `create_degraded_mode_parameter` | Create the degraded-mode parameter with the value "false". Turn it off if it already exists. | `bool` | `true` | no |
-| `drainable_node_label` | drain_node only drains nodes with this label, as key=value | `string` | `"nodegroup=apps"` | no |
+| `kubernetes_group` | Kubernetes group runbook_action's role is mapped to. rbac_manifest binds it, and names its Roles after it. | `string` | `"sre-remediation"` | no |
+| `remediation_namespaces` | Namespaces runbook_action may act in. The first is the runbook's target when an alert doesn't name one. | `list(string)` | n/a | yes |
+| `default_deployment` | Deployment the runbook targets when an alert names neither a deployment nor a service. With null, such an alert is escalated. | `string` | `null` | no |
+| `runbook_routes` | Which action the runbook takes for each alertname. An alert at an auto-remediated severity with no route (and no runbook_action annotation) is escalated, so with the default nothing is remediated. | `map(object({action = string}))` | `{}` | no |
+| `degraded_mode_deployment` | The only deployment degrade works for; it reads the degraded-mode parameter. With null, degraded mode is off: no parameter, no SSM permissions, and degrade and degrade_or_scale are rejected. | `string` | `null` | no |
+| `degraded_mode_parameter_name` | SSM parameter degrade sets to "true". Defaults to /NAME/degraded-mode, with NAME from var.name. Only used with degraded_mode_deployment. | `string` | `null` | no |
+| `create_degraded_mode_parameter` | Create the degraded-mode parameter with the value "false". Turn it off if it already exists. Only used with degraded_mode_deployment. | `bool` | `true` | no |
+| `drainable_node_label` | drain_node only drains nodes with this label, as key=value. With null, drain_node is off: it's rejected, and rbac_manifest has no node permissions. | `string` | `null` | no |
 | `drain_min_schedulable_nodes` | drain_node refuses to drain a node unless at least this many other drainable nodes are Ready and schedulable | `number` | `1` | no |
+| `default_scale_replicas` | Replicas scale and degrade_or_scale go to when the alert has no desired_replicas annotation. At most remediation_max_replicas. | `number` | `4` | no |
 | `remediation_max_replicas` | Highest replica count runbook_action will scale a deployment to | `number` | `10` | no |
 | `runbook_action_reserved_concurrency` | Concurrent executions reserved for runbook_action, which caps how many remediations hit the cluster at once (10 is a good cap). -1 leaves it unreserved, the default, because AWS keeps at least 50 to 100 executions unreserved per account and new accounts often have a limit of 50. | `number` | `-1` | no |
 | `alert_ingest_reserved_concurrency` | Concurrent executions reserved for alert_ingest. -1 leaves it unreserved, the default, because AWS keeps at least 50 to 100 executions unreserved per account and new accounts often have a limit of 50. | `number` | `-1` | no |
@@ -168,15 +192,17 @@ The module has no provider blocks. It needs an EKS cluster with access entries e
 | `webhook_burst_limit` | Burst of requests allowed on the webhook | `number` | `2000` | no |
 | `webhook_private` | Make the webhook a private API, reachable only through an execute-api VPC endpoint the module creates in vpc_id and subnet_ids. Datadog can't reach a private API, so only use this when Alertmanager is the only sender. | `bool` | `false` | no |
 | `notification_emails` | Email addresses subscribed to the alerts topic. Each one gets a confirmation email from SNS to accept first. | `list(string)` | `[]` | no |
-| `chat_notifications` | Also publish incidents to a second topic in the format Amazon Q Developer in chat applications (AWS Chatbot) renders, for a Slack or Teams channel to subscribe to. See examples/complete/chatbot.tf. | `bool` | `false` | no |
+| `create_chat_topic` | Also publish incidents to a second topic in the format Amazon Q Developer in chat applications (AWS Chatbot) renders, for a Slack or Teams channel to subscribe to. See examples/complete/chatbot.tf. | `bool` | `false` | no |
 
 ## Outputs
 
 | Name | Description |
 | --- | --- |
 | `alert_webhook_url` | POST alerts here |
-| `alertmanager_api_key` | X-API-Key for Alertmanager; empty when webhook_require_api_key is false (sensitive) |
-| `datadog_api_key` | X-API-Key for the Datadog webhook; empty when webhook_require_api_key is false (sensitive) |
+| `alertmanager_api_key` | X-API-Key for Alertmanager; null when webhook_require_api_key is false (sensitive) |
+| `datadog_api_key` | X-API-Key for the Datadog webhook; null when webhook_require_api_key is false (sensitive) |
+| `rest_api_id` | ID of the webhook's REST API |
+| `rest_api_execution_arn` | Execution ARN of the webhook's REST API, for execute-api:Invoke permissions |
 | `event_bus_name` | Custom EventBridge bus every sre.* event goes through |
 | `event_bus_arn` | ARN of the event bus, for rules or targets of your own |
 | `runbook_state_machine_arn` | Runbook state machine, started by the incident.created rule |
@@ -184,19 +210,24 @@ The module has no provider blocks. It needs an EKS cluster with access entries e
 | `incidents_table_name` | DynamoDB table with one item per incident; query the by-status index for open or escalated ones |
 | `incidents_table_arn` | ARN of the incidents table |
 | `sns_topic_arn` | Incident notifications; subscribe on-call here |
+| `alerts_topic_name` | Name of the incident notifications topic |
 | `events_dlq_url` | Events EventBridge couldn't deliver after retries |
 | `events_log_group` | Every event on the bus |
 | `events_archive_arn` | Replay source; events are kept 7 days |
 | `runbook_log_group` | Runbook execution logs, including state input and output |
 | `incident_recorder_log_group` | Incident recorder failures. Express workflows have no execution history, so this is where they show up. |
 | `kms_key_arn` | Key for the incidents table, SNS topic, DLQ and log groups: the module's own, or kms_key_arn |
+| `alert_ingest_function_arn` | Lambda behind the webhook that validates alerts and puts them on the bus |
+| `alert_ingest_function_name` | Name of the alert_ingest Lambda |
 | `runbook_action_function_arn` | Lambda that carries out remediation actions against the cluster |
+| `runbook_action_function_name` | Name of the runbook_action Lambda |
 | `runbook_action_role_arn` | IAM role runbook_action calls the Kubernetes API as |
 | `runbook_action_security_group_id` | Security group of runbook_action; the module already allows it to the cluster API on 443 |
-| `kubernetes_group` | Group runbook_action's role is in; bind it with k8s/rbac/remediation-role.yaml |
-| `degraded_mode_parameter_name` | SSM parameter the degrade action sets to true; the app reads it |
-| `degraded_mode_parameter_arn` | Grant the degraded-mode deployment ssm:GetParameter on this |
-| `chat_topic_arn` | Topic for a Slack or Teams channel configuration to subscribe to; empty when chat_notifications is false |
+| `kubernetes_group` | Group runbook_action's role is in; rbac_manifest binds it |
+| `rbac_manifest` | Kubernetes RBAC for kubernetes_group: a Role and RoleBinding in each of remediation_namespaces, and a ClusterRole for nodes and evictions when drainable_node_label is set. Apply it with terraform output -raw rbac_manifest \| kubectl apply -f - |
+| `degraded_mode_parameter_name` | SSM parameter the degrade action sets to true; the app reads it. Null without degraded_mode_deployment. |
+| `degraded_mode_parameter_arn` | Grant the degraded-mode deployment ssm:GetParameter on this. Null without degraded_mode_deployment. |
+| `chat_topic_arn` | Topic for a Slack or Teams channel configuration to subscribe to; null when create_chat_topic is false |
 <!-- END_TF_TABLES -->
 
 ## Tests
@@ -226,8 +257,8 @@ CI (`.github/workflows/integration-tests.yml`) runs Checkov on the module and on
 - **Remediation isn't reverted automatically.** After an incident resolves, degraded mode stays on, the HPA minimum stays raised, and a drained node stays cordoned. Put them back by hand (in the complete example, re-running `deploy.sh` also resets the HPA minimum, since `helm upgrade` applies the chart's 3):
 
   ```bash
-  aws ssm put-parameter --name /checkout/degraded_mode --value false --overwrite
-  kubectl patch hpa checkout -n apps --type merge -p '{"spec":{"minReplicas":3}}'
+  aws ssm put-parameter --name "$(terraform output -raw degraded_mode_parameter_name)" --value false --overwrite
+  kubectl patch hpa DEPLOYMENT -n NAMESPACE --type merge -p '{"spec":{"minReplicas":3}}'
   kubectl uncordon NODE_NAME
   ```
 - **The webhook's TLS version isn't pinned.** It's HTTPS only, with API Gateway's default TLS policy. Setting a TLS 1.2 minimum on the REST API needs AWS provider 6, and the module still supports provider 5 (the complete example's EKS module, ~> 20, keeps it below 6).
