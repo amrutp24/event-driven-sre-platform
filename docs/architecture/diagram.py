@@ -94,6 +94,6 @@ with Diagram(
     runbook >> Edge(label="claim, verify", style="dashed") >> table
     runbook >> action
     action >> flag
-    runbook >> Edge(label="escalated /\nauto_resolved", **back) >> bus
+    runbook >> Edge(label="action.completed,\nescalated, auto_resolved", **back) >> bus
     action >> Edge(label="scale, restart,\ndrain", color="darkorange", **back) >> eks_api
     flag >> Edge(label="read every 15s", style="dashed", color="darkorange", **back) >> checkout

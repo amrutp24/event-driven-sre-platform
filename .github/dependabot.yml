@@ -18,6 +18,10 @@ updates:
       - /examples/existing-cluster
     schedule:
       interval: weekly
+    # Module majors (EKS v20 to v21, IAM v5 to v6) are deliberate upgrades
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
     groups:
       terraform:
         patterns: ["*"]
@@ -31,7 +35,10 @@ updates:
       - /examples/complete/apps/checkout
     schedule:
       interval: weekly
+    # Only touch a requirement when its range no longer allows the new version,
+    # so ">=" floors in the Lambdas' test requirements stay as they are
+    versioning-strategy: increase-if-necessary
+    # Test and app dependencies all in one PR; CI runs every suite on it
     groups:
       pip:
         patterns: ["*"]
-        update-types: [minor, patch]

@@ -4,7 +4,7 @@
 
 How alerts flow through the system, from detection to remediation.
 
-The alert pipeline (webhook, Lambdas, EventBridge, Step Functions, DynamoDB, SNS, KMS) is the Terraform module at the repo root. The VPC, EKS cluster, IRSA roles, ECR, CloudTrail and VPC endpoints come from `examples/complete`, which calls the module.
+The alert pipeline (webhook, Lambdas, EventBridge, Step Functions, DynamoDB, SNS, KMS) is the Terraform module at the repo root. The VPC, EKS cluster, IRSA roles, ECR, CloudTrail and VPC endpoints come from `examples/complete`, which calls the module. The one exception is the execute-api endpoint for `webhook_private`, which the module creates.
 
 Names and values like the `apps` namespace, the `checkout` deployment, the `/checkout/degraded_mode` parameter, the `nodegroup=apps` drain label and the alert routes are the ones `examples/complete` passes to the module. The module itself has no routes (nothing is remediated until `runbook_routes` is set), no default deployment, and degraded mode and `drain_node` stay off until `degraded_mode_deployment` and `drainable_node_label` are set.
 
@@ -28,11 +28,11 @@ Generated from [diagram.py](diagram.py) with [Diagrams](https://diagrams.mingram
 graph TB
     subgraph "User Traffic & Edge"
         Users[Users/Clients]
-        R53[Route53 DNS]
+        R53[Route53 DNS<br/>optional, ExternalDNS<br/>with route53_zone_arns]
     end
 
     subgraph "AWS VPC"
-        ALB[Application Load Balancer<br/>AWS Load Balancer Controller]
+        ALB[Application Load Balancer<br/>AWS Load Balancer Controller<br/>optional, ingress off by default]
 
         subgraph "Amazon EKS Cluster"
             subgraph "apps namespace"
@@ -69,9 +69,9 @@ graph TB
     end
 
     %% Traffic Flow
-    Users -->|HTTPS| R53
-    R53 --> ALB
-    ALB -->|HTTP| APP
+    Users -.->|HTTPS, optional| R53
+    R53 -.-> ALB
+    ALB -.->|HTTP| APP
 
     %% Observability Flow
     APP -->|Expose Metrics| SM
@@ -124,52 +124,52 @@ This diagram shows the numbered sequence of events from alert detection through 
 flowchart TD
     Start([Alert Condition Detected]) --> Step1
 
-    Step1[1. Prometheus evaluates alert rules<br/>PromQL: rate errors > 5%] --> Step2
-    Step2[2. Alert enters FIRING state<br/>Alertmanager receives alert] --> Step3
-    Step3[3. Alertmanager routes alert<br/>Applies labels + annotations] --> Step4
+    Step1[Step 1: Prometheus evaluates alert rules<br/>PromQL: rate errors > 5%] --> Step2
+    Step2[Step 2: Alert enters FIRING state<br/>Alertmanager receives alert] --> Step3
+    Step3[Step 3: Alertmanager routes alert<br/>Applies labels + annotations] --> Step4
 
-    Step4[4. POST webhook to API Gateway<br/>JSON payload with alert details] --> Step5
-    Step5[5. alert_ingest Lambda triggered<br/>Validates schema + enriches metadata] --> Step6
+    Step4[Step 4: POST webhook to API Gateway<br/>JSON payload with alert details] --> Step5
+    Step5[Step 5: alert_ingest Lambda triggered<br/>Validates schema + enriches metadata] --> Step6
 
     Step6{Alert Valid?} -->|No| Reject[Log error + return 400]
     Step6 -->|Yes| Step7
 
-    Step7[6. Normalize alert format<br/>Add: timestamp, severity, context] --> Step8
-    Step8[7. Put event to EventBridge<br/>Source: sre.alertmanager] --> Step9
+    Step7[Step 6: Normalize alert format<br/>Add: timestamp, severity, context] --> Step8
+    Step8[Step 7: Put event to EventBridge<br/>Source: sre.alertmanager] --> Step9
 
-    Step9[8. EventBridge routes to 4 targets] --> Multi{Fan-out}
+    Step9[Step 8: EventBridge routes to 4 targets] --> Multi{Fan-out}
 
-    Multi --> Target1[8a. incident-recorder state machine<br/>DynamoDB: store incident record]
-    Multi --> Target2[8b. SNS Publish<br/>Notify on-call engineer]
-    Multi --> Target3[8c. CloudWatch Logs<br/>Audit trail]
-    Multi --> Target4[8d. Step Functions StartExecution<br/>Begin runbook automation]
+    Multi --> Target1[Step 8a: incident-recorder state machine<br/>DynamoDB: store incident record]
+    Multi --> Target2[Step 8b: SNS Publish<br/>Notify on-call engineer]
+    Multi --> Target3[Step 8c: CloudWatch Logs<br/>Audit trail]
+    Multi --> Target4[Step 8d: Step Functions StartExecution<br/>Begin runbook automation]
 
-    Target4 --> Step10{9. Step Functions evaluates the alert<br/>Firing and severity=critical?}
+    Target4 --> Step10{Step 9: Step Functions evaluates the alert<br/>Firing and severity=critical?}
 
     Step10 -->|No, or notify_only| NotAuto([Not auto-remediated<br/>SNS already notified on-call])
-    Step10 -->|Yes| Claim[10. Claim the incident in DynamoDB<br/>status=remediating, once per incident]
+    Step10 -->|Yes| Claim[Step 10: Claim the incident in DynamoDB<br/>status=remediating, once per incident]
 
     Claim -->|Already claimed or resolved| Dup([Stop: nothing to do])
     Claim --> Decision{Runbook for this alert?}
     Decision -->|No| Escalate
     Decision -->|Yes| Step11
 
-    Step11[11. Invoke runbook_action Lambda<br/>Pass: action, namespace, deployment, replicas, node] --> Step12
-    Step12[12. Lambda authenticates to EKS<br/>IAM role + EKS access entry] --> ActionType{Action Type}
+    Step11[Step 11: Invoke runbook_action Lambda<br/>Pass: action, namespace, deployment, replicas, node] --> Step12
+    Step12[Step 12: Lambda authenticates to EKS<br/>IAM role + EKS access entry] --> ActionType{Action Type}
 
-    ActionType -->|Scale| Scale[Raise the HPA minimum<br/>Up to MAX_REPLICAS]
+    ActionType -->|Scale| Scale[Raise the HPA minimum<br/>or replicas without an HPA<br/>Up to MAX_REPLICAS]
     ActionType -->|Restart| Restart[Restart annotation<br/>Rolling restart pods]
     ActionType -->|Degrade| Degrade[Set the SSM flag<br/>Pods pick it up within 15s]
     ActionType -->|Drain| Drain[Cordon the node<br/>Evict its pods, PDBs respected]
-    ActionType -->|Failed after 3 retries| Escalate
+    ActionType -->|Failed: 3 retries, none for bad input| Escalate
 
     Scale --> Step13
     Restart --> Step13
     Degrade --> Step13
     Drain --> Step13
 
-    Step13[13. Publish action.completed<br/>Wait 60s for metrics to settle] --> Step14
-    Step14[14. Read the incident every 30s<br/>until the recorder marks it resolved] --> Step15
+    Step13[Step 13: Publish action.completed<br/>Wait 60s for metrics to settle] --> Step14
+    Step14[Step 14: Read the incident every 30s<br/>until the recorder marks it resolved] --> Step15
 
     Step15{Resolved within 10 min<br/>of the action?} -->|Yes| Success([incident.auto_resolved with MTTR<br/>SNS notifies on-call])
     Step15 -->|No| Escalate([incident.escalated, status=escalated<br/>SNS notifies on-call])
@@ -218,7 +218,7 @@ sequenceDiagram
     Prom->>AM: Fire alert: CheckoutHighErrorRate
 
     Note over AM,APIGW: Notification Phase
-    AM->>AM: Apply routing rules<br/>Match: severity=critical
+    AM->>AM: Apply routing rules<br/>Watchdog, InfoInhibitor: null receiver<br/>Everything else: aws-webhook
     AM->>APIGW: POST /webhook<br/>JSON: {alert_name, labels, annotations}
 
     Note over APIGW,EB: Ingestion Phase
@@ -232,7 +232,7 @@ sequenceDiagram
     par Parallel Targets
         EB->>DDB: incident-recorder upserts record<br/>{id, status=open, first_seen_at}
         EB->>SNS: Publish notification<br/>Alert on-call engineer
-        EB->>SF: StartExecution: incident-response-runbook
+        EB->>SF: StartExecution: {name}-runbook
     end
 
     Note over SF,K8s: Remediation Phase
@@ -282,7 +282,7 @@ sequenceDiagram
 ```mermaid
 graph TB
     subgraph "IAM Roles & Policies"
-        R1[alert_ingest Lambda Role<br/>Permissions:<br/>- eventbridge:PutEvents]
+        R1[alert_ingest Lambda Role<br/>Permissions:<br/>- events:PutEvents]
         R2[runbook_action Lambda Role<br/>Permissions:<br/>- eks:DescribeCluster<br/>- ssm:GetParameter<br/>- ssm:PutParameter<br/>- sts:GetCallerIdentity]
         R3[EventBridge Role<br/>Permissions:<br/>- states:StartExecution<br/>SNS, SQS and Logs grant it<br/>through resource policies]
         R4[Step Functions Role<br/>Permissions:<br/>- lambda:InvokeFunction<br/>- dynamodb:UpdateItem<br/>- dynamodb:GetItem<br/>- events:PutEvents]
@@ -294,7 +294,7 @@ graph TB
     end
 
     subgraph "Kubernetes RBAC"
-        Role[Role: sre-remediation<br/>Namespace: apps<br/>Permissions:<br/>- get/list/patch deployments<br/>- get/patch horizontalpodautoscalers<br/>- get/list pods]
+        Role[Role: sre-remediation<br/>Namespace: apps<br/>Permissions:<br/>- get/list/patch deployments<br/>- get/patch horizontalpodautoscalers<br/>- get/list pods<br/>- get/list configmaps]
         RB[RoleBinding<br/>Group sre-remediation -> Role]
         CRole[ClusterRole: sre-remediation-nodes<br/>Permissions:<br/>- get/list/patch nodes<br/>- list pods<br/>- create pods/eviction]
         CRB[ClusterRoleBinding<br/>Group sre-remediation -> ClusterRole]
@@ -302,7 +302,7 @@ graph TB
 
     subgraph "Network Security"
         SG1[Security Group: EKS Nodes<br/>Ingress: control plane, other nodes,<br/>ALB to pods<br/>Egress: Internet via NAT]
-        SG2[Security Group: ALB<br/>Ingress: 443 from anywhere<br/>TLS 1.2+ policy, 1.3 preferred<br/>CloudFront in front: not built yet]
+        SG2[Security Group: ALB<br/>only with ingress.enabled, off by default<br/>Ingress: 443 from anywhere<br/>TLS 1.2+ policy, 1.3 preferred<br/>CloudFront in front: not built yet]
         SG3[Security Group: VPC Endpoints<br/>Ingress: 443 from the VPC CIDR<br/>Interface endpoints, off by default]
         GW[Gateway endpoints<br/>S3 and DynamoDB, always on]
     end
@@ -356,11 +356,10 @@ graph TB
 
 **Alertmanager**
 - Groups related alerts (reduces noise)
-- Routes alerts based on severity labels
-- Sends the chart's always-firing `Watchdog` and `InfoInhibitor` alerts to a `null` receiver, so they don't become incidents
-- Deduplicates alerts (5-minute window)
+- Routes on alert name only: the chart's always-firing `Watchdog` and `InfoInhibitor` alerts go to a `null` receiver, so they don't become incidents, and everything else goes to the webhook. Severity is checked later, by the runbook.
+- Groups with `group_wait` 30s, `group_interval` 2m and `repeat_interval` 30m in `examples/complete`
 - Webhook integration with API Gateway
-- Retry logic: 3 attempts with exponential backoff
+- Retries a failed webhook call with backoff until the notification times out, then sends it again at the next `group_interval`
 
 **Datadog** (optional)
 - Datadog monitors can send to the same webhook; the payload format is in [docs/API.md](../API.md#datadog-webhook-format)
@@ -373,7 +372,7 @@ graph TB
 - Request validation: JSON schema enforcement
 - Throttling: 1000 requests/second
 - Authentication: API key in `X-API-Key`, required by default. `webhook_private` makes it a private API that only answers through an execute-api VPC endpoint, which also shuts out Datadog.
-- TLS: HTTPS only, with API Gateway's default TLS policy. Pinning a TLS 1.2 minimum on the default endpoint needs AWS provider 6, and the EKS module (~> 20) holds the provider below 6.
+- TLS: HTTPS only, with API Gateway's default TLS policy. Pinning a TLS 1.2 minimum on the default endpoint needs AWS provider 6, and the module still supports provider 5.x. Only `examples/complete` is held on 5, by the EKS module v20.
 - Integration: Lambda proxy integration
 
 **alert_ingest Lambda**
@@ -415,10 +414,10 @@ graph TB
   3. **Choose Action**: map the alert name to an action with `runbook_routes`. In `examples/complete`, `CheckoutHighErrorRate`, `CheckoutHighLatencyP95` and `CheckoutSLOBurnFast` get `degrade_or_scale`, `CheckoutDown` gets `restart`, `NodeUnderPressure` gets `drain_node`. A `runbook_action` annotation overrides the table. The namespace comes from the alert's `namespace` label (or Datadog's `kube_namespace` tag), else the first of `remediation_namespaces`; the deployment from its `deployment` label, `kube_deployment` tag or `service` label, else `default_deployment`; replicas from a `desired_replicas` annotation, else `default_scale_replicas` (4); the node from its `node` label or Datadog's `host` tag (the EC2 private DNS name, which is the node name). No runbook for the alert means escalate.
   4. **Execute Action**: invoke runbook_action. `InvalidRequest` (bad input) isn't retried; anything else gets 3 retries with exponential backoff and jitter. Either way the result goes out as an `action.completed` event, and a failure escalates.
   5. **Wait for Stabilization**: 60 seconds (`stabilization_seconds`)
-  6. **Verify Resolution**: read the incident from DynamoDB every 30 seconds (`verify_poll_seconds`) until the incident recorder has marked it resolved, for up to 10 minutes after the action (`verify_timeout_seconds`). The original plan was 5 minutes, but the alert's 5 minute rate window plus Alertmanager's 2 minute `group_interval` mean a fixed service usually reads as resolved 3 to 7 minutes after the action.
+  6. **Verify Resolution**: read the incident from DynamoDB every 30 seconds (`verify_poll_seconds`) until the incident recorder has marked it resolved, for up to 10 minutes after the action (`verify_timeout_seconds`). The original plan was 5 minutes, but the alert's 5 minute rate window plus Alertmanager's 2 minute `group_interval` in `examples/complete` mean a fixed service usually reads as resolved 3 to 7 minutes after the action.
   7. **Update Status**: if resolved, set `remediation_result=auto_resolved`, `remediated_by` and `mttr_seconds`, and publish `incident.auto_resolved`. MTTR runs from when the platform first saw the alert to when it saw the resolution. Otherwise set `status=escalated` and `escalation_reason`, publish `incident.escalated`, and end the execution as failed. An incident that resolved in the meantime isn't escalated.
 - Escalation reasons: no runbook for the alert, the action failed after its retries, the alert still firing at the end of the verify window, or DynamoDB failing when the incident is logged or checked
-- Error handling: the DynamoDB and EventBridge steps also retry 3 times with backoff
+- Error handling: the DynamoDB and EventBridge steps also retry 3 times with backoff (5 for the escalation event)
 - Logs: `/aws/vendedlogs/states/<name>-runbook`, every state with its input and output, kept 30 days
 - Execution history: 90 days
 
@@ -590,8 +589,8 @@ Not built yet. kube-prometheus-stack brings its own Grafana dashboards for the c
 **Scenario 1: alert_ingest Lambda fails**
 - Impact: Alerts not ingested, no remediation
 - Detection: the Lambda's `Errors` metric (no alarm is built yet) and Alertmanager's failed-notification logs
-- Mitigation: Alertmanager retries webhook (3 attempts), DLQ captures failed events
-- Recovery: Replay events from EventBridge archive
+- Mitigation: Alertmanager retries the webhook call with backoff. Nothing reaches the event bus, so the DLQ and the archive don't help here.
+- Recovery: Alertmanager sends the alert again on its next `group_interval` or `repeat_interval` once the Lambda works
 
 **Scenario 2: EKS API unreachable**
 - Impact: Remediation actions fail
@@ -646,7 +645,7 @@ The monthly cost of `examples/complete`, line by line, is in [its README](../../
 
 - Least-privilege IAM policies (no wildcards for application resources)
 - Encryption at rest: one customer managed KMS key, rotated yearly, for the incidents table, the SNS topics, the dead-letter queue, the platform's log groups and CloudTrail. Kubernetes secrets use the EKS module's own key, and ECR images AES-256.
-- Encryption in transit: a TLS 1.2+ policy on the ALB (TLS 1.3 preferred), and the SNS topics, the dead-letter queue and the CloudTrail bucket refuse requests without TLS. The webhook is HTTPS only, but its TLS policy can't be pinned until the move to AWS provider 6.
+- Encryption in transit: a TLS 1.2+ policy on the ALB when the checkout ingress is turned on (TLS 1.3 preferred), and the SNS topics, the dead-letter queue and the CloudTrail bucket refuse requests without TLS. The webhook is HTTPS only, but its TLS policy can't be pinned while the module supports AWS provider 5.x.
 - IRSA and EKS access entries instead of long-lived credentials
 - Kubernetes RBAC: workload changes limited to the `apps` namespace, and a ClusterRole only for cordoning nodes and evicting pods
 - VPC security groups (allow-list only)
