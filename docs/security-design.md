@@ -1,4 +1,6 @@
-# Security Documentation - Event-Driven SRE Platform
+# Security design
+
+Names and values like the `apps` namespace, the `checkout` deployment, the `/checkout/degraded_mode` parameter and the `nodegroup=apps` drain label are what `examples/complete` passes to the module. The module itself has no default namespace, deployment or routes, and leaves degraded mode and `drain_node` off until `degraded_mode_deployment` and `drainable_node_label` are set; the permissions for them are only created then.
 
 ## Table of Contents
 
@@ -66,11 +68,11 @@ All IAM roles and policies follow the principle of least privilege, granting onl
 ```
 
 **Why This Is Secure**:
-- ✅ No wildcards (`*`) for application resources
-- ✅ Scoped to specific log group (not all CloudWatch Logs)
-- ✅ Only write access to specific event bus (not all EventBridge buses)
-- ✅ No access to DynamoDB, SNS or Step Functions at all; EventBridge rules deliver the events
-- ✅ Cannot read incidents or delete data
+- No wildcards (`*`) for application resources
+- Scoped to specific log group (not all CloudWatch Logs)
+- Only write access to specific event bus (not all EventBridge buses)
+- No access to DynamoDB, SNS or Step Functions at all; EventBridge rules deliver the events
+- Cannot read incidents or delete data
 
 #### 2. runbook_action Lambda Role
 
@@ -98,7 +100,7 @@ All IAM roles and policies follow the principle of least privilege, granting onl
     {
       "Effect": "Allow",
       "Action": ["ssm:PutParameter", "ssm:GetParameter"],
-      "Resource": "arn:aws:ssm:REGION:*:parameter/checkout/*"
+      "Resource": "arn:aws:ssm:REGION:ACCOUNT_ID:parameter/checkout/degraded_mode"
     },
     {
       "Effect": "Allow",
@@ -110,14 +112,14 @@ All IAM roles and policies follow the principle of least privilege, granting onl
 ```
 
 **Why This Is Secure**:
-- ✅ Only describe specific EKS cluster (not all clusters)
-- ✅ SSM access limited to `/checkout/*` namespace (not all parameters)
-- ✅ Cannot delete SSM parameters or modify other application configs
-- ✅ `sts:GetCallerIdentity` required to sign the EKS authentication token (cannot be scoped)
+- Only describe specific EKS cluster (not all clusters)
+- SSM access only to the degraded-mode parameter, and only when `degraded_mode_deployment` is set; without it the role has no SSM statement
+- Cannot delete SSM parameters or modify other application configs
+- `sts:GetCallerIdentity` required to sign the EKS authentication token (cannot be scoped)
 
 **Note**: The actual Kubernetes access is controlled by RBAC (see below), not IAM. The role also has the AWS-managed `AWSLambdaVPCAccessExecutionRole` policy so the Lambda can run in the private subnets.
 
-**Input checks**: the Lambda only runs what the state machine sends it, and checks that first. It raises `InvalidRequest` for an action other than `degrade`, `restart`, `scale`, `degrade_or_scale` or `drain_node`, a namespace that isn't in `ALLOWED_NAMESPACES` (`apps`), a deployment name that isn't a valid Kubernetes name, replicas outside 1 to `MAX_REPLICAS` (`remediation_max_replicas`, default 10), or `degrade` for anything but checkout. For `drain_node` it refuses an invalid or unknown node name, a node without the `nodegroup=apps` label, and a drain that would leave no other Ready, schedulable apps node (`drain_min_schedulable_nodes`, default 1). The state machine doesn't retry `InvalidRequest`; it escalates the incident instead. So an alert can't point the Lambda at another namespace, scale a deployment without limit, or drain a system node or the last apps node, even though the target comes from the alert's labels.
+**Input checks**: the Lambda only runs what the state machine sends it, and checks that first. It raises `InvalidRequest` for an action other than `degrade`, `restart`, `scale`, `degrade_or_scale` or `drain_node`, a namespace that isn't in `ALLOWED_NAMESPACES` (`remediation_namespaces`), a deployment name that isn't a valid Kubernetes name, replicas outside 1 to `MAX_REPLICAS` (`remediation_max_replicas`, default 10), `degrade` for anything but `degraded_mode_deployment`, or `degrade` at all when that isn't set. It refuses `drain_node` when `drainable_node_label` isn't set, and otherwise an invalid or unknown node name, a node without that label, and a drain that would leave no other Ready, schedulable apps node (`drain_min_schedulable_nodes`, default 1). The state machine doesn't retry `InvalidRequest`; it escalates the incident instead. So an alert can't point the Lambda at another namespace, scale a deployment without limit, or drain a system node or the last apps node, even though the target comes from the alert's labels.
 
 ### Step Functions Execution Role
 
@@ -162,10 +164,10 @@ All IAM roles and policies follow the principle of least privilege, granting onl
 ```
 
 **Why This Is Secure**:
-- ✅ CloudWatch Logs permissions required for Step Functions logging (cannot be scoped further)
-- ✅ Only invoke specific Lambda function (not all functions)
-- ✅ `UpdateItem` and `GetItem` on the incidents table only: to claim an incident, check whether it resolved, and mark it resolved or escalated. No scans, queries or deletes.
-- ✅ `PutEvents` on the platform's bus only, for `action.completed`, `incident.auto_resolved` and `incident.escalated`
+- CloudWatch Logs permissions required for Step Functions logging (cannot be scoped further)
+- Only invoke specific Lambda function (not all functions)
+- `UpdateItem` and `GetItem` on the incidents table only: to claim an incident, check whether it resolved, and mark it resolved or escalated. No scans, queries or deletes.
+- `PutEvents` on the platform's bus only, for `action.completed`, `incident.auto_resolved` and `incident.escalated`
 
 ### Incident Recorder Role
 
@@ -184,7 +186,7 @@ The other targets grant EventBridge access through resource policies, each limit
 | Resource | Allows `events.amazonaws.com` to | Limited to |
 | --- | --- | --- |
 | SNS topic `PLATFORM_NAME-alerts` | `sns:Publish` | the `incident-created`, `incident-resolved`, `incident-escalated` and `incident-auto-resolved` rules |
-| SNS topic `PLATFORM_NAME-chat` (only with `chat_notifications`) | `sns:Publish` | the same four rules |
+| SNS topic `PLATFORM_NAME-chat` (only with `create_chat_topic`) | `sns:Publish` | the same four rules |
 | SQS queue `PLATFORM_NAME-events-dlq` | `sqs:SendMessage` | the platform's six rules |
 | Log group `/aws/events/PLATFORM_NAME` | `logs:CreateLogStream`, `logs:PutLogEvents` | that log group |
 
@@ -219,7 +221,7 @@ IRSA allows Kubernetes pods to assume IAM roles via the EKS OIDC provider, elimi
 
 ### The checkout app's role
 
-The checkout pods read the degraded-mode flag from SSM. The chart's `checkout` service account carries the role from `terraform output checkout_role_arn` (`examples/complete/irsa.tf`, passed in by `scripts/deploy.sh`), and the role trusts only `apps:checkout`. Its one permission:
+The checkout pods read the degraded-mode flag from SSM. The chart's `checkout` service account carries the role from `terraform output checkout_role_arn` (`examples/complete/irsa.tf`, passed in by `examples/complete/scripts/deploy.sh`), and the role trusts only `apps:checkout`. Its one permission:
 
 ```json
 {
@@ -254,9 +256,9 @@ resource "aws_eks_access_entry" "runbook_action" {
 The Lambda runs in the private subnets and reaches the cluster's private API endpoint. The cluster security group allows HTTPS from the Lambda's security group only.
 
 **Security Properties**:
-- ✅ No kubeconfig, static token or long-lived key is stored anywhere
-- ✅ Only this IAM role is mapped to the `sre-remediation` group
-- ✅ Outside the `apps` namespace, the group can only look at and cordon nodes, list pods and evict them (for `drain_node`)
+- No kubeconfig, static token or long-lived key is stored anywhere
+- Only this IAM role is mapped to the `sre-remediation` group
+- Outside the `apps` namespace, the group can only look at and cordon nodes, list pods and evict them (for `drain_node`)
 
 ---
 
@@ -264,7 +266,7 @@ The Lambda runs in the private subnets and reaches the cluster's private API end
 
 ### Principle: Namespace Isolation
 
-The runbook_action Lambda (through its access entry) can change workloads only in the `apps` namespace. The one exception is `drain_node`: nodes are cluster-scoped and a node runs pods from every namespace, so cordoning one and evicting its pods needs a ClusterRole. That ClusterRole can't change any workload, only nodes and evictions. The Role, the ClusterRole and their bindings are in `k8s/rbac/remediation-role.yaml` and applied by `scripts/deploy.sh`.
+The runbook_action Lambda (through its access entry) can change workloads only in the `apps` namespace. The one exception is `drain_node`: nodes are cluster-scoped and a node runs pods from every namespace, so cordoning one and evicting its pods needs a ClusterRole. That ClusterRole can't change any workload, only nodes and evictions. The Role, the ClusterRole and their bindings are the module's `rbac_manifest` output, rendered from `templates/rbac.yaml.tftpl`: a Role and RoleBinding in each of `remediation_namespaces`, and the ClusterRole and its binding only when `drainable_node_label` is set. Apply it with `terraform output -raw rbac_manifest | kubectl apply -f -`; `examples/complete/scripts/deploy.sh` does that.
 
 ### Role Definition
 
@@ -341,13 +343,13 @@ roleRef:
 
 ### What the Lambda CANNOT Do
 
-- ❌ Delete deployments, pods, nodes or other resources (evicting is allowed, deleting isn't)
-- ❌ Create new deployments or pods
-- ❌ Modify deployments or other workloads in other namespaces (e.g., `kube-system`, `monitoring`)
-- ❌ Access secrets or service accounts
-- ❌ Modify RBAC rules (roles, rolebindings, clusterroles)
-- ❌ Exec into pods or access pod logs
-- ❌ Modify cluster-level resources other than nodes. It can patch nodes, and the Lambda only uses that to cordon them.
+- Delete deployments, pods, nodes or other resources (evicting is allowed, deleting isn't)
+- Create new deployments or pods
+- Modify deployments or other workloads in other namespaces (e.g., `kube-system`, `monitoring`)
+- Access secrets or service accounts
+- Modify RBAC rules (roles, rolebindings, clusterroles)
+- Exec into pods or access pod logs
+- Modify cluster-level resources other than nodes. It can patch nodes, and the Lambda only uses that to cordon them.
 
 ### Security Validation
 
@@ -499,7 +501,7 @@ The only secrets are the two webhook API keys.
 
 | Item | Storage | Access Method |
 |------|---------|---------------|
-| **Alertmanager's webhook API key** | Kubernetes Secret `alertmanager-webhook-key` in `monitoring`, encrypted with the EKS secrets key | `scripts/deploy.sh` writes it from `terraform output alertmanager_api_key`; Alertmanager mounts it as a file |
+| **Alertmanager's webhook API key** | Kubernetes Secret `alertmanager-webhook-key` in `monitoring`, encrypted with the EKS secrets key | `examples/complete/scripts/deploy.sh` writes it from `terraform output alertmanager_api_key`; Alertmanager mounts it as a file |
 | **Datadog's webhook API key** | A hidden custom variable in Datadog's webhook integration | Added by hand from `terraform output datadog_api_key` |
 | **Degraded-mode flag** (not a secret) | SSM String parameter `/checkout/degraded_mode` | The runbook_action Lambda writes it; checkout pods read it through their IRSA role |
 | **TLS certificate** | AWS Certificate Manager | The ALB fetches it |
@@ -513,7 +515,7 @@ Both API key values are also in the Terraform state, as sensitive outputs, so ke
 
 ```bash
 terraform -chdir=examples/complete apply -replace='module.sre.aws_api_gateway_api_key.webhook["alertmanager"]'
-bash scripts/deploy.sh   # writes the new key to Alertmanager's secret
+bash examples/complete/scripts/deploy.sh   # writes the new key to Alertmanager's secret
 ```
 
 For Datadog, replace `module.sre.aws_api_gateway_api_key.webhook["datadog"]` and paste the new value into the Datadog integration.
@@ -523,13 +525,13 @@ For Datadog, replace `module.sre.aws_api_gateway_api_key.webhook["datadog"]` and
 ### Secrets in Code
 
 **Never commit secrets to Git**:
-- ❌ Hardcoded API keys in Lambda code
-- ❌ Database passwords in Terraform files
-- ❌ AWS credentials in Docker images
+- No hardcoded API keys in Lambda code
+- No database passwords in Terraform files
+- No AWS credentials in Docker images
 
 **Where they come from instead**:
-- ✅ API keys are generated by Terraform and handed to Alertmanager through a Kubernetes Secret
-- ✅ AWS access is through IAM roles (Lambda execution roles, IRSA), never stored keys
+- API keys are generated by Terraform and handed to Alertmanager through a Kubernetes Secret
+- AWS access is through IAM roles (Lambda execution roles, IRSA), never stored keys
 
 ---
 
@@ -547,7 +549,7 @@ For Datadog, replace `module.sre.aws_api_gateway_api_key.webhook["datadog"]` and
 
 **Storage**: the S3 bucket `PLATFORM_NAME-cloudtrail-ACCOUNT_ID` (output `cloudtrail_bucket`), encrypted with the platform key, versioned, with all public access blocked, ownership enforced, and a policy that only lets this trail write and denies non-TLS requests. Log file validation is on, so `aws cloudtrail validate-logs` can show whether a file was changed or deleted.
 
-**Retention**: 365 days (`cloudtrail_retention_days`), then the lifecycle rule deletes them. The bucket can't be deleted while it holds logs unless `cloudtrail_force_destroy` is set, which `scripts/destroy.sh` does.
+**Retention**: 365 days (`cloudtrail_retention_days`), then the lifecycle rule deletes them. The bucket can't be deleted while it holds logs unless `cloudtrail_force_destroy` is set, which `examples/complete/scripts/destroy.sh` does.
 
 **Use Cases**:
 - **Forensics**: Who invoked which Lambda at what time?
@@ -610,7 +612,7 @@ Every incident is logged with:
 
 ## Security Best Practices Implemented
 
-### ✅ Implemented
+### Implemented
 
 1. **Least-Privilege IAM**: All roles have specific ARNs, no wildcards for application resources
 2. **IRSA and EKS access entries**: No long-lived credentials stored
@@ -632,7 +634,7 @@ Every incident is logged with:
 18. **No Node Credentials for Pods**: nodes require IMDSv2 with a hop limit of 1, so pods can't use the node's IAM role; pods that need AWS use IRSA
 19. **Remediation Concurrency Cap, opt-in**: `runbook_action_reserved_concurrency` caps how many remediations run at once (10 is a good cap). It's -1 (no cap) by default, because AWS keeps at least 50 to 100 executions unreserved per account and new accounts often have a limit of 50, so any reservation fails there.
 
-### 🚧 Recommended for Production
+### Recommended for production
 
 20. **Restrict the EKS Public Endpoint**: it's open to `0.0.0.0/0` by default; set `eks_public_access_cidrs` to your own address
 21. **Multi-Factor Authentication (MFA)**: Require MFA for all AWS console access
@@ -706,12 +708,12 @@ Use this checklist before deploying to production:
 **Impact**: Trigger unauthorized remediation actions (e.g., delete all pods)
 
 **Mitigations**:
-- ✅ API Gateway validates JSON schema (reject malformed requests)
-- ✅ alert_ingest Lambda validates alert structure and source
-- ✅ RBAC limits Lambda to patching deployments and HPAs, cordoning nodes and evicting pods (cannot delete anything)
-- ✅ The state machine only runs four known actions, and the Lambda rejects other namespaces, invalid deployment names and replica counts over `MAX_REPLICAS`
-- ✅ An incident is remediated once, however many times the alert is sent
-- ✅ API Gateway throttling prevents alert flood
+- API Gateway validates JSON schema (reject malformed requests)
+- alert_ingest Lambda validates alert structure and source
+- RBAC limits Lambda to patching deployments and HPAs, cordoning nodes and evicting pods (cannot delete anything)
+- The state machine only runs four known actions, and the Lambda rejects other namespaces, invalid deployment names and replica counts over `MAX_REPLICAS`
+- An incident is remediated once, however many times the alert is sent
+- API Gateway throttling prevents alert flood
 
 **Residual Risk**: Low (requires bypassing multiple validation layers)
 
@@ -722,11 +724,11 @@ Use this checklist before deploying to production:
 **Impact**: Read incident history, publish fake alerts, invoke Step Functions
 
 **Mitigations**:
-- ✅ Least-privilege IAM policies limit damage
-- ✅ CloudTrail logs management API calls in every region (detect unusual activity)
-- ❌ GuardDuty isn't set up by this repo; turn it on for the account
-- ✅ Lambda execution role cannot delete resources
-- ✅ Credentials are temporary (Lambda execution context, 6-hour max)
+- Least-privilege IAM policies limit damage
+- CloudTrail logs management API calls in every region (detect unusual activity)
+- GuardDuty isn't set up by this repo; turn it on for the account
+- Lambda execution role cannot delete resources
+- Credentials are temporary (Lambda execution context, 6-hour max)
 
 **Residual Risk**: Medium (could still cause availability issues)
 
@@ -737,11 +739,11 @@ Use this checklist before deploying to production:
 **Impact**: Modify resources outside `apps` namespace, delete production pods
 
 **Mitigations**:
-- ✅ Keep EKS version up-to-date (patches security issues)
-- ✅ RBAC limits the remediation group's workload changes to the `apps` namespace; outside it, only cordons and evictions
-- ❌ Pod Security Standards (PSS) aren't enforced yet
-- ❌ No network policies between namespaces yet
-- ✅ Audit logs capture unauthorized access attempts
+- Keep EKS version up-to-date (patches security issues)
+- RBAC limits the remediation group's workload changes to the `apps` namespace; outside it, only cordons and evictions
+- Pod Security Standards (PSS) aren't enforced yet
+- No network policies between namespaces yet
+- Audit logs capture unauthorized access attempts
 
 **Residual Risk**: Low (requires Kubernetes 0-day exploit)
 
@@ -752,10 +754,10 @@ Use this checklist before deploying to production:
 **Impact**: Execute arbitrary code with Lambda IAM role permissions
 
 **Mitigations**:
-- ✅ Function code only changes through Terraform; no role in the platform has `lambda:UpdateFunctionCode`
-- ✅ CloudTrail logs every function code and configuration update
-- ✅ The checkout image tags are immutable, so a deployed tag can't be swapped for different code
-- ❌ Lambda code signing isn't set up
+- Function code only changes through Terraform; no role in the platform has `lambda:UpdateFunctionCode`
+- CloudTrail logs every function code and configuration update
+- The checkout image tags are immutable, so a deployed tag can't be swapped for different code
+- Lambda code signing isn't set up
 
 **Residual Risk**: Very Low (requires AWS account compromise)
 
@@ -766,10 +768,10 @@ Use this checklist before deploying to production:
 **Impact**: Exposure of incident details, alert patterns, service topology
 
 **Mitigations**:
-- ✅ IAM policies prevent read access (only the incident recorder and the runbook state machine can write, and the runbook can only read single items)
-- ✅ DynamoDB encrypted at rest with the platform key
-- ✅ VPC gateway endpoint for DynamoDB (traffic from the VPC stays on the AWS network)
-- ❌ CloudTrail doesn't log item reads and writes (data events), only table-level calls
+- IAM policies prevent read access (only the incident recorder and the runbook state machine can write, and the runbook can only read single items)
+- DynamoDB encrypted at rest with the platform key
+- VPC gateway endpoint for DynamoDB (traffic from the VPC stays on the AWS network)
+- CloudTrail doesn't log item reads and writes (data events), only table-level calls
 
 **Residual Risk**: Low (requires IAM role compromise)
 
@@ -816,31 +818,31 @@ Use this checklist before deploying to production:
 ### SOC 2 Type II
 
 **Requirements**:
-- Encryption at rest and in transit (✅ Implemented)
-- Access controls and least privilege (✅ Implemented)
-- Audit logs retained for at least 1 year (✅ CloudTrail to S3)
-- Incident response plan documented (✅ See above)
-- Regular security reviews and penetration tests (🚧 To be scheduled)
+- Encryption at rest and in transit (implemented)
+- Access controls and least privilege (implemented)
+- Audit logs retained for at least 1 year (CloudTrail to S3)
+- Incident response plan documented (see above)
+- Regular security reviews and penetration tests (to be scheduled)
 
 ### PCI DSS (if handling payment data)
 
 **Requirements**:
-- Network segmentation (✅ Private subnets, security groups)
-- Encryption of cardholder data (✅ KMS encryption)
-- Access control (✅ RBAC, IAM)
-- Monitoring and logging (✅ CloudTrail, CloudWatch Logs)
-- Regular security testing (🚧 Quarterly scans required)
+- Network segmentation (Private subnets, security groups)
+- Encryption of cardholder data (KMS encryption)
+- Access control (RBAC, IAM)
+- Monitoring and logging (CloudTrail, CloudWatch Logs)
+- Regular security testing (quarterly scans required)
 
 **Note**: This platform does not store cardholder data, but alerts may contain metadata that references payment transactions.
 
 ### HIPAA (if handling health data)
 
 **Requirements**:
-- Encryption at rest and in transit (✅ Implemented)
-- Audit controls (✅ CloudTrail, EKS audit logs)
-- Access controls (✅ IAM, RBAC)
-- Data retention policies (✅ DynamoDB TTL)
-- Business Associate Agreement (BAA) with AWS (🚧 Required for compliance)
+- Encryption at rest and in transit (implemented)
+- Audit controls (CloudTrail, EKS audit logs)
+- Access controls (IAM, RBAC)
+- Data retention policies (DynamoDB TTL)
+- Business Associate Agreement (BAA) with AWS (required for compliance)
 
 **Note**: Ensure alerts do not contain Protected Health Information (PHI) in labels or annotations.
 
@@ -848,12 +850,7 @@ Use this checklist before deploying to production:
 
 ## Security Contact
 
-For security issues or vulnerabilities, please report to:
-
-- **Email**: security@example.com (replace with your actual contact)
-- **Bug Bounty Program**: (if applicable)
-
-**Please DO NOT** open public GitHub issues for security vulnerabilities.
+Report vulnerabilities privately, as described in [SECURITY.md](../SECURITY.md). Please don't open public issues for them.
 
 ---
 
@@ -865,8 +862,3 @@ For security issues or vulnerabilities, please report to:
 - [OWASP Top 10](https://owasp.org/www-project-top-ten/)
 - [CIS Benchmarks for AWS and Kubernetes](https://www.cisecurity.org/cis-benchmarks/)
 
----
-
-**Last Updated**: 2026-02-02
-**Reviewed By**: SRE Platform Team
-**Next Review**: 2026-05-02 (quarterly)

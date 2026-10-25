@@ -106,9 +106,9 @@ Prometheus Alertmanager sends alerts in the following format:
 |-------|------|-------------|
 | `alerts[].annotations` | object | Human-readable metadata (summary, description, runbook_url) |
 | `alerts[].annotations.runbook_action` | string | Override the default action: `degrade`, `scale`, `restart`, `degrade_or_scale` or `drain_node`. `notify_only` skips the runbook: the alert is recorded and sent to SNS, nothing more. Any other value escalates a critical alert. |
-| `alerts[].annotations.desired_replicas` | string | Replica count for `scale` and `degrade_or_scale` (default 4, at most `remediation_max_replicas`). With an HPA, this becomes the HPA's minimum instead. |
-| `alerts[].labels.namespace`, `alerts[].labels.deployment` | string | What the runbook acts on. Without them it uses the `service` label as the deployment, then `apps/checkout`. Namespaces other than `apps` are refused. |
-| `alerts[].labels.node` | string | The node `drain_node` drains. `NodeUnderPressure` carries it from kube-state-metrics. Only nodes labelled `nodegroup=apps` are drained. |
+| `alerts[].annotations.desired_replicas` | string | Replica count for `scale` and `degrade_or_scale` (default `default_scale_replicas`, 4, at most `remediation_max_replicas`). With an HPA, this becomes the HPA's minimum instead. |
+| `alerts[].labels.namespace`, `alerts[].labels.deployment` | string | What the runbook acts on. Without them it uses the first of `remediation_namespaces` and the `service` label as the deployment, then `default_deployment`; with neither, the action is refused and the incident escalates. Namespaces outside `remediation_namespaces` are refused. |
+| `alerts[].labels.node` | string | The node `drain_node` drains. `NodeUnderPressure` carries it from kube-state-metrics. Only nodes with `drainable_node_label` (`nodegroup=apps` in `examples/complete`) are drained, and nothing is drained when it isn't set. |
 | `alerts[].startsAt` | string (ISO 8601) | When the alert started firing |
 | `alerts[].endsAt` | string (ISO 8601) | When the alert resolved (0001-01-01 means still firing) |
 | `alerts[].generatorURL` | string | Link to Prometheus query |
@@ -222,7 +222,7 @@ terraform -chdir=examples/complete output -raw alertmanager_api_key
 terraform -chdir=examples/complete output -raw datadog_api_key
 ```
 
-`scripts/deploy.sh` gives Alertmanager its key. Set `webhook_require_api_key = false` to accept requests without one.
+`examples/complete/scripts/deploy.sh` gives Alertmanager its key. Set `webhook_require_api_key = false` to accept requests without one.
 
 **Header**: `X-API-Key: YOUR_API_KEY`
 
@@ -458,7 +458,7 @@ curl -X POST "$WEBHOOK_URL" \
 
 Configure Alertmanager to send alerts to the webhook:
 
-`helm/observability/alertmanager-values.yaml` sets this up through kube-prometheus-stack; the equivalent plain **alertmanager.yml** is:
+`examples/complete/helm/observability/alertmanager-values.yaml` sets this up through kube-prometheus-stack; the equivalent plain **alertmanager.yml** is:
 ```yaml
 global:
   resolve_timeout: 5m

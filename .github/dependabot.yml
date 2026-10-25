@@ -1,0 +1,37 @@
+# Weekly update PRs, one per ecosystem and directory, with minor and patch
+# bumps grouped together
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: terraform
+    directories:
+      - /
+      - /examples/complete
+      - /examples/existing-cluster
+    schedule:
+      interval: weekly
+    groups:
+      terraform:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: pip
+    directories:
+      - /lambda/alert_ingest
+      - /lambda/runbook_action
+      - /stepfunctions/tests
+      - /examples/complete/apps/checkout
+    schedule:
+      interval: weekly
+    groups:
+      pip:
+        patterns: ["*"]
+        update-types: [minor, patch]

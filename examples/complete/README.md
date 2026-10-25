@@ -24,7 +24,7 @@ State is local; there's no backend block.
 
 ## Deploy
 
-From the repo root, in this order:
+From this directory, in this order (the scripts also work from anywhere else, since they change to this directory first):
 
 ```bash
 bash scripts/bootstrap.sh       # terraform init and apply here, then configure kubectl
@@ -37,7 +37,7 @@ bash scripts/deploy.sh          # Alertmanager's API key, kube-prometheus-stack,
 
 Both Lambdas run without reserved concurrency by default (`alert_ingest_reserved_concurrency` and `runbook_action_reserved_concurrency` are -1). New accounts often have a concurrency limit of 50, and AWS keeps at least 50 unreserved, so any reservation fails there. If your account has room, set `runbook_action_reserved_concurrency` (10 is a good cap) to limit how many remediations hit the cluster at once.
 
-[docs/DEMO.md](../../docs/DEMO.md) walks through breaking the app and watching the runbook fix it.
+[DEMO.md](DEMO.md) walks through breaking the app and watching the runbook fix it.
 
 ## Slack and email
 
@@ -58,7 +58,7 @@ Slack goes through Amazon Q Developer in chat applications (AWS Chatbot). Before
 
 After the apply, run `/invite @Amazon Q` in the channel. Without that the configuration exists but nothing posts.
 
-Setting both IDs turns on the module's `chat_notifications`, and `chatbot.tf` subscribes the channel to `chat_topic_arn`. The Chatbot API isn't in `us-east-1`, so `chatbot.tf` uses a second provider in `chatbot_region` (default `us-east-2`). The channel's role has no permissions, and the channel has a `ReadOnlyAccess` guardrail. Messages look like:
+Setting both IDs turns on the module's `create_chat_topic`, and `chatbot.tf` subscribes the channel to `chat_topic_arn`. The Chatbot API isn't in `us-east-1`, so `chatbot.tf` uses a second provider in `chatbot_region` (default `us-east-2`). The channel's role has no permissions, and the channel has a `ReadOnlyAccess` guardrail. Messages look like:
 
 - `critical: CheckoutHighErrorRate is firing on checkout`
 - `Escalated: CheckoutHighErrorRate on checkout needs a person`
@@ -97,4 +97,30 @@ bash scripts/destroy.sh         # deletion protection and the trail bucket's pro
 
 ## Cost
 
-Roughly $460 a month running continuously in `us-east-1`, plus $88 with `enable_vpc_endpoints`. The breakdown is in [docs/architecture/README.md](../../docs/architecture/README.md#monthly-cost-estimate).
+Roughly $460 a month running continuously, at `us-east-1` on-demand prices with the default variables, before free tiers. The cluster is nearly all of it; the alert pipeline is small even at 1000 alerts a day, and it plus the KMS key line is what the module costs on its own. Tear it down when you're done.
+
+| Item | Monthly |
+| --- | --- |
+| EKS control plane ($0.10/hour) | $73 |
+| 4 × m6i.large nodes, 2 per node group ($0.096/hour each) | $280 |
+| EBS root volumes, 4 × 20 GB gp3 | $6 |
+| 2 NAT gateways ($0.045/hour each, plus $0.045/GB processed) | $66 plus data |
+| Load balancer for the checkout ingress ($0.0225/hour plus LCUs) | about $16 plus usage |
+| KMS key ($1, plus $0.03 per 10,000 requests) | about $1 |
+| CloudTrail management events (the first trail in an account is free) and its S3 bucket | under $1 |
+| S3 and DynamoDB gateway endpoints | $0 |
+| EKS control plane logs, all five types ($0.50/GB ingested) | a few dollars, depending on cluster activity |
+| Alert pipeline at 1000 alerts/day (below) | about $14 |
+| **Total** | **about $460** |
+| Optional: 6 interface endpoints in 2 AZs (`enable_vpc_endpoints`, $0.01/hour each per AZ, plus $0.01/GB) | add $88 |
+| Optional: the execute-api endpoint for `webhook_private` (2 AZs) | add $15 |
+
+The alert pipeline line assumes 1000 webhook calls a day (30,000 a month), one alert each, half of them firing alerts that each start a runbook run of about 30 state transitions (remediate, then poll for up to 10 minutes):
+
+- API Gateway (REST): 30,000 requests × $3.50/M = $0.11
+- Lambda: alert_ingest (256 MB, about 100 ms) and runbook_action (512 MB, about 2 s per action): about $0.30
+- EventBridge: about 60,000 custom events × $1/M = $0.06, plus a few cents for the archive
+- Step Functions: 15,000 runbook runs × 30 transitions = 450,000 × $25/M = $11.25; the Express incident recorder, 45,000 runs: about $0.05
+- DynamoDB on demand: about 150,000 writes (index included) and 135,000 reads: about $0.12
+- SNS: 45,000 publishes, $0.02; email deliveries, $2 per 100,000 after the first 1,000: about $0.90. The chat topic doubles the publishes; Amazon Q Developer in chat applications itself is free.
+- CloudWatch Logs for the pipeline, about 1 GB at $0.50/GB: $0.50

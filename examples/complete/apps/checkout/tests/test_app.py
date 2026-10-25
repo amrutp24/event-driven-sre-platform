@@ -10,12 +10,10 @@ Tests cover:
 - Prometheus metrics
 - Chaos engineering features
 """
-import pytest
-import os
-import sys
-import time
 import importlib
-from app import app as flask_app
+import time
+
+import pytest
 
 
 class TestHealthEndpoints:
@@ -324,10 +322,6 @@ class TestMetricsAccuracy:
         importlib.reload(app)
         client = app.app.test_client()
 
-        # Get initial metrics
-        initial_response = client.get('/metrics')
-        initial_data = initial_response.data.decode('utf-8')
-
         # Make 3 checkout requests
         for _ in range(3):
             client.get('/checkout')
@@ -450,4 +444,3 @@ def test_coverage_report():
 
     Overall expected coverage: >60%
     """
-    pass

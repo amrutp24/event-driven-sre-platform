@@ -1,17 +1,28 @@
+# Terraform
 **/.terraform/
 **/.terraform.lock.hcl
-**/terraform.tfstate
-**/terraform.tfstate.*
-**/node_modules/
-**/__pycache__/
-**/*.pyc
-.DS_Store
-
-**/vendor/
-
-# test coverage data
-.coverage
+*.tfstate
+*.tfstate.*
+# Variable files can hold real values; ci.tfvars is the CI fixture
+*.tfvars
+!ci.tfvars
 
 # Lambda zips built by the module at plan time
-/build/
+build/
+
+# Python
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# Test coverage and results
+.coverage
 coverage.xml
+coverage/
+htmlcov/
+test-results.xml
+
+**/node_modules/
+**/vendor/
+.DS_Store

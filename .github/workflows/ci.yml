@@ -1,0 +1,285 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Read-only token by default; a job that needs more asks for it
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  TF_VAR_FILE: examples/complete/ci.tfvars
+  CHECKOV_VERSION: "3.3.26"
+  TFLINT_VERSION: "v0.64.0"
+  # sha256 of tflint_linux_amd64.zip, from the release's checksums.txt
+  TFLINT_SHA256: cca9d13e2e1d7a2c627af60ff899a3c9b74212899416aeb96ec764d2ef954537
+  TERRAFORM_DOCS_IMAGE: quay.io/terraform-docs/terraform-docs:0.24.0-amd64
+
+# Every action is pinned to a commit, with its version in the comment
+jobs:
+  terraform-security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install Checkov
+        run: pip install "checkov==${CHECKOV_VERSION}"
+
+      # Settings and skipped checks (with reasons) are in .checkov.yaml.
+      # soft-fail keeps failed checks from failing the job, but a Checkov
+      # error still does. pipefail (shell: bash) keeps tee from hiding it.
+      # The module is the repo root; the example is scanned on its own.
+      - name: Run Checkov
+        shell: bash
+        run: |
+          mkdir -p reports
+          checkov --config-file .checkov.yaml -d . --framework terraform --skip-path examples | tee reports/checkov-module.txt
+          checkov --config-file .checkov.yaml -d examples/complete --var-file ${{ env.TF_VAR_FILE }} | tee reports/checkov-complete.txt
+
+      - name: Upload Checkov results
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: terraform-security-results
+          path: reports/
+          retention-days: 30
+
+  container-security-scan:
+    runs-on: ubuntu-latest
+    # Uploading to the Security tab needs security-events: write
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Pinned to a commit, not @master (trivy-action was compromised in March 2026).
+      - name: Scan the repo with Trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Build the checkout image
+        run: docker build -t checkout:ci examples/complete/apps/checkout
+
+      # Fails the job on a critical vulnerability that has a fix available
+      - name: Scan the checkout image with Trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: 'image'
+          image-ref: 'checkout:ci'
+          format: 'table'
+          severity: 'CRITICAL'
+          ignore-unfixed: true
+          exit-code: '1'
+          skip-setup-trivy: true
+
+  lambda-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        lambda: [alert_ingest, runbook_action]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+
+      - name: Install test dependencies
+        run: |
+          cd lambda/${{ matrix.lambda }}
+          pip install -r requirements-dev.txt
+
+      - name: Run unit tests with moto mocks
+        env:
+          AWS_DEFAULT_REGION: us-east-1
+          REGION: us-east-1
+          CLUSTER_NAME: event-driven-sre-ci-eks
+          ALLOWED_NAMESPACES: apps
+          MAX_REPLICAS: "10"
+          DEGRADED_PARAM: /checkout/degraded_mode
+        run: |
+          cd lambda/${{ matrix.lambda }}
+          pytest tests/ -v --cov --cov-report=xml --cov-report=html --junitxml=test-results.xml
+
+      - name: Upload coverage reports
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: ${{ matrix.lambda }}-coverage
+          path: |
+            lambda/${{ matrix.lambda }}/coverage.xml
+            lambda/${{ matrix.lambda }}/htmlcov/
+            lambda/${{ matrix.lambda }}/test-results.xml
+          retention-days: 30
+
+  # Runs both state machine templates through a local simulator, with the
+  # Lambda handlers on either side of the runbook
+  stepfunctions-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+
+      - name: Install test dependencies
+        run: pip install -r stepfunctions/tests/requirements.txt
+
+      - name: Run state machine tests
+        run: |
+          cd stepfunctions
+          pytest tests/ -v --junitxml=test-results.xml
+
+      - name: Upload test results
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: stepfunctions-test-results
+          path: stepfunctions/test-results.xml
+          retention-days: 30
+
+  # terraform test against a mocked AWS provider (tests/module.tftest.hcl).
+  # Mock providers need Terraform 1.7+.
+  module-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: "1.x"
+          terraform_wrapper: false
+
+      - name: Run module tests
+        run: |
+          terraform init -input=false -backend=false
+          terraform test -no-color
+
+  # 1.5.7 is the oldest version the module supports (versions.tf), 1.x the newest
+  terraform-validate:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        terraform: ["1.5.7", "1.x"]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ matrix.terraform }}
+          terraform_wrapper: false
+
+      - name: Terraform fmt check
+        run: terraform fmt -check -recursive -diff
+
+      # The module is the repo root; each example calls it with source = "../.."
+      - name: Terraform validate (module and examples)
+        shell: bash
+        run: |
+          for dir in . examples/complete examples/existing-cluster; do
+            echo "::group::$dir"
+            terraform -chdir="$dir" init -input=false -backend=false
+            terraform -chdir="$dir" validate -no-color
+            echo "::endgroup::"
+          done
+
+  tflint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install tflint
+        run: |
+          curl -fsSL -o tflint.zip "https://github.com/terraform-linters/tflint/releases/download/${TFLINT_VERSION}/tflint_linux_amd64.zip"
+          echo "${TFLINT_SHA256}  tflint.zip" | sha256sum --check
+          unzip -q tflint.zip
+          sudo install tflint /usr/local/bin/
+          tflint --version
+
+      - name: Run tflint
+        run: |
+          tflint --chdir=. --config="$PWD/.tflint.hcl"
+          tflint --chdir=examples/complete --config="$PWD/.tflint.hcl" --var-file=ci.tfvars
+
+  # The README's Terraform tables come from terraform-docs (.terraform-docs.yml)
+  terraform-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check the README's tables are up to date
+        run: |
+          docker run --rm -v "$PWD:/terraform-docs" -w /terraform-docs "$TERRAFORM_DOCS_IMAGE" .
+          if ! git diff --exit-code README.md; then
+            echo "::error::README.md is out of date. Run terraform-docs (see .terraform-docs.yml) and commit the result."
+            exit 1
+          fi
+
+  application-tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: examples/complete/apps/checkout
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run application tests
+        run: pytest tests/ -v --cov --cov-report=xml --junitxml=test-results.xml
+
+      - name: Upload app coverage reports
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: app-coverage
+          path: |
+            examples/complete/apps/checkout/coverage.xml
+            examples/complete/apps/checkout/htmlcov/
+            examples/complete/apps/checkout/test-results.xml
+          retention-days: 30

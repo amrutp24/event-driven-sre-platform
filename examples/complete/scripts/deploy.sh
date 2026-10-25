@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Run from examples/complete, wherever the script is called from
+cd "$(dirname "$0")/.."
+
 helm repo add prometheus-community https://prometheus-community.github.io/helm-charts >/dev/null
 helm repo update >/dev/null
 
-WEBHOOK_URL="$(terraform -chdir=examples/complete output -raw alert_webhook_url)"
-API_KEY="$(terraform -chdir=examples/complete output -raw alertmanager_api_key)"
-CHECKOUT_ROLE_ARN="$(terraform -chdir=examples/complete output -raw checkout_role_arn)"
-REGION="$(terraform -chdir=examples/complete output -raw aws_region)"
-IMAGE_REPO="$(terraform -chdir=examples/complete output -raw checkout_image_repository)"
+WEBHOOK_URL="$(terraform output -raw alert_webhook_url)"
+API_KEY="$(terraform output -raw alertmanager_api_key)"
+CHECKOUT_ROLE_ARN="$(terraform output -raw checkout_role_arn)"
+REGION="$(terraform output -raw aws_region)"
+IMAGE_REPO="$(terraform output -raw checkout_image_repository)"
 IMAGE_TAG="${IMAGE_TAG:-$(git rev-parse --short HEAD)}"
 
 # The tag follows the current commit, so a commit since the last build means a
@@ -48,6 +51,6 @@ helm upgrade --install checkout helm/checkout -n apps --create-namespace \
   --set env.AWS_REGION="$REGION"
 
 echo "[5/5] Allow the runbook Lambda to remediate in apps"
-kubectl apply -f k8s/rbac/remediation-role.yaml
+terraform output -raw rbac_manifest | kubectl apply -f -
 
 echo "Deployed."

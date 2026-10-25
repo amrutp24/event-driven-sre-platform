@@ -5,7 +5,8 @@ resource "aws_dynamodb_table" "incidents" {
   billing_mode = "PAY_PER_REQUEST"
   hash_key     = "incident_id"
 
-  # scripts/destroy.sh turns this off before tearing down
+  # Set incidents_deletion_protection = false and apply before destroying
+  # (examples/complete/scripts/destroy.sh does this)
   deletion_protection_enabled = var.incidents_deletion_protection
 
   attribute {
