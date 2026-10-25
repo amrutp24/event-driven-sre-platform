@@ -18,6 +18,21 @@ module "sre" {
   create_kms_key = false
   kms_key_arn    = aws_kms_key.platform.arn
 
+  # The checkout app's alerts (helm/observability) and what the runbook does
+  # for each. drain_node only touches the apps node group.
+  runbook_routes = {
+    CheckoutHighErrorRate  = { action = "degrade_or_scale" }
+    CheckoutHighLatencyP95 = { action = "degrade_or_scale" }
+    CheckoutSLOBurnFast    = { action = "degrade_or_scale" }
+    CheckoutDown           = { action = "restart" }
+    NodeUnderPressure      = { action = "drain_node" }
+  }
+  remediation_namespaces       = ["apps"]
+  default_deployment           = "checkout"
+  degraded_mode_deployment     = "checkout"
+  degraded_mode_parameter_name = "/checkout/degraded_mode"
+  drainable_node_label         = "nodegroup=apps"
+
   webhook_private         = var.webhook_private
   webhook_require_api_key = var.webhook_require_api_key
 

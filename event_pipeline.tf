@@ -166,10 +166,12 @@ resource "aws_sfn_state_machine" "runbook" {
     event_bus_name            = aws_cloudwatch_event_bus.sre.name
     auto_remediate_severities = join(", ", formatlist("'%s'", var.auto_remediate_severities))
     routes                    = jsonencode(var.runbook_routes)
-    # What the runbook targets when the alert doesn't name a namespace or deployment
+    # What the runbook targets when the alert doesn't name a namespace or
+    # deployment. An empty deployment is rejected by runbook_action, so the
+    # incident escalates.
     default_namespace     = var.remediation_namespaces[0]
-    default_deployment    = var.default_deployment
-    default_replicas      = 4
+    default_deployment    = var.default_deployment != null ? var.default_deployment : ""
+    default_replicas      = var.default_scale_replicas
     stabilization_seconds = var.stabilization_seconds
     verify_poll_seconds   = var.verify_poll_seconds
     verify_attempts       = local.verify_attempts
@@ -185,6 +187,15 @@ resource "aws_sfn_state_machine" "runbook" {
   depends_on = [aws_iam_role_policy.sfn_policy]
 
   tags = var.tags
+
+  # Here because a variable validation can't refer to another variable
+  # before Terraform 1.9
+  lifecycle {
+    precondition {
+      condition     = var.default_scale_replicas <= var.remediation_max_replicas
+      error_message = "default_scale_replicas can't be more than remediation_max_replicas."
+    }
+  }
 }
 
 # Zipped at plan time from the source in lambda/. Neither function has
@@ -251,10 +262,10 @@ resource "aws_lambda_function" "alert_ingest" {
 
 # degrade sets this to "true" and degraded_mode_deployment reads it. The value
 # is left alone after creation so an apply doesn't undo a remediation.
-resource "aws_ssm_parameter" "checkout_degraded_mode" {
-  count = var.create_degraded_mode_parameter ? 1 : 0
+resource "aws_ssm_parameter" "degraded_mode" {
+  count = local.create_degraded_mode_parameter ? 1 : 0
 
-  name  = var.degraded_mode_parameter_name
+  name  = local.degraded_mode_parameter_name
   type  = "String"
   value = "false"
   tags  = var.tags
@@ -262,6 +273,11 @@ resource "aws_ssm_parameter" "checkout_degraded_mode" {
   lifecycle {
     ignore_changes = [value]
   }
+}
+
+moved {
+  from = aws_ssm_parameter.checkout_degraded_mode
+  to   = aws_ssm_parameter.degraded_mode
 }
 
 # Runbook action Lambda: performs remediation against EKS and/or SSM
@@ -282,30 +298,35 @@ resource "aws_iam_role_policy" "runbook_lambda_policy" {
   role = aws_iam_role.runbook_lambda_role.id
   policy = jsonencode({
     Version = "2012-10-17",
-    Statement = [
-      {
-        Effect   = "Allow",
-        Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
-        Resource = "arn:${local.partition}:logs:${local.region}:${local.account_id}:log-group:/aws/lambda/${var.name}-runbook-action:*"
-      },
-      {
-        Effect   = "Allow",
-        Action   = ["eks:DescribeCluster"],
-        Resource = local.cluster_arn
-      },
-      {
-        Effect   = "Allow",
-        Action   = ["ssm:PutParameter", "ssm:GetParameter"],
-        Resource = local.degraded_mode_parameter_arn
-      },
-      {
-        Effect = "Allow",
-        # sts:GetCallerIdentity doesn't support resource-level permissions
-        # This is required for the Lambda to authenticate with EKS
-        Action   = ["sts:GetCallerIdentity"],
-        Resource = "*"
-      }
-    ]
+    Statement = concat(
+      [
+        {
+          Effect   = "Allow",
+          Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+          Resource = "arn:${local.partition}:logs:${local.region}:${local.account_id}:log-group:/aws/lambda/${var.name}-runbook-action:*"
+        },
+        {
+          Effect   = "Allow",
+          Action   = ["eks:DescribeCluster"],
+          Resource = local.cluster_arn
+        },
+        {
+          Effect = "Allow",
+          # sts:GetCallerIdentity doesn't support resource-level permissions
+          # This is required for the Lambda to authenticate with EKS
+          Action   = ["sts:GetCallerIdentity"],
+          Resource = "*"
+        },
+      ],
+      # Only with degraded mode on
+      local.degraded_mode_enabled ? [
+        {
+          Effect   = "Allow",
+          Action   = ["ssm:PutParameter", "ssm:GetParameter"],
+          Resource = local.degraded_mode_parameter_arn
+        },
+      ] : [],
+    )
   })
 }
 
@@ -358,8 +379,9 @@ resource "aws_lambda_function" "runbook_action" {
     aws_cloudwatch_log_group.runbook_action,
   ]
 
+  # degrade and drain_node are rejected when their variables are left out
   environment {
-    variables = {
+    variables = { for k, v in {
       REGION                = local.region
       CLUSTER_NAME          = var.cluster_name
       ALLOWED_NAMESPACES    = join(",", var.remediation_namespaces)
@@ -368,7 +390,7 @@ resource "aws_lambda_function" "runbook_action" {
       DEGRADED_PARAM        = local.degraded_mode_parameter_name
       DRAINABLE_NODE_LABEL  = var.drainable_node_label
       MIN_SCHEDULABLE_NODES = var.drain_min_schedulable_nodes
-    }
+    } : k => tostring(v) if v != null }
   }
 
   tags = var.tags

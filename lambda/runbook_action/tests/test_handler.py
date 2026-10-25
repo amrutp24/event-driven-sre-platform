@@ -820,12 +820,23 @@ class TestDrainNode:
 
         assert handler.lambda_handler(drain_payload, {})['cordoned'] is True
 
-    def test_defaults_when_env_is_unset(self, k8s, drain_payload, monkeypatch):
-        monkeypatch.delenv('DRAINABLE_NODE_LABEL')
+    def test_min_schedulable_nodes_defaults_to_one(self, k8s, drain_payload, monkeypatch):
         monkeypatch.delenv('MIN_SCHEDULABLE_NODES')
         drainable(k8s.api, [])
 
         assert handler.lambda_handler(drain_payload, {})['cordoned'] is True
+
+    @pytest.mark.parametrize('label', [None, ''])
+    def test_not_configured_without_a_drainable_label(self, k8s, drain_payload, monkeypatch, label):
+        """drainable_node_label null leaves DRAINABLE_NODE_LABEL out of the environment"""
+        if label is None:
+            monkeypatch.delenv('DRAINABLE_NODE_LABEL')
+        else:
+            monkeypatch.setenv('DRAINABLE_NODE_LABEL', label)
+
+        with pytest.raises(handler.InvalidRequest, match="drain_node isn't configured"):
+            handler.lambda_handler(drain_payload, {})
+        assert_untouched(k8s)
 
 
 class TestInvalidRequest:
@@ -899,11 +910,26 @@ class TestInvalidRequest:
         with pytest.raises(handler.InvalidRequest, match='only wired up for payments-api'):
             handler.lambda_handler(runbook_payload, {})
 
-    def test_degraded_deployment_defaults_to_checkout(self, k8s, runbook_payload, monkeypatch):
-        monkeypatch.delenv('DEGRADED_DEPLOYMENT')
-        runbook_payload['action'] = 'degrade'
+    @pytest.mark.parametrize('action', ['degrade', 'degrade_or_scale'])
+    @pytest.mark.parametrize('unset', ['DEGRADED_DEPLOYMENT', 'DEGRADED_PARAM'])
+    def test_degrade_not_configured(self, k8s, runbook_payload, monkeypatch, action, unset):
+        """degraded_mode_deployment null leaves both out of the environment"""
+        monkeypatch.delenv(unset)
+        runbook_payload['action'] = action
 
-        assert handler.lambda_handler(runbook_payload, {})['degraded'] is True
+        with pytest.raises(handler.InvalidRequest, match="degraded mode isn't configured"):
+            handler.lambda_handler(runbook_payload, {})
+        assert_untouched(k8s)
+
+    def test_scale_and_restart_work_without_degraded_mode(self, k8s, runbook_payload, monkeypatch):
+        monkeypatch.delenv('DEGRADED_DEPLOYMENT')
+        monkeypatch.delenv('DEGRADED_PARAM')
+        runbook_payload['action'] = 'scale'
+        k8s.api.on('GET', HPA_PATH, (404, 'not found'))
+        k8s.api.on('PATCH', DEPLOYMENT_PATH, (200, {}))
+
+        assert handler.lambda_handler(runbook_payload, {})['scaled_to'] == 4
+        k8s.ssm.put_parameter.assert_not_called()
 
     @pytest.mark.parametrize('action', ['scale', 'degrade_or_scale'])
     @pytest.mark.parametrize('replicas', [None, 'four', '', '-1', '2.5', 2.5, True, [4], 0, '0', 11, '11'])
@@ -975,17 +1001,13 @@ class TestEnvironmentVariables:
 
         assert len(k8s.api.calls) == 1
 
-    def test_allowed_namespaces_defaults_to_apps(self, k8s, runbook_payload, monkeypatch):
+    def test_no_allowed_namespaces_allows_none(self, k8s, runbook_payload, monkeypatch):
         monkeypatch.delenv('ALLOWED_NAMESPACES')
         runbook_payload['action'] = 'restart'
-        k8s.api.on('PATCH', DEPLOYMENT_PATH, (200, {}))
 
-        handler.lambda_handler(runbook_payload, {})
-        assert len(k8s.api.calls) == 1
-
-        runbook_payload['namespace'] = 'payments'
-        with pytest.raises(handler.InvalidRequest, match=r'ALLOWED_NAMESPACES \(apps\)'):
+        with pytest.raises(handler.InvalidRequest, match=r'ALLOWED_NAMESPACES \(\)'):
             handler.lambda_handler(runbook_payload, {})
+        assert_untouched(k8s)
 
     def test_max_replicas_override(self, k8s, runbook_payload, monkeypatch):
         monkeypatch.setenv('MAX_REPLICAS', '20')

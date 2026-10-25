@@ -65,6 +65,7 @@ variables {
   vpc_id                    = "vpc-0123456789abcdef0"
   subnet_ids                = ["subnet-0aaaaaaaaaaaaaaaa", "subnet-0bbbbbbbbbbbbbbbb"]
   cluster_security_group_id = "sg-0123456789abcdef0"
+  remediation_namespaces    = ["apps"]
 }
 
 run "defaults" {
@@ -104,18 +105,17 @@ run "defaults" {
   }
 
   assert {
-    condition     = length(keys(jsondecode(aws_sfn_state_machine.runbook.definition).States.EvaluateAlert.Assign.routes)) == 5
-    error_message = "The runbook should render the 5 default routes."
+    condition     = length(keys(jsondecode(aws_sfn_state_machine.runbook.definition).States.EvaluateAlert.Assign.routes)) == 0
+    error_message = "No alert should be routed to an action by default."
   }
 
   assert {
-    condition     = jsondecode(aws_sfn_state_machine.runbook.definition).States.EvaluateAlert.Assign.routes.NodeUnderPressure.action == "drain_node"
-    error_message = "NodeUnderPressure should route to drain_node by default."
-  }
-
-  assert {
-    condition     = strcontains(jsondecode(aws_sfn_state_machine.runbook.definition).States.ChooseAction.Assign.target.namespace, "'apps'")
-    error_message = "The runbook's default namespace should be the first remediation namespace."
+    condition = (
+      strcontains(jsondecode(aws_sfn_state_machine.runbook.definition).States.ChooseAction.Assign.target.namespace, "'apps'")
+      && endswith(jsondecode(aws_sfn_state_machine.runbook.definition).States.ChooseAction.Assign.target.deployment, ": '')) %}")
+      && endswith(jsondecode(aws_sfn_state_machine.runbook.definition).States.ChooseAction.Assign.target.replicas, ": 4 %}")
+    )
+    error_message = "The runbook should default to the first remediation namespace, no deployment and 4 replicas."
   }
 
   assert {
@@ -129,8 +129,18 @@ run "defaults" {
   }
 
   assert {
-    condition     = strcontains(aws_iam_role_policy.runbook_lambda_policy.policy, "cluster/test-cluster") && strcontains(aws_iam_role_policy.runbook_lambda_policy.policy, aws_ssm_parameter.checkout_degraded_mode[0].arn)
-    error_message = "runbook_action's policy should be scoped to the cluster and the degraded-mode parameter."
+    condition     = strcontains(aws_iam_role_policy.runbook_lambda_policy.policy, "cluster/test-cluster") && !strcontains(aws_iam_role_policy.runbook_lambda_policy.policy, "ssm:")
+    error_message = "runbook_action's policy should be scoped to the cluster, with no SSM access while degraded mode is off."
+  }
+
+  assert {
+    condition = (
+      length(aws_ssm_parameter.degraded_mode) == 0
+      && output.degraded_mode_parameter_name == null
+      && output.degraded_mode_parameter_arn == null
+      && length(setintersection(keys(aws_lambda_function.runbook_action.environment[0].variables), ["DEGRADED_DEPLOYMENT", "DEGRADED_PARAM", "DRAINABLE_NODE_LABEL"])) == 0
+    )
+    error_message = "Degraded mode and drain_node should be off by default: no parameter, and nothing in runbook_action's environment."
   }
 
   assert {
@@ -158,9 +168,102 @@ run "defaults" {
   }
 
   assert {
-    condition     = output.kubernetes_group == "sre-remediation" && output.degraded_mode_parameter_name == "/checkout/degraded_mode"
-    error_message = "Outputs should report the Kubernetes group and the degraded-mode parameter."
+    condition     = output.kubernetes_group == "sre-remediation"
+    error_message = "Outputs should report the Kubernetes group."
   }
+}
+
+run "checkout_demo" {
+  command = apply
+
+  # What examples/complete passes
+  variables {
+    runbook_routes = {
+      CheckoutHighErrorRate  = { action = "degrade_or_scale" }
+      CheckoutHighLatencyP95 = { action = "degrade_or_scale" }
+      CheckoutSLOBurnFast    = { action = "degrade_or_scale" }
+      CheckoutDown           = { action = "restart" }
+      NodeUnderPressure      = { action = "drain_node" }
+    }
+    default_deployment           = "checkout"
+    degraded_mode_deployment     = "checkout"
+    degraded_mode_parameter_name = "/checkout/degraded_mode"
+    drainable_node_label         = "nodegroup=apps"
+  }
+
+  assert {
+    condition     = length(keys(jsondecode(aws_sfn_state_machine.runbook.definition).States.EvaluateAlert.Assign.routes)) == 5 && jsondecode(aws_sfn_state_machine.runbook.definition).States.EvaluateAlert.Assign.routes.NodeUnderPressure.action == "drain_node"
+    error_message = "The runbook should render the 5 checkout routes."
+  }
+
+  assert {
+    condition     = strcontains(jsondecode(aws_sfn_state_machine.runbook.definition).States.ChooseAction.Assign.target.deployment, "'checkout'")
+    error_message = "The runbook's default deployment should be checkout."
+  }
+
+  assert {
+    condition = (
+      length(aws_ssm_parameter.degraded_mode) == 1
+      && aws_ssm_parameter.degraded_mode[0].name == "/checkout/degraded_mode"
+      && aws_ssm_parameter.degraded_mode[0].value == "false"
+      && output.degraded_mode_parameter_name == "/checkout/degraded_mode"
+      && output.degraded_mode_parameter_arn == aws_ssm_parameter.degraded_mode[0].arn
+    )
+    error_message = "Degraded mode should create the parameter and output it."
+  }
+
+  assert {
+    condition     = strcontains(aws_iam_role_policy.runbook_lambda_policy.policy, "ssm:PutParameter") && strcontains(aws_iam_role_policy.runbook_lambda_policy.policy, aws_ssm_parameter.degraded_mode[0].arn)
+    error_message = "runbook_action should be allowed to set the degraded-mode parameter."
+  }
+
+  assert {
+    condition = (
+      aws_lambda_function.runbook_action.environment[0].variables["DEGRADED_DEPLOYMENT"] == "checkout"
+      && aws_lambda_function.runbook_action.environment[0].variables["DEGRADED_PARAM"] == "/checkout/degraded_mode"
+      && aws_lambda_function.runbook_action.environment[0].variables["DRAINABLE_NODE_LABEL"] == "nodegroup=apps"
+    )
+    error_message = "runbook_action should get the degraded-mode deployment, its parameter and the drainable label."
+  }
+}
+
+run "degraded_mode_parameter_name_default" {
+  command = apply
+
+  variables {
+    name                     = "payments-sre"
+    degraded_mode_deployment = "payments-api"
+  }
+
+  assert {
+    condition     = aws_ssm_parameter.degraded_mode[0].name == "/payments-sre/degraded-mode" && aws_lambda_function.runbook_action.environment[0].variables["DEGRADED_PARAM"] == "/payments-sre/degraded-mode"
+    error_message = "The parameter name should default to /<name>/degraded-mode."
+  }
+}
+
+run "default_scale_replicas" {
+  command = plan
+
+  variables {
+    default_scale_replicas   = 6
+    remediation_max_replicas = 6
+  }
+
+  assert {
+    condition     = endswith(jsondecode(aws_sfn_state_machine.runbook.definition).States.ChooseAction.Assign.target.replicas, ": 6 %}")
+    error_message = "The runbook should scale to default_scale_replicas when the alert doesn't say."
+  }
+}
+
+run "rejects_default_replicas_above_the_max" {
+  command = plan
+
+  variables {
+    default_scale_replicas   = 11
+    remediation_max_replicas = 10
+  }
+
+  expect_failures = [aws_sfn_state_machine.runbook]
 }
 
 run "bring_your_own_key" {
@@ -254,12 +357,14 @@ run "optional_pieces_off" {
 
   variables {
     create_access_entry            = false
+    degraded_mode_deployment       = "checkout"
+    degraded_mode_parameter_name   = "/checkout/degraded_mode"
     create_degraded_mode_parameter = false
     webhook_require_api_key        = false
   }
 
   assert {
-    condition     = length(aws_eks_access_entry.runbook_action) == 0 && length(aws_ssm_parameter.checkout_degraded_mode) == 0
+    condition     = length(aws_eks_access_entry.runbook_action) == 0 && length(aws_ssm_parameter.degraded_mode) == 0
     error_message = "The access entry and the parameter should be optional."
   }
 

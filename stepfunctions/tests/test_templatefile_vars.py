@@ -56,22 +56,36 @@ def _variable_block(name):
 
 
 def variable_default(name):
-    """A one-line default that's also valid JSON: a number, string or list."""
+    """A one-line default that's also valid JSON: a number, string, list or null."""
     default = re.search(r"^\s*default\s*=\s*(.+)$", _variable_block(name), re.MULTILINE)
     assert default, f"variable {name} has no default"
     return json.loads(default.group(1).strip())
 
 
+def _example_module_block():
+    text = (MODULE_DIR / "examples" / "complete" / "main.tf").read_text(encoding="utf-8")
+    start = re.search(r'^module\s+"sre"\s*\{', text, re.MULTILINE)
+    assert start, 'examples/complete/main.tf has no module "sre"'
+    return _block(text, start.end() - 1)
+
+
+def example_argument(name):
+    """A one-line argument to the sre module in examples/complete that's also valid JSON."""
+    value = re.search(r"^\s*" + re.escape(name) + r"\s*=\s*(.+)$", _example_module_block(), re.MULTILINE)
+    assert value, f"examples/complete doesn't set {name}"
+    return json.loads(value.group(1).strip())
+
+
 ROUTE_LINE = re.compile(r'^\s*([A-Za-z0-9_]+)\s*=\s*\{\s*action\s*=\s*"([^"]+)"\s*\}\s*$')
 
 
-def routes_default():
-    """var.runbook_routes' default, written one `Alertname = { action = "..." }` per line."""
-    block = _variable_block("runbook_routes")
-    default = re.search(r"^\s*default\s*=\s*\{", block, re.MULTILINE)
-    assert default, "variable runbook_routes has no default"
+def example_routes():
+    """examples/complete's runbook_routes, written one `Alertname = { action = "..." }` per line."""
+    block = _example_module_block()
+    start = re.search(r"^\s*runbook_routes\s*=\s*\{", block, re.MULTILINE)
+    assert start, "examples/complete doesn't set runbook_routes"
     routes = {}
-    for line in _block(block, default.end() - 1).splitlines():
+    for line in _block(block, start.end() - 1).splitlines():
         if line.strip():
             match = ROUTE_LINE.match(line)
             assert match, f"can't read this runbook_routes line: {line.strip()}"
@@ -106,7 +120,16 @@ def test_test_values_match_terraform_defaults():
     assert RUNBOOK_VARS["verify_attempts"] == math.floor(max(timeout - stabilization, 0) / poll) + 1
     assert RUNBOOK_VARS["auto_remediate_severities"] == ", ".join(
         f"'{s}'" for s in variable_default("auto_remediate_severities"))
+    assert RUNBOOK_VARS["default_replicas"] == variable_default("default_scale_replicas")
     assert RECORDER_VARS["ttl_seconds"] == variable_default("incident_retention_days") * 86400
-    assert RUNBOOK_VARS["default_namespace"] == variable_default("remediation_namespaces")[0]
-    assert RUNBOOK_VARS["default_deployment"] == variable_default("default_deployment")
-    assert json.loads(RUNBOOK_VARS["routes"]) == routes_default()
+
+
+def test_test_values_match_the_complete_example():
+    assert RUNBOOK_VARS["default_namespace"] == example_argument("remediation_namespaces")[0]
+    assert RUNBOOK_VARS["default_deployment"] == example_argument("default_deployment")
+    assert json.loads(RUNBOOK_VARS["routes"]) == example_routes()
+
+
+def test_module_defaults_route_nothing():
+    assert variable_default("runbook_routes") == {}
+    assert variable_default("default_deployment") is None

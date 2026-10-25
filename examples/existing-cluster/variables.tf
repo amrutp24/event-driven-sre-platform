@@ -22,3 +22,16 @@ variable "cluster_security_group_id" {
   description = "The cluster security group. The module adds a 443 ingress rule to it for the Lambda."
   type        = string
 }
+
+variable "remediation_namespaces" {
+  description = "Namespaces the runbook may change. The first is the target when an alert doesn't name one."
+  type        = list(string)
+}
+
+variable "runbook_routes" {
+  description = "Action for each alertname, e.g. { MyAppDown = { action = \"restart\" } }"
+  type = map(object({
+    action = string
+  }))
+  default = {}
+}

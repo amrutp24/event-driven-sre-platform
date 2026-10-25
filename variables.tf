@@ -49,7 +49,6 @@ variable "kubernetes_group" {
 variable "remediation_namespaces" {
   description = "Namespaces runbook_action may act in. The first is the runbook's target when an alert doesn't name one."
   type        = list(string)
-  default     = ["apps"]
 
   validation {
     condition     = length(var.remediation_namespaces) > 0
@@ -58,23 +57,17 @@ variable "remediation_namespaces" {
 }
 
 variable "default_deployment" {
-  description = "Deployment the runbook targets when an alert doesn't name one"
+  description = "Deployment the runbook targets when an alert names neither a deployment nor a service. With null, such an alert is escalated."
   type        = string
-  default     = "checkout"
+  default     = null
 }
 
 variable "runbook_routes" {
-  description = "Which action the runbook takes for each alertname"
+  description = "Which action the runbook takes for each alertname. An alert at an auto-remediated severity with no route (and no runbook_action annotation) is escalated, so with the default nothing is remediated."
   type = map(object({
     action = string
   }))
-  default = {
-    CheckoutHighErrorRate  = { action = "degrade_or_scale" }
-    CheckoutHighLatencyP95 = { action = "degrade_or_scale" }
-    CheckoutSLOBurnFast    = { action = "degrade_or_scale" }
-    CheckoutDown           = { action = "restart" }
-    NodeUnderPressure      = { action = "drain_node" }
-  }
+  default = {}
 
   validation {
     condition     = alltrue([for r in values(var.runbook_routes) : contains(["degrade", "restart", "scale", "degrade_or_scale", "drain_node"], r.action)])
@@ -83,30 +76,30 @@ variable "runbook_routes" {
 }
 
 variable "degraded_mode_deployment" {
-  description = "The only deployment degrade works for; it reads the degraded-mode parameter"
+  description = "The only deployment degrade works for; it reads the degraded-mode parameter. With null, degraded mode is off: no parameter, no SSM permissions, and degrade and degrade_or_scale are rejected."
   type        = string
-  default     = "checkout"
+  default     = null
 }
 
 variable "degraded_mode_parameter_name" {
-  description = "SSM parameter degrade sets to \"true\""
+  description = "SSM parameter degrade sets to \"true\". Defaults to /<name>/degraded-mode. Only used with degraded_mode_deployment."
   type        = string
-  default     = "/checkout/degraded_mode"
+  default     = null
 }
 
 variable "create_degraded_mode_parameter" {
-  description = "Create the degraded-mode parameter with the value \"false\". Turn it off if it already exists."
+  description = "Create the degraded-mode parameter with the value \"false\". Turn it off if it already exists. Only used with degraded_mode_deployment."
   type        = bool
   default     = true
 }
 
 variable "drainable_node_label" {
-  description = "drain_node only drains nodes with this label, as key=value"
+  description = "drain_node only drains nodes with this label, as key=value. With null, drain_node is off: it's rejected, and rbac_manifest has no node permissions."
   type        = string
-  default     = "nodegroup=apps"
+  default     = null
 
   validation {
-    condition     = can(regex("^[^=]+=.*$", var.drainable_node_label))
+    condition     = var.drainable_node_label == null || can(regex("^[^=]+=.*$", var.drainable_node_label))
     error_message = "Must be key=value."
   }
 }
@@ -119,6 +112,18 @@ variable "drain_min_schedulable_nodes" {
   validation {
     condition     = var.drain_min_schedulable_nodes >= 1
     error_message = "Must be at least 1."
+  }
+}
+
+# Checked against remediation_max_replicas by a precondition on the runbook
+variable "default_scale_replicas" {
+  description = "Replicas scale and degrade_or_scale go to when the alert has no desired_replicas annotation. At most remediation_max_replicas."
+  type        = number
+  default     = 4
+
+  validation {
+    condition     = var.default_scale_replicas >= 1 && floor(var.default_scale_replicas) == var.default_scale_replicas
+    error_message = "Must be a whole number, at least 1."
   }
 }
 
