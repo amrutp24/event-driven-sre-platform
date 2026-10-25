@@ -175,11 +175,32 @@ class TestEKSAuthentication:
         url = base64.urlsafe_b64decode(encoded + '=' * (-len(encoded) % 4)).decode('utf-8')
         query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
 
-        assert url.startswith('https://sts.amazonaws.com/')
+        assert url.startswith('https://sts.us-east-1.amazonaws.com/')
         assert query['Action'] == ['GetCallerIdentity']
         assert query['X-Amz-Expires'] == ['60']
         assert 'x-k8s-aws-id' in query['X-Amz-SignedHeaders'][0]
         assert query['X-Amz-Credential'][0].startswith('AKIDEXAMPLE/')
+
+    @pytest.mark.parametrize('region, host', [
+        ('us-east-1', 'sts.us-east-1.amazonaws.com'),
+        ('us-west-2', 'sts.us-west-2.amazonaws.com'),
+        ('cn-north-1', 'sts.cn-north-1.amazonaws.com.cn'),
+    ])
+    def test_token_uses_the_regional_sts_endpoint(self, region, host):
+        """STS rejects a signature scoped to another region on the global
+        endpoint, so the URL and the signature both use the Lambda's region"""
+        session = botocore.session.get_session()
+        session.set_credentials('AKIDEXAMPLE', 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY')
+
+        with patch('handler.botocore.session.get_session', return_value=session):
+            token = handler._eks_bearer_token('test-cluster', region)
+
+        encoded = token[len('k8s-aws-v1.'):]
+        url = urllib.parse.urlparse(base64.urlsafe_b64decode(encoded + '=' * (-len(encoded) % 4)).decode('utf-8'))
+        query = urllib.parse.parse_qs(url.query)
+
+        assert url.scheme == 'https' and url.netloc == host and url.path == '/'
+        assert f'/{region}/sts/aws4_request' in query['X-Amz-Credential'][0]
 
     def test_cluster_connection_info(self):
         """Endpoint comes back as-is and the CA is base64-decoded"""

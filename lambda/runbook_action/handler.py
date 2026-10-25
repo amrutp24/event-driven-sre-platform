@@ -41,6 +41,12 @@ class InvalidRequest(Exception):
 def get_env(name, default=None):
     return os.environ.get(name, default)
 
+def _sts_endpoint(region: str) -> str:
+    """STS's regional endpoint, like aws eks get-token uses. The global one only
+    accepts signatures scoped to us-east-1."""
+    suffix = "amazonaws.com.cn" if region.startswith("cn-") else "amazonaws.com"
+    return f"https://sts.{region}.{suffix}/"
+
 def _eks_bearer_token(cluster_name: str, region: str) -> str:
     """Generate an EKS authentication token (k8s-aws-v1) using a presigned STS GetCallerIdentity URL."""
     session = botocore.session.get_session()
@@ -56,7 +62,7 @@ def _eks_bearer_token(cluster_name: str, region: str) -> str:
 
     params = {
         "method": "GET",
-        "url": "https://sts.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15",
+        "url": f"{_sts_endpoint(region)}?Action=GetCallerIdentity&Version=2011-06-15",
         "body": {},
         "headers": {"x-k8s-aws-id": cluster_name},
         "context": {},
