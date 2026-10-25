@@ -209,12 +209,12 @@ jobs:
 
       - name: Install dependencies
         run: |
-          cd apps/checkout
+          cd examples/complete/apps/checkout
           pip install -r requirements-dev.txt
 
       - name: Run application tests
         run: |
-          cd apps/checkout
+          cd examples/complete/apps/checkout
           pytest tests/ -v --cov --cov-report=xml --junitxml=test-results.xml
 
       - name: Upload app coverage reports
@@ -223,9 +223,9 @@ jobs:
         with:
           name: app-coverage
           path: |
-            apps/checkout/coverage.xml
-            apps/checkout/htmlcov/
-            apps/checkout/test-results.xml
+            examples/complete/apps/checkout/coverage.xml
+            examples/complete/apps/checkout/htmlcov/
+            examples/complete/apps/checkout/test-results.xml
           retention-days: 30
 
       

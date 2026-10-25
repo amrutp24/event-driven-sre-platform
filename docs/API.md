@@ -222,7 +222,7 @@ terraform -chdir=examples/complete output -raw alertmanager_api_key
 terraform -chdir=examples/complete output -raw datadog_api_key
 ```
 
-`scripts/deploy.sh` gives Alertmanager its key. Set `webhook_require_api_key = false` to accept requests without one.
+`examples/complete/scripts/deploy.sh` gives Alertmanager its key. Set `webhook_require_api_key = false` to accept requests without one.
 
 **Header**: `X-API-Key: YOUR_API_KEY`
 
@@ -458,7 +458,7 @@ curl -X POST "$WEBHOOK_URL" \
 
 Configure Alertmanager to send alerts to the webhook:
 
-`helm/observability/alertmanager-values.yaml` sets this up through kube-prometheus-stack; the equivalent plain **alertmanager.yml** is:
+`examples/complete/helm/observability/alertmanager-values.yaml` sets this up through kube-prometheus-stack; the equivalent plain **alertmanager.yml** is:
 ```yaml
 global:
   resolve_timeout: 5m

@@ -24,7 +24,7 @@ State is local; there's no backend block.
 
 ## Deploy
 
-From the repo root, in this order:
+From this directory, in this order (the scripts also work from anywhere else, since they change to this directory first):
 
 ```bash
 bash scripts/bootstrap.sh       # terraform init and apply here, then configure kubectl
@@ -37,7 +37,7 @@ bash scripts/deploy.sh          # Alertmanager's API key, kube-prometheus-stack,
 
 Both Lambdas run without reserved concurrency by default (`alert_ingest_reserved_concurrency` and `runbook_action_reserved_concurrency` are -1). New accounts often have a concurrency limit of 50, and AWS keeps at least 50 unreserved, so any reservation fails there. If your account has room, set `runbook_action_reserved_concurrency` (10 is a good cap) to limit how many remediations hit the cluster at once.
 
-[docs/DEMO.md](../../docs/DEMO.md) walks through breaking the app and watching the runbook fix it.
+[DEMO.md](DEMO.md) walks through breaking the app and watching the runbook fix it.
 
 ## Slack and email
 

@@ -109,9 +109,10 @@ module "sre" {
 
 ## Examples
 
-- [examples/complete](examples/complete): the full demo. A VPC with flow logs, EKS 1.36, IRSA roles, ECR, CloudTrail, optional VPC endpoints, one KMS key passed to the module, optional email and Slack notifications, and the `checkout` demo app with Prometheus alerting on top. Deploy it with the scripts, in order:
+- [examples/complete](examples/complete): the full demo. A VPC with flow logs, EKS 1.36, IRSA roles, ECR, CloudTrail, optional VPC endpoints, one KMS key passed to the module, optional email and Slack notifications, and the `checkout` demo app with Prometheus alerting on top. Deploy it with the scripts in `examples/complete/scripts`, in order:
 
   ```bash
+  cd examples/complete
   bash scripts/bootstrap.sh       # terraform apply in examples/complete, configure kubectl
   bash scripts/install-addons.sh  # AWS Load Balancer Controller, ExternalDNS (only with route53_zone_arns), cert-manager
   bash scripts/build-image.sh     # build apps/checkout and push it to ECR, tagged with the short git SHA
@@ -119,7 +120,7 @@ module "sre" {
   bash scripts/destroy.sh         # after uninstalling the Helm releases; protections off, then terraform destroy
   ```
 
-  Running continuously in `us-east-1` it costs roughly $460 a month, nearly all of it the cluster, the nodes and the NAT gateways. The breakdown is in [docs/architecture/README.md](docs/architecture/README.md#monthly-cost-estimate). Tear it down when you're done. [docs/DEMO.md](docs/DEMO.md) walks through breaking the app and watching it get fixed.
+  Running continuously in `us-east-1` it costs roughly $460 a month, nearly all of it the cluster, the nodes and the NAT gateways. The breakdown is in [docs/architecture/README.md](docs/architecture/README.md#monthly-cost-estimate). Tear it down when you're done. [examples/complete/DEMO.md](examples/complete/DEMO.md) walks through breaking the app and watching it get fixed.
 - [examples/existing-cluster](examples/existing-cluster): the minimal call, for a cluster you already have. On its own the module costs about $14 a month at 1000 alerts a day, plus $1 for its KMS key.
 
 ## What's in the repo
@@ -248,7 +249,7 @@ cd lambda/runbook_action && pip install -r requirements-dev.txt && AWS_DEFAULT_R
 cd stepfunctions && pip install -r tests/requirements.txt && pytest tests/
 
 # The demo app
-cd apps/checkout && pip install -r requirements-dev.txt && pytest tests/ --cov
+cd examples/complete/apps/checkout && pip install -r requirements-dev.txt && pytest tests/ --cov
 ```
 
 `tests/integration/` runs the alert path end to end against LocalStack (`setup.sh`, then pytest, then `cleanup.sh`). It isn't part of CI.

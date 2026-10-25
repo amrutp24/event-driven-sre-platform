@@ -466,7 +466,7 @@ graph TB
 - Encryption: the platform's customer managed KMS key (`alias/<name>`)
 - Point-in-time recovery: Enabled
 - TTL: 90 days after the incident's last activity (`incident_retention_days`)
-- Deletion protection: Enabled (`incidents_deletion_protection`). `scripts/destroy.sh` turns it off before `terraform destroy`.
+- Deletion protection: Enabled (`incidents_deletion_protection`). `examples/complete/scripts/destroy.sh` turns it off before `terraform destroy`.
 
 **SNS Topics**
 - Alerts topic: `<name>-alerts` (output `sns_topic_arn`). EventBridge publishes a one-line text message per event, like `[critical] checkout - CheckoutHighErrorRate is firing. ... (incident <id>)`.

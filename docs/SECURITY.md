@@ -219,7 +219,7 @@ IRSA allows Kubernetes pods to assume IAM roles via the EKS OIDC provider, elimi
 
 ### The checkout app's role
 
-The checkout pods read the degraded-mode flag from SSM. The chart's `checkout` service account carries the role from `terraform output checkout_role_arn` (`examples/complete/irsa.tf`, passed in by `scripts/deploy.sh`), and the role trusts only `apps:checkout`. Its one permission:
+The checkout pods read the degraded-mode flag from SSM. The chart's `checkout` service account carries the role from `terraform output checkout_role_arn` (`examples/complete/irsa.tf`, passed in by `examples/complete/scripts/deploy.sh`), and the role trusts only `apps:checkout`. Its one permission:
 
 ```json
 {
@@ -499,7 +499,7 @@ The only secrets are the two webhook API keys.
 
 | Item | Storage | Access Method |
 |------|---------|---------------|
-| **Alertmanager's webhook API key** | Kubernetes Secret `alertmanager-webhook-key` in `monitoring`, encrypted with the EKS secrets key | `scripts/deploy.sh` writes it from `terraform output alertmanager_api_key`; Alertmanager mounts it as a file |
+| **Alertmanager's webhook API key** | Kubernetes Secret `alertmanager-webhook-key` in `monitoring`, encrypted with the EKS secrets key | `examples/complete/scripts/deploy.sh` writes it from `terraform output alertmanager_api_key`; Alertmanager mounts it as a file |
 | **Datadog's webhook API key** | A hidden custom variable in Datadog's webhook integration | Added by hand from `terraform output datadog_api_key` |
 | **Degraded-mode flag** (not a secret) | SSM String parameter `/checkout/degraded_mode` | The runbook_action Lambda writes it; checkout pods read it through their IRSA role |
 | **TLS certificate** | AWS Certificate Manager | The ALB fetches it |
@@ -513,7 +513,7 @@ Both API key values are also in the Terraform state, as sensitive outputs, so ke
 
 ```bash
 terraform -chdir=examples/complete apply -replace='module.sre.aws_api_gateway_api_key.webhook["alertmanager"]'
-bash scripts/deploy.sh   # writes the new key to Alertmanager's secret
+bash examples/complete/scripts/deploy.sh   # writes the new key to Alertmanager's secret
 ```
 
 For Datadog, replace `module.sre.aws_api_gateway_api_key.webhook["datadog"]` and paste the new value into the Datadog integration.
@@ -547,7 +547,7 @@ For Datadog, replace `module.sre.aws_api_gateway_api_key.webhook["datadog"]` and
 
 **Storage**: the S3 bucket `PLATFORM_NAME-cloudtrail-ACCOUNT_ID` (output `cloudtrail_bucket`), encrypted with the platform key, versioned, with all public access blocked, ownership enforced, and a policy that only lets this trail write and denies non-TLS requests. Log file validation is on, so `aws cloudtrail validate-logs` can show whether a file was changed or deleted.
 
-**Retention**: 365 days (`cloudtrail_retention_days`), then the lifecycle rule deletes them. The bucket can't be deleted while it holds logs unless `cloudtrail_force_destroy` is set, which `scripts/destroy.sh` does.
+**Retention**: 365 days (`cloudtrail_retention_days`), then the lifecycle rule deletes them. The bucket can't be deleted while it holds logs unless `cloudtrail_force_destroy` is set, which `examples/complete/scripts/destroy.sh` does.
 
 **Use Cases**:
 - **Forensics**: Who invoked which Lambda at what time?

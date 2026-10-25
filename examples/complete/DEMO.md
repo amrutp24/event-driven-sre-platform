@@ -6,7 +6,7 @@ This is a step-by-step demo script for the event-driven SRE platform. It takes a
 
 **Demo Flow**: Error injection → Alert fires → Automated remediation → Alert resolves → Runbook confirms it and records the MTTR
 
-The commands assume the default `name` variable, `event-driven-sre`, and are run from the repo root.
+The commands assume the default `name` variable, `event-driven-sre`, and are run from `examples/complete`.
 
 ---
 
@@ -22,7 +22,7 @@ aws sts get-caller-identity
 kubectl cluster-info
 
 # 3. Terraform outputs available
-terraform -chdir=examples/complete output
+terraform output
 
 # 4. Required CLI tools installed
 which kubectl helm aws jq curl docker git
@@ -36,7 +36,7 @@ kubectl get deployment checkout -n apps -o jsonpath='{.spec.template.spec.contai
 
 Expected: All commands succeed without errors, and the image is `ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/event-driven-sre/checkout:<git sha>`. Tags are immutable, so build again after committing changes to `apps/checkout`; to build uncommitted changes, set the same `IMAGE_TAG` for both scripts.
 
-To see the notifications, set `notification_emails` in `examples/complete` and click the link in the confirmation email SNS sends each address, and for Slack set `slack_workspace_id` and `slack_channel_id` (setup in [examples/complete](../examples/complete/README.md#slack-and-email)).
+To see the notifications, set the `notification_emails` variable and click the link in the confirmation email SNS sends each address, and for Slack set `slack_workspace_id` and `slack_channel_id` (setup in [README.md](README.md#slack-and-email)).
 
 On Windows Git Bash, prefix the `aws ssm` commands below with `MSYS_NO_PATHCONV=1`, or Git Bash turns `/checkout/degraded_mode` into a Windows path.
 
@@ -55,8 +55,6 @@ On Windows Git Bash, prefix the `aws ssm` commands below with `MSYS_NO_PATHCONV=
 ### Step 2: Get Important URLs
 
 ```bash
-cd examples/complete
-
 # Get API Gateway webhook URL
 terraform output -raw alert_webhook_url
 # Example: https://abc123.execute-api.us-west-2.amazonaws.com/prod/webhook
@@ -190,7 +188,7 @@ aws logs tail /aws/events/event-driven-sre --since 10m
 
 # The runbook execution
 aws stepfunctions list-executions \
-  --state-machine-arn "$(terraform -chdir=examples/complete output -raw step_functions_arn)" \
+  --state-machine-arn "$(terraform output -raw step_functions_arn)" \
   --max-results 1 \
   --query 'executions[0].[name,status,startDate]' \
   --output table
@@ -323,7 +321,7 @@ Swap `resolved` for `open`, `remediating` or `escalated` to list those instead.
 
 # Check Step Functions execution completed
 aws stepfunctions list-executions \
-  --state-machine-arn "$(terraform -chdir=examples/complete output -raw step_functions_arn)" \
+  --state-machine-arn "$(terraform output -raw step_functions_arn)" \
   --max-results 1 \
   --query 'executions[0].status' \
   --output text
@@ -333,7 +331,7 @@ aws stepfunctions list-executions \
 # Check the email subscription is confirmed (notification_emails); an
 # unconfirmed one shows PendingConfirmation instead of an ARN
 aws sns list-subscriptions-by-topic \
-  --topic-arn "$(terraform -chdir=examples/complete output -raw sns_topic_arn)" \
+  --topic-arn "$(terraform output -raw sns_topic_arn)" \
   --query 'Subscriptions[].[Endpoint,SubscriptionArn]' --output text
 ```
 
@@ -369,7 +367,7 @@ echo "System capacity: 1000 alerts/second; remediations limited by the account's
 
 **Script**: "Let me quickly show you the architecture that makes this possible."
 
-**Open**: `docs/architecture/README.md` in browser or show diagram
+**Open**: [docs/architecture/README.md](../../docs/architecture/README.md) in browser or show diagram
 
 **Highlight**:
 1. **Detection**: Prometheus scrapes metrics every 15s, evaluates rules every 30s
@@ -462,8 +460,8 @@ kubectl get secret -n monitoring alertmanager-mon-kube-prometheus-stack-alertman
 # Verify: webhook_configs contains correct URL
 
 # Test webhook manually. A warning only notifies, so nothing in the cluster changes.
-WEBHOOK_URL=$(terraform -chdir=examples/complete output -raw alert_webhook_url)
-API_KEY=$(terraform -chdir=examples/complete output -raw alertmanager_api_key)
+WEBHOOK_URL=$(terraform output -raw alert_webhook_url)
+API_KEY=$(terraform output -raw alertmanager_api_key)
 
 curl -X POST "$WEBHOOK_URL" \
   -H "X-API-Key: $API_KEY" \
@@ -502,14 +500,13 @@ aws logs tail /aws/events/event-driven-sre --since 30m
 
 # Events EventBridge couldn't deliver end up here
 aws sqs get-queue-attributes --attribute-names ApproximateNumberOfMessages \
-  --queue-url "$(terraform -chdir=examples/complete output -raw events_dlq_url)"
+  --queue-url "$(terraform output -raw events_dlq_url)"
 ```
 
 An execution that starts and stops at `NotAutoRemediated` means the alert wasn't critical or was annotated `runbook_action: notify_only`. One that stops at `AlreadyHandled` means another run already claimed the incident, or it had already resolved.
 
 **Fix**: If IAM error, check EventBridge execution role:
 ```bash
-cd examples/complete
 terraform plan -target=module.sre.aws_iam_role.events_invoke
 # Verify: Role has states:StartExecution permission
 ```
@@ -547,7 +544,7 @@ aws lambda invoke \
 
 **Fix**: If RBAC error, verify the access entry, Role and RoleBinding:
 ```bash
-aws eks list-access-entries --cluster-name "$(terraform -chdir=examples/complete output -raw eks_cluster_name)"
+aws eks list-access-entries --cluster-name "$(terraform output -raw eks_cluster_name)"
 kubectl get role,rolebinding -n apps sre-remediation
 kubectl auth can-i patch deployments -n apps --as=runbook-action --as-group=sre-remediation
 ```
@@ -574,7 +571,7 @@ kubectl get sa checkout -n apps -o jsonpath='{.metadata.annotations.eks\.amazona
 kubectl describe pod -n apps -l app=checkout | grep -i "AWS_ROLE_ARN"
 ```
 
-**Fix**: The role ARN should match `terraform -chdir=examples/complete output -raw checkout_role_arn`. If it's missing or different, re-run `scripts/deploy.sh`, which passes it to the chart, then restart the pods so they get the new credentials:
+**Fix**: The role ARN should match `terraform output -raw checkout_role_arn`. If it's missing or different, re-run `scripts/deploy.sh`, which passes it to the chart, then restart the pods so they get the new credentials:
 ```bash
 kubectl rollout restart deployment/checkout -n apps
 ```
@@ -587,7 +584,7 @@ kubectl rollout restart deployment/checkout -n apps
 ```bash
 # Email: each address has to confirm first; PendingConfirmation means the link wasn't clicked
 aws sns list-subscriptions-by-topic \
-  --topic-arn "$(terraform -chdir=examples/complete output -raw sns_topic_arn)" \
+  --topic-arn "$(terraform output -raw sns_topic_arn)" \
   --query 'Subscriptions[].[Endpoint,SubscriptionArn]' --output text
 
 # Slack: the channel configuration lives in chatbot_region (us-east-2 by default)
@@ -617,8 +614,8 @@ kubectl set env deployment/checkout -n apps \
 A critical alert with no runbook is escalated right after it's logged:
 
 ```bash
-WEBHOOK_URL=$(terraform -chdir=examples/complete output -raw alert_webhook_url)
-API_KEY=$(terraform -chdir=examples/complete output -raw alertmanager_api_key)
+WEBHOOK_URL=$(terraform output -raw alert_webhook_url)
+API_KEY=$(terraform output -raw alertmanager_api_key)
 
 curl -X POST "$WEBHOOK_URL" -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
   -d '{"alerts": [{"status": "firing",
@@ -753,7 +750,6 @@ kubectl port-forward -n apps svc/checkout 8080:80
 
 **Terraform Outputs**:
 ```bash
-cd examples/complete
 terraform output alert_webhook_url
 terraform output sns_topic_arn
 terraform output step_functions_arn
