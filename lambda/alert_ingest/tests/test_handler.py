@@ -25,9 +25,8 @@ test_env_vars = {
     'EVENT_BUS_NAME': 'test-event-bus',
 }
 
-with patch.dict(os.environ, test_env_vars):
-    with patch('boto3.client'):
-        import handler
+with patch.dict(os.environ, test_env_vars), patch('boto3.client'):
+    import handler
 
 
 class FakeContext:

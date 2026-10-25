@@ -18,7 +18,7 @@ import logging
 import os
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
@@ -108,7 +108,7 @@ def _parse_body(event):
 
 
 def _iso_now():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _incident_id(*parts):
@@ -222,7 +222,7 @@ def _from_datadog(payload):
         seconds = int(happened)
         if seconds > 10_000_000_000:  # sent in milliseconds
             seconds //= 1000
-        happened_iso = datetime.fromtimestamp(seconds, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        happened_iso = datetime.fromtimestamp(seconds, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     cycle_key = payload.get("alert_cycle_key")
     labels = dict(tags, alertname=alertname, severity=severity)
