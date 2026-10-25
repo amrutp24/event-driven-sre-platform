@@ -6,6 +6,8 @@ locals {
   region     = data.aws_region.current.name
   account_id = data.aws_caller_identity.current.account_id
   partition  = data.aws_partition.current.partition
+  # amazonaws.com, or amazonaws.com.cn in China, for regional service names
+  dns_suffix = data.aws_partition.current.dns_suffix
 
   # The module's key, or the one passed in with create_kms_key = false
   kms_key_arn = var.create_kms_key ? aws_kms_key.platform[0].arn : var.kms_key_arn

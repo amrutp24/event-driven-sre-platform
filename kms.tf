@@ -35,10 +35,10 @@ resource "aws_kms_key" "platform" {
           StringEquals = {
             "kms:CallerAccount" = local.account_id
             "kms:ViaService" = [
-              "dynamodb.${local.region}.amazonaws.com",
-              "sns.${local.region}.amazonaws.com",
-              "sqs.${local.region}.amazonaws.com",
-              "logs.${local.region}.amazonaws.com",
+              "dynamodb.${local.region}.${local.dns_suffix}",
+              "sns.${local.region}.${local.dns_suffix}",
+              "sqs.${local.region}.${local.dns_suffix}",
+              "logs.${local.region}.${local.dns_suffix}",
             ]
           }
         }
@@ -46,7 +46,7 @@ resource "aws_kms_key" "platform" {
       {
         Sid       = "CloudWatchLogs"
         Effect    = "Allow"
-        Principal = { Service = "logs.${local.region}.amazonaws.com" }
+        Principal = { Service = "logs.${local.region}.${local.dns_suffix}" }
         Action = [
           "kms:Encrypt", "kms:Decrypt", "kms:ReEncrypt*",
           "kms:GenerateDataKey*", "kms:Describe*",

@@ -161,6 +161,7 @@ resource "aws_sfn_state_machine" "runbook" {
   name     = "${var.name}-runbook"
   role_arn = aws_iam_role.sfn_role.arn
   definition = templatefile("${path.module}/stepfunctions/runbook.asl.json", {
+    partition                 = local.partition
     table_name                = aws_dynamodb_table.incidents.name
     runbook_action_arn        = aws_lambda_function.runbook_action.arn
     event_bus_name            = aws_cloudwatch_event_bus.sre.name

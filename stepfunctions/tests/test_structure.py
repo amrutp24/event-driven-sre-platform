@@ -176,3 +176,13 @@ def test_dynamodb_typed_values_are_strings(definition):
                         assert value.startswith("States.Format("), (
                             f"{name}.{section}.{placeholder}: a number needs States.Format to become a string"
                         )
+
+
+@pytest.mark.parametrize("name", sorted(TEMPLATES))
+@pytest.mark.parametrize("partition", ["aws", "aws-cn", "aws-us-gov"])
+def test_task_resources_use_the_partition(name, partition):
+    definition = load(name, {**TEMPLATES[name], "partition": partition})
+    tasks = [s for s in definition["States"].values() if s["Type"] == "Task"]
+    assert tasks
+    for state in tasks:
+        assert state["Resource"].startswith(f"arn:{partition}:states:::")

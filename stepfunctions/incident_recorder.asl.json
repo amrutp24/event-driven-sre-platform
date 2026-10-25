@@ -26,7 +26,7 @@
     "RecordCreated": {
       "Comment": "Upsert. A re-sent firing alert bumps last_seen_at and notification_count but doesn't reset the status. expires_at is the TTL: last activity plus the retention period.",
       "Type": "Task",
-      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Resource": "arn:${partition}:states:::dynamodb:updateItem",
       "Parameters": {
         "TableName": "${table_name}",
         "Key": {
@@ -51,7 +51,7 @@
     },
     "RecordResolved": {
       "Type": "Task",
-      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Resource": "arn:${partition}:states:::dynamodb:updateItem",
       "Parameters": {
         "TableName": "${table_name}",
         "Key": {
@@ -70,7 +70,7 @@
     "RecordAction": {
       "Comment": "Success or failure. The runbook decides whether to escalate.",
       "Type": "Task",
-      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Resource": "arn:${partition}:states:::dynamodb:updateItem",
       "Parameters": {
         "TableName": "${table_name}",
         "Key": {

@@ -289,6 +289,7 @@ resource "aws_sfn_state_machine" "incident_recorder" {
   type     = "EXPRESS"
   role_arn = aws_iam_role.incident_recorder.arn
   definition = templatefile("${path.module}/stepfunctions/incident_recorder.asl.json", {
+    partition   = local.partition
     table_name  = aws_dynamodb_table.incidents.name
     ttl_seconds = var.incident_retention_days * 86400
   })

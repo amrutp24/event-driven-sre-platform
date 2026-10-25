@@ -30,6 +30,7 @@ ROUTES = {
 }
 
 RUNBOOK_VARS = {
+    "partition": "aws",
     "table_name": TABLE,
     "runbook_action_arn": RUNBOOK_ACTION_ARN,
     "event_bus_name": BUS,
@@ -45,6 +46,7 @@ RUNBOOK_VARS = {
 }
 
 RECORDER_VARS = {
+    "partition": "aws",
     "table_name": TABLE,
     "ttl_seconds": 7776000,
 }

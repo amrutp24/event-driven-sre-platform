@@ -32,7 +32,7 @@
     "LogIncident": {
       "Comment": "Step 2. Claims the incident so it's remediated once. Alertmanager re-sends firing alerts and EventBridge delivers at least once, so later runs stop here, as do runs for an alert that already resolved.",
       "Type": "Task",
-      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Resource": "arn:${partition}:states:::dynamodb:updateItem",
       "Arguments": {
         "TableName": "${table_name}",
         "Key": {
@@ -108,7 +108,7 @@
     "ExecuteAction": {
       "Comment": "Step 4. runbook_action does the Kubernetes work. Bad input (InvalidRequest) isn't retried; anything else gets 3 retries with backoff.",
       "Type": "Task",
-      "Resource": "arn:aws:states:::lambda:invoke",
+      "Resource": "arn:${partition}:states:::lambda:invoke",
       "TimeoutSeconds": 150,
       "Arguments": {
         "FunctionName": "${runbook_action_arn}",
@@ -154,7 +154,7 @@
     "ReportActionCompleted": {
       "Comment": "The incident recorder adds this to actions_taken.",
       "Type": "Task",
-      "Resource": "arn:aws:states:::events:putEvents",
+      "Resource": "arn:${partition}:states:::events:putEvents",
       "Arguments": {
         "Entries": [
           {
@@ -190,7 +190,7 @@
     },
     "ReportActionFailed": {
       "Type": "Task",
-      "Resource": "arn:aws:states:::events:putEvents",
+      "Resource": "arn:${partition}:states:::events:putEvents",
       "Arguments": {
         "Entries": [
           {
@@ -234,7 +234,7 @@
     "VerifyResolution": {
       "Comment": "Step 6. The incident recorder sets status=resolved when the resolved alert comes in, so this reads the item.",
       "Type": "Task",
-      "Resource": "arn:aws:states:::dynamodb:getItem",
+      "Resource": "arn:${partition}:states:::dynamodb:getItem",
       "Arguments": {
         "TableName": "${table_name}",
         "Key": {
@@ -295,7 +295,7 @@
     "MarkResolved": {
       "Comment": "Step 7, resolved. MTTR runs from when the platform first saw the alert to when it saw the resolution.",
       "Type": "Task",
-      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Resource": "arn:${partition}:states:::dynamodb:updateItem",
       "Arguments": {
         "TableName": "${table_name}",
         "Key": {
@@ -326,7 +326,7 @@
     },
     "PublishAutoResolved": {
       "Type": "Task",
-      "Resource": "arn:aws:states:::events:putEvents",
+      "Resource": "arn:${partition}:states:::events:putEvents",
       "Arguments": {
         "Entries": [
           {
@@ -367,7 +367,7 @@
     "Escalate": {
       "Comment": "Step 7, escalated. Hands the incident to a person, unless the alert resolved in the meantime.",
       "Type": "Task",
-      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Resource": "arn:${partition}:states:::dynamodb:updateItem",
       "Arguments": {
         "TableName": "${table_name}",
         "Key": {
@@ -413,7 +413,7 @@
     "PublishEscalation": {
       "Comment": "A rule sends this to SNS.",
       "Type": "Task",
-      "Resource": "arn:aws:states:::events:putEvents",
+      "Resource": "arn:${partition}:states:::events:putEvents",
       "Arguments": {
         "Entries": [
           {

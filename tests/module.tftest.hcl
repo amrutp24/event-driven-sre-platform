@@ -12,7 +12,7 @@ mock_provider "aws" {
     defaults = { account_id = "123456789012" }
   }
   mock_data "aws_partition" {
-    defaults = { partition = "aws" }
+    defaults = { partition = "aws", dns_suffix = "amazonaws.com", reverse_dns_prefix = "com.amazonaws" }
   }
   mock_data "aws_vpc" {
     defaults = { cidr_block = "10.40.0.0/16" }
@@ -369,6 +369,46 @@ run "private_webhook" {
   assert {
     condition     = length(aws_api_gateway_rest_api_policy.private_only) == 1 && strcontains(aws_api_gateway_rest_api_policy.private_only[0].policy, aws_vpc_endpoint.webhook[0].id)
     error_message = "A private webhook should only accept requests through its endpoint."
+  }
+}
+
+run "china_partition" {
+  command = plan
+
+  override_data {
+    target = data.aws_region.current
+    values = { name = "cn-north-1" }
+  }
+  override_data {
+    target = data.aws_partition.current
+    values = { partition = "aws-cn", dns_suffix = "amazonaws.com.cn", reverse_dns_prefix = "cn.com.amazonaws" }
+  }
+
+  variables {
+    webhook_private = true
+  }
+
+  assert {
+    condition = alltrue([
+      for s in values(jsondecode(aws_sfn_state_machine.runbook.definition).States) : startswith(s.Resource, "arn:aws-cn:states:::") if s.Type == "Task"
+      ]) && alltrue([
+      for s in values(jsondecode(aws_sfn_state_machine.incident_recorder.definition).States) : startswith(s.Resource, "arn:aws-cn:states:::") if s.Type == "Task"
+    ])
+    error_message = "Both state machines' task resources should use the partition."
+  }
+
+  assert {
+    condition = (
+      contains(jsondecode(aws_kms_key.platform[0].policy).Statement[1].Condition.StringEquals["kms:ViaService"], "dynamodb.cn-north-1.amazonaws.com.cn")
+      && jsondecode(aws_kms_key.platform[0].policy).Statement[2].Principal.Service == "logs.cn-north-1.amazonaws.com.cn"
+      && startswith(jsondecode(aws_kms_key.platform[0].policy).Statement[0].Principal.AWS, "arn:aws-cn:iam::")
+    )
+    error_message = "The key policy should use the partition's DNS suffix and ARNs."
+  }
+
+  assert {
+    condition     = aws_vpc_endpoint.webhook[0].service_name == "cn.com.amazonaws.cn-north-1.execute-api"
+    error_message = "The execute-api endpoint should use the partition's service name prefix."
   }
 }
 
