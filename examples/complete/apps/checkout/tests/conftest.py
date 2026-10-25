@@ -1,8 +1,11 @@
 """
 Pytest configuration and fixtures for checkout service tests
 """
-import pytest
+import contextlib
 import os
+
+import pytest
+
 from app import app as flask_app
 
 
@@ -54,10 +57,9 @@ def clear_registry():
                 collectors_to_remove.append(collector)
 
         for collector in collectors_to_remove:
-            try:
+            # Already gone if another fixture unregistered it
+            with contextlib.suppress(KeyError):
                 REGISTRY.unregister(collector)
-            except Exception:
-                pass
 
     # Don't clear before - let tests call it explicitly when needed
     yield _clear
