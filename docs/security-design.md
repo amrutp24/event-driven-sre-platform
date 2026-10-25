@@ -90,12 +90,12 @@ All IAM roles and policies follow the principle of least privilege, granting onl
         "logs:CreateLogStream",
         "logs:PutLogEvents"
       ],
-      "Resource": "arn:aws:logs:REGION:*:log-group:/aws/lambda/PLATFORM_NAME-runbook-action:*"
+      "Resource": "arn:aws:logs:REGION:ACCOUNT_ID:log-group:/aws/lambda/PLATFORM_NAME-runbook-action:*"
     },
     {
       "Effect": "Allow",
       "Action": ["eks:DescribeCluster"],
-      "Resource": "arn:aws:eks:REGION:*:cluster/CLUSTER_NAME"
+      "Resource": "arn:aws:eks:REGION:ACCOUNT_ID:cluster/CLUSTER_NAME"
     },
     {
       "Effect": "Allow",
@@ -206,8 +206,8 @@ IRSA allows Kubernetes pods to assume IAM roles via the EKS OIDC provider, elimi
 
 ```
 1. Pod starts with ServiceAccount annotation: eks.amazonaws.com/role-arn=<IAM_ROLE_ARN>
-2. EKS mutating webhook injects AWS credentials as environment variables
-3. Pod calls AWS STS AssumeRoleWithWebIdentity using OIDC token
+2. EKS mutating webhook injects AWS_ROLE_ARN, AWS_WEB_IDENTITY_TOKEN_FILE and a projected service account token volume (no credentials)
+3. The AWS SDK in the pod calls STS AssumeRoleWithWebIdentity with that token
 4. STS returns temporary credentials (valid for 1 hour)
 5. Pod uses temporary credentials to call AWS APIs
 ```
@@ -253,7 +253,7 @@ resource "aws_eks_access_entry" "runbook_action" {
 3. EKS verifies the token with STS, finds the access entry for the role, and treats the caller as a member of `sre-remediation`.
 4. Kubernetes RBAC decides what that group may do (next section).
 
-The Lambda runs in the private subnets and reaches the cluster's private API endpoint. The cluster security group allows HTTPS from the Lambda's security group only.
+The Lambda runs in the private subnets and reaches the cluster's private API endpoint. The module adds a rule to the cluster security group that allows HTTPS from the Lambda's security group. The cluster security group also allows 443 from the nodes.
 
 **Security Properties**:
 - No kubeconfig, static token or long-lived key is stored anywhere
@@ -370,7 +370,7 @@ kubectl auth can-i patch deployments -n kube-system --as=runbook-action --as-gro
 # drain_node: it can cordon nodes and evict pods anywhere, but not delete them
 kubectl auth can-i patch nodes --as=runbook-action --as-group=sre-remediation
 # Expected: yes
-kubectl auth can-i create pods/eviction -n kube-system --as=runbook-action --as-group=sre-remediation
+kubectl auth can-i create pods --subresource=eviction -n kube-system --as=runbook-action --as-group=sre-remediation
 # Expected: yes
 kubectl auth can-i delete pods -n apps --as=runbook-action --as-group=sre-remediation
 # Expected: no
@@ -382,7 +382,7 @@ kubectl auth can-i delete pods -n apps --as=runbook-action --as-group=sre-remedi
 
 ### VPC Design
 
-- **Public Subnets**: the ALB and a NAT gateway per AZ
+- **Public Subnets**: a NAT gateway per AZ, and the ALB when the checkout ingress is turned on (`ingress.enabled`, off by default)
 - **Private Subnets**: EKS nodes, the runbook_action Lambda, and the interface endpoints when they're on
 
 ### Security Groups
@@ -394,14 +394,14 @@ Created by the EKS module with its recommended rules:
 **Inbound Rules**:
 - From the control plane: HTTPS (443), the kubelet (10250) and the webhook ports, plus 10251 for the metrics-server add-on, which the complete example adds (`node_security_group_additional_rules`)
 - From other nodes: DNS and the ephemeral port range (pod-to-pod traffic)
-- From the ALB to the pods; the AWS Load Balancer Controller adds this rule
+- From the ALB to the pods, when the ingress is on; the AWS Load Balancer Controller adds this rule
 
 **Outbound Rules**:
 - All traffic, which leaves through the NAT gateways (images, AWS APIs) unless an endpoint handles it
 
 #### 2. ALB Security Group
 
-Created by the AWS Load Balancer Controller for the internet-facing checkout ingress.
+Created by the AWS Load Balancer Controller for the internet-facing checkout ingress, so it only exists when `ingress.enabled` is set in the checkout chart's values. It's off by default, and `certificateArn` is a placeholder until you set it.
 
 **Inbound Rules**:
 - HTTPS (443) from anywhere. Only allowing CloudFront is not built yet; there's no CloudFront in front of it today.
@@ -419,7 +419,7 @@ The listener is HTTPS only, with the `ELBSecurityPolicy-TLS13-1-2-2021-06` polic
 **Outbound Rules**:
 - HTTPS (443) only: the cluster's private API endpoint, and AWS APIs (EKS, SSM, STS) through the NAT gateways or the interface endpoints
 
-The cluster security group allows HTTPS from this group only.
+The cluster security group allows HTTPS from this group, and also from the nodes.
 
 #### 4. VPC Endpoint Security Group
 
@@ -485,8 +485,8 @@ resource "aws_dynamodb_table" "incidents" {
 
 ### Encryption in Transit
 
-- **ALB**: HTTPS only, with an ACM certificate and the `ELBSecurityPolicy-TLS13-1-2-2021-06` policy (TLS 1.2 minimum, TLS 1.3 preferred)
-- **Webhook (API Gateway)**: HTTPS only, with API Gateway's default TLS policy for the default endpoint. Pinning a TLS 1.2 minimum there (`security_policy` on the REST API) needs AWS provider 6, and the EKS module (~> 20) holds the provider below 6. That comes with the move to EKS module v21.
+- **ALB** (when `ingress.enabled` is set): HTTPS only, with an ACM certificate and the `ELBSecurityPolicy-TLS13-1-2-2021-06` policy (TLS 1.2 minimum, TLS 1.3 preferred)
+- **Webhook (API Gateway)**: HTTPS only, with API Gateway's default TLS policy for the default endpoint. Pinning a TLS 1.2 minimum there (`security_policy` on the REST API) needs AWS provider 6, and the module still supports provider 5.x. Only `examples/complete` is held on 5, by the EKS module v20.
 - **Both SNS topics, the dead-letter queue and the CloudTrail bucket**: their resource policies deny any request without TLS (`aws:SecureTransport` false)
 - **EKS API server**: TLS, managed by AWS
 - **Inside the cluster**: plain HTTP, ALB to pods included. There's no service mesh.
@@ -504,7 +504,7 @@ The only secrets are the two webhook API keys.
 | **Alertmanager's webhook API key** | Kubernetes Secret `alertmanager-webhook-key` in `monitoring`, encrypted with the EKS secrets key | `examples/complete/scripts/deploy.sh` writes it from `terraform output alertmanager_api_key`; Alertmanager mounts it as a file |
 | **Datadog's webhook API key** | A hidden custom variable in Datadog's webhook integration | Added by hand from `terraform output datadog_api_key` |
 | **Degraded-mode flag** (not a secret) | SSM String parameter `/checkout/degraded_mode` | The runbook_action Lambda writes it; checkout pods read it through their IRSA role |
-| **TLS certificate** | AWS Certificate Manager | The ALB fetches it |
+| **TLS certificate** (when `ingress.enabled` is set) | AWS Certificate Manager | The ALB fetches it |
 | **Image pulls** | No secret | Nodes pull from ECR with their node role |
 
 Both API key values are also in the Terraform state, as sensitive outputs, so keep the state encrypted and access to it limited.
@@ -570,7 +570,7 @@ For Datadog, replace `module.sre.aws_api_gateway_api_key.webhook["datadog"]` and
 
 Both state machines log execution data, so these log groups hold alert payloads: labels, annotations, and the action results. Alerts carry no secrets, and the webhook API keys never reach the state machines, but treat the log groups like the incident table when granting read access.
 
-**Metric Filters**:
+**Metric Filters** (not built yet):
 - Extract custom metrics (e.g., remediation success rate, alert volume)
 - Create CloudWatch alarms on errors or anomalies
 
@@ -599,7 +599,7 @@ Every incident is logged with:
 **Enabled Log Types**:
 - `api`: Kubernetes API server logs (who called which API, when)
 - `audit`: Detailed audit logs (every API call with request/response)
-- `authenticator`: IAM authentication logs (IRSA token exchanges)
+- `authenticator`: IAM principals authenticating to the Kubernetes API (the runbook_action role, kubectl users). IRSA's `AssumeRoleWithWebIdentity` calls are in CloudTrail instead.
 - `controllerManager`: Controller logs (deployment scaling, etc.)
 - `scheduler`: Pod scheduling decisions
 
@@ -618,7 +618,7 @@ Every incident is logged with:
 2. **IRSA and EKS access entries**: No long-lived credentials stored
 3. **Kubernetes RBAC**: the remediation group is limited to the `apps` namespace and specific operations
 4. **Encryption at Rest**: the platform KMS key for the incidents table, SNS, the dead-letter queue, the log groups and CloudTrail; the EKS module's key for Kubernetes secrets; AES-256 for ECR
-5. **Encryption in Transit**: TLS 1.2+ policy on the ALB; SNS, the dead-letter queue and the CloudTrail bucket deny non-TLS requests. The webhook is HTTPS only, but its TLS policy waits on AWS provider 6.
+5. **Encryption in Transit**: TLS 1.2+ policy on the ALB when the ingress is on; SNS, the dead-letter queue and the CloudTrail bucket deny non-TLS requests. The webhook is HTTPS only, but its TLS policy waits until the module drops support for AWS provider 5.x.
 6. **Network Segmentation**: Private subnets for EKS and the remediation Lambda, security groups for isolation, an optional private webhook
 7. **CloudTrail Logging**: Multi-region management events with log file validation, kept 365 days
 8. **CloudWatch Logs**: Lambda, Step Functions and event logs kept 30 days, encrypted with the platform key
@@ -645,7 +645,7 @@ Every incident is logged with:
 26. **Secrets Rotation**: Rotate the webhook API keys on a schedule
 27. **WAF Rules**: Protect the ALB and API Gateway from common attacks (SQL injection, XSS)
 28. **DDoS Protection**: AWS Shield Standard (free) or Advanced (paid)
-29. **TLS Policy on the Webhook**: once the repo moves to AWS provider 6
+29. **TLS Policy on the Webhook**: once the module requires AWS provider 6
 
 ---
 
@@ -711,7 +711,7 @@ Use this checklist before deploying to production:
 - API Gateway validates JSON schema (reject malformed requests)
 - alert_ingest Lambda validates alert structure and source
 - RBAC limits Lambda to patching deployments and HPAs, cordoning nodes and evicting pods (cannot delete anything)
-- The state machine only runs four known actions, and the Lambda rejects other namespaces, invalid deployment names and replica counts over `MAX_REPLICAS`
+- The state machine only runs five known actions (`degrade`, `restart`, `scale`, `degrade_or_scale`, `drain_node`), and the Lambda rejects other namespaces, invalid deployment names and replica counts over `MAX_REPLICAS`
 - An incident is remediated once, however many times the alert is sent
 - API Gateway throttling prevents alert flood
 
@@ -768,7 +768,7 @@ Use this checklist before deploying to production:
 **Impact**: Exposure of incident details, alert patterns, service topology
 
 **Mitigations**:
-- IAM policies prevent read access (only the incident recorder and the runbook state machine can write, and the runbook can only read single items)
+- No platform role can `Scan` or `Query` (only the incident recorder and the runbook state machine can write, and the runbook can only read single items). The KMS key policy lets any principal in the account decrypt through DynamoDB, so reads are limited only by the account's IAM policies.
 - DynamoDB encrypted at rest with the platform key
 - VPC gateway endpoint for DynamoDB (traffic from the VPC stays on the AWS network)
 - CloudTrail doesn't log item reads and writes (data events), only table-level calls
@@ -783,7 +783,7 @@ Use this checklist before deploying to production:
 
 **Scenario 1: Unauthorized Lambda Invocation Detected**
 
-1. **Detect**: CloudWatch alarm on Lambda invocations spike
+1. **Detect**: CloudWatch alarm on Lambda invocations spike (not built)
 2. **Triage**: Check CloudTrail for source IP and IAM principal
 3. **Contain**: Disable Lambda function (update IAM policy to deny all)
 4. **Investigate**: Review Lambda logs for malicious activity
@@ -803,12 +803,12 @@ Use this checklist before deploying to production:
 
 **Scenario 3: DynamoDB Data Breach**
 
-1. **Detect**: GuardDuty alert on unusual DynamoDB access
+1. **Detect**: GuardDuty alert on unusual DynamoDB access (not built)
 2. **Triage**: Identify IAM principal and IP address
 3. **Contain**: Revoke IAM role or add deny policy
 4. **Investigate**: Determine what data was accessed
 5. **Remediate**: Rotate exposed credentials, notify affected parties
-6. **Recover**: Enable DynamoDB point-in-time recovery, restore if needed
+6. **Recover**: Restore the table from point-in-time recovery (already on) if needed
 7. **Post-Mortem**: Implement additional access controls (VPC endpoint, IAM conditions)
 
 ---
