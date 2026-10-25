@@ -14,11 +14,9 @@ updates:
   - package-ecosystem: terraform
     directories:
       - /
-      - /examples/complete
       - /examples/existing-cluster
     schedule:
       interval: weekly
-    # Module majors (EKS v20 to v21, IAM v5 to v6) are deliberate upgrades
     ignore:
       - dependency-name: "*"
         update-types: ["version-update:semver-major"]
@@ -26,6 +24,27 @@ updates:
       terraform:
         patterns: ["*"]
         update-types: [minor, patch]
+
+  # The complete example pins its majors on purpose: the EKS module v20 needs
+  # AWS provider 5.x, and the VPC and IAM modules move with it. Dependabot
+  # can't classify range requirements as majors, so the versions are named.
+  # Moving to EKS v21 and provider 6 is a deliberate upgrade.
+  - package-ecosystem: terraform
+    directory: /examples/complete
+    schedule:
+      interval: weekly
+    ignore:
+      - dependency-name: "hashicorp/aws"
+        versions: [">= 6.0"]
+      - dependency-name: "terraform-aws-modules/eks/aws"
+        versions: [">= 21.0"]
+      - dependency-name: "terraform-aws-modules/vpc/aws"
+        versions: [">= 6.0"]
+      - dependency-name: "terraform-aws-modules/iam/aws"
+        versions: [">= 6.0"]
+    groups:
+      terraform-complete:
+        patterns: ["*"]
 
   - package-ecosystem: pip
     directories:
